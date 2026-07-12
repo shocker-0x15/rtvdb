@@ -1,0 +1,8 @@
+/build/
+/build-*/
+/artifacts/
+/_CPack_Packages/
+/rtvdb-*.zip
+/.vs/
+/CMakeUserPresets.json
+/imgui.ini
