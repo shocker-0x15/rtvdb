@@ -225,15 +225,7 @@ WindowsでVulkan RT backendを有効にする場合は、configure時に
 - `build\Debug\rtvdb_viewer.exe`
 - `build\Debug\rtvdb_example_client.exe`
 - `build\Debug\rtvdb_obj_stream_client.exe`
-- `build\Debug\rtvdb_display_mode_test_client.exe`
 - `build\Debug\rtvdb_bt2020_volume_client.exe`
-
-## ドキュメント / Documentation
-
-- 利用者向けの入口: この `README.md`
-- 現在の runtime 挙動と内部メモ: [`docs/runtime_behavior.md`](docs/runtime_behavior.md)
-- アーキテクチャ方針: [`docs/architecture.md`](docs/architecture.md)
-- 将来の移植境界: [`docs/platform_migration_notes.md`](docs/platform_migration_notes.md)
 
 ----
 2026 [@Shocker_0x15](https://twitter.com/Shocker_0x15), [@bsky.rayspace.xyz](https://bsky.app/profile/bsky.rayspace.xyz)
