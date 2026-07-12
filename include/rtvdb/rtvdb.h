@@ -1,4 +1,7 @@
-﻿#pragma once
+﻿// Copyright (c) 2026 Shin Watanabe
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
 
 #include <concepts>
 #include <cstddef>

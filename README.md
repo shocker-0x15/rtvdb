@@ -125,7 +125,7 @@ The default connection to the local viewer (`127.0.0.1:47909`) is established im
 - レイヤー名は空文字と `/` を含む名前を受け付けず、1階層あたり63 byteまでです。\
 Layer names cannot be empty or contain `/`, and are limited to 63 bytes per level.
 
-## サンプル / Samples
+## Samples
 
 - `rtvdb_example_client`: Minimal connection check
 - `rtvdb_bt2020_volume_client`: Color-gamut volume sample using points and line segments
@@ -152,7 +152,7 @@ if (!rtvdb::connect(&cfg, "remote_app")) {
 }
 ```
 
-## 対応プラットフォーム / Supported Platforms
+## Supported Platforms
 
 client library と viewer は対応範囲が異なります。\
 The supported platforms differ between the client library and the viewer.
@@ -187,7 +187,7 @@ A viewer built with the Vulkan RT backend enabled on Windows requires the Vulkan
 - Windows 既定構成は DXR backend のみで、Vulkan RT backend は configure 時に明示的に有効化します。\
 The default Windows configuration contains only the DXR backend; enable the Vulkan RT backend explicitly at configure time.
 
-## ビルド / Build
+## Build
 
 ここからはviewerやサンプルclientをソースからビルドする場合の情報です。
 

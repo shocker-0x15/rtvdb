@@ -577,6 +577,57 @@ install(FILES
     DESTINATION .
 )
 
+set(RTVDB_THIRD_PARTY_NOTICE_FILE
+    ${CMAKE_CURRENT_BINARY_DIR}/THIRD_PARTY_NOTICES.txt
+)
+file(WRITE ${RTVDB_THIRD_PARTY_NOTICE_FILE} [=[rtvdb third-party notices
+
+This distribution statically links the following third-party components:
+
+- SDL: see licenses/SDL/LICENSE.txt.
+- HIDAPI included through SDL: rtvdb uses the original HIDAPI license; see
+  licenses/SDL/hidapi/LICENSE-orig.txt.
+- yuv2rgb included through SDL: see licenses/SDL/yuv2rgb/LICENSE.
+- Dear ImGui: see licenses/imgui/LICENSE.txt.
+- fpng: see licenses/fpng/README.md, the upstream license notice.
+
+The license files above are taken from the corresponding source submodules.
+The presence of an alternative license text in an upstream notice does not
+change the license selected for the component used by rtvdb.
+]=])
+
+install(FILES
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/SDL/LICENSE.txt
+    DESTINATION licenses/SDL
+)
+
+install(FILES
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/SDL/src/hidapi/LICENSE.txt
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/SDL/src/hidapi/LICENSE-orig.txt
+    DESTINATION licenses/SDL/hidapi
+)
+
+install(FILES
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/SDL/src/video/yuv2rgb/LICENSE
+    DESTINATION licenses/SDL/yuv2rgb
+)
+
+install(FILES
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui/LICENSE.txt
+    DESTINATION licenses/imgui
+)
+
+install(FILES
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/fpng/README.md
+    DESTINATION licenses/fpng
+    RENAME README.md
+)
+
+install(FILES
+    ${RTVDB_THIRD_PARTY_NOTICE_FILE}
+    DESTINATION licenses
+)
+
 install(DIRECTORY
     ${CMAKE_CURRENT_SOURCE_DIR}/images
     DESTINATION .
