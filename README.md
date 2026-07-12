@@ -44,8 +44,8 @@ int main() {
 
 ビューワー側の表示 / Viewer output
 <p>
-    <img src="docs/demo_view_a.png" alt="DemoView A" width="360">
-    <img src="docs/demo_view_b.png" alt="DemoView B" width="360">
+    <img src="images/demo_view_a.png" alt="DemoView A" width="360">
+    <img src="images/demo_view_b.png" alt="DemoView B" width="360">
 </p>
 
 ## API
