@@ -577,6 +577,11 @@ install(FILES
     DESTINATION .
 )
 
+install(DIRECTORY
+    ${CMAKE_CURRENT_SOURCE_DIR}/images
+    DESTINATION .
+)
+
 install(TARGETS rtvdb_viewer
     BUNDLE DESTINATION .
     RUNTIME DESTINATION .
