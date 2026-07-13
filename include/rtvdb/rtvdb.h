@@ -3,9 +3,11 @@
 
 #pragma once
 
-#include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <bit>
+#include <concepts>
+#include <type_traits>
 
 namespace rtvdb {
 
@@ -104,6 +106,20 @@ concept rgba_like =
 
 template <class T>
 concept rgb_only_like = rgb_like<T> && !rgba_like<T>;
+
+template <typename T>
+concept copyable_32bit =
+    std::is_trivially_copyable_v<T> &&
+    sizeof(T) == sizeof(std::uint32_t);
+
+namespace detail {
+
+template <copyable_32bit T>
+inline std::uint32_t encode_user_data(const T &value) {
+    return std::bit_cast<std::uint32_t>(value);
+}
+
+} // namespace detail
 
 struct vec3 {
     float x;
@@ -229,30 +245,30 @@ inline void set_color(const Color &value) {
         static_cast<float>(value.a));
 }
 
-template <vec3_like A, vec3_like B, vec3_like C>
-inline bool triangle(const A &a, const B &b, const C &c0, std::uint32_t user_data = 0) {
+template <vec3_like A, vec3_like B, vec3_like C, copyable_32bit UserData = std::uint32_t>
+inline bool triangle(const A &a, const B &b, const C &c0, const UserData &user_data = {}) {
     return triangle(
         static_cast<float>(a.x), static_cast<float>(a.y), static_cast<float>(a.z),
         static_cast<float>(b.x), static_cast<float>(b.y), static_cast<float>(b.z),
         static_cast<float>(c0.x), static_cast<float>(c0.y), static_cast<float>(c0.z),
-        user_data);
+        detail::encode_user_data(user_data));
 }
 
-template <vec3_like Position>
-inline bool point(const Position &position, std::uint32_t user_data = 0) {
+template <vec3_like Position, copyable_32bit UserData = std::uint32_t>
+inline bool point(const Position &position, const UserData &user_data = {}) {
     return point(
         static_cast<float>(position.x),
         static_cast<float>(position.y),
         static_cast<float>(position.z),
-        user_data);
+        detail::encode_user_data(user_data));
 }
 
-template <vec3_like A, vec3_like B>
-inline bool line(const A &a, const B &b, std::uint32_t user_data = 0) {
+template <vec3_like A, vec3_like B, copyable_32bit UserData = std::uint32_t>
+inline bool line(const A &a, const B &b, const UserData &user_data = {}) {
     return line(
         static_cast<float>(a.x), static_cast<float>(a.y), static_cast<float>(a.z),
         static_cast<float>(b.x), static_cast<float>(b.y), static_cast<float>(b.z),
-        user_data);
+        detail::encode_user_data(user_data));
 }
 
 // End: Convenience APIs
