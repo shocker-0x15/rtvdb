@@ -1,4 +1,7 @@
-﻿struct rtvdb_core_ray
+﻿namespace rtvdb {
+namespace core {
+
+struct ray
 {
     float3 origin;
     float3 direction;
@@ -6,23 +9,23 @@
     float max_distance;
 };
 
-struct rtvdb_core_projection_ray
+struct projection_ray
 {
     float3 origin;
     float3 direction;
 };
 
-struct rtvdb_core_intersection
+struct intersection
 {
     bool hit;
     float distance;
     float3 normal;
 };
 
-float rtvdb_core_minimum_forward_projection(float3 bounds_min, float3 bounds_max, float3 forward)
+float minimum_forward_projection(float3 bounds_min, float3 bounds_max, float3 forward)
 {
     float min_projection = dot(bounds_min, forward);
-    for (uint corner_index = 1u; corner_index < 8u; ++corner_index)
+    for (uint32_t corner_index = 1u; corner_index < 8u; ++corner_index)
     {
         const float3 corner = float3(
             (corner_index & 1u) != 0u ? bounds_max.x : bounds_min.x,
@@ -33,7 +36,7 @@ float rtvdb_core_minimum_forward_projection(float3 bounds_min, float3 bounds_max
     return min_projection;
 }
 
-float rtvdb_core_scene_scale(uint bounds_valid, float3 bounds_min, float3 bounds_max)
+float scene_scale(uint32_t bounds_valid, float3 bounds_min, float3 bounds_max)
 {
     if (bounds_valid != 0u)
     {
@@ -42,22 +45,22 @@ float rtvdb_core_scene_scale(uint bounds_valid, float3 bounds_min, float3 bounds
     return 1.0;
 }
 
-float rtvdb_core_scene_intersection_t_min(float scale)
+float scene_intersection_t_min(float scale)
 {
     return max(scale * 1.0e-5, 1.0e-6);
 }
 
-float rtvdb_core_scene_hit_advance_bias(float scale)
+float scene_hit_advance_bias(float scale)
 {
     return max(scale * 1.0e-5, 1.0e-6);
 }
 
-float rtvdb_core_scene_length_sq_epsilon(float scale)
+float scene_length_sq_epsilon(float scale)
 {
     return max(scale * scale * 1.0e-12, 1.0e-12);
 }
 
-float rtvdb_core_approximate_ray_shift(
+float approximate_ray_shift(
     float3 ray_origin,
     float3 ray_direction,
     float3 target,
@@ -74,7 +77,7 @@ float rtvdb_core_approximate_ray_shift(
     return clamp(projected_t, min_t, max_t);
 }
 
-float rtvdb_core_encode_srgb_channel(float value)
+float encode_srgb_channel(float value)
 {
     const float x = clamp(value, 0.0, 1.0);
     if (x <= 0.0031308)
@@ -84,7 +87,7 @@ float rtvdb_core_encode_srgb_channel(float value)
     return 1.055 * pow(x, 1.0 / 2.4) - 0.055;
 }
 
-float3 rtvdb_core_hash_color(uint seed)
+float3 hash_color(uint32_t seed)
 {
     float3 h = float3(float(seed), float(seed), float(seed)) * float3(0.1031, 0.11369, 0.13787);
     h -= floor(h);
@@ -98,7 +101,7 @@ float3 rtvdb_core_hash_color(uint seed)
     return result;
 }
 
-float3 rtvdb_core_safe_normalize(float3 value, float3 fallback)
+float3 safe_normalize(float3 value, float3 fallback)
 {
     const float length_sq = dot(value, value);
     if (length_sq <= 1.0e-12)
@@ -108,31 +111,31 @@ float3 rtvdb_core_safe_normalize(float3 value, float3 fallback)
     return value * rsqrt(length_sq);
 }
 
-float3 rtvdb_core_triangle_normal(float3 a, float3 b, float3 c)
+float3 triangle_normal(float3 a, float3 b, float3 c)
 {
-    return rtvdb_core_safe_normalize(cross(b - a, c - a), float3(0.0, 1.0, 0.0));
+    return safe_normalize(cross(b - a, c - a), float3(0.0, 1.0, 0.0));
 }
 
-float3 rtvdb_core_point_normal(float3 center, float3 hit_position)
+float3 point_normal(float3 center, float3 hit_position)
 {
-    return rtvdb_core_safe_normalize(hit_position - center, float3(0.0, 1.0, 0.0));
+    return safe_normalize(hit_position - center, float3(0.0, 1.0, 0.0));
 }
 
-float3 rtvdb_core_line_normal(float3 a, float3 b, float3 hit_position)
+float3 line_normal(float3 a, float3 b, float3 hit_position)
 {
     const float3 ab = b - a;
     const float ab_len_sq = dot(ab, ab);
     if (ab_len_sq <= 1.0e-12)
     {
-        return rtvdb_core_point_normal(a, hit_position);
+        return point_normal(a, hit_position);
     }
 
     const float u = clamp(dot(hit_position - a, ab) / ab_len_sq, 0.0, 1.0);
     const float3 closest = a + (b - a) * u;
-    return rtvdb_core_safe_normalize(hit_position - closest, float3(0.0, 1.0, 0.0));
+    return safe_normalize(hit_position - closest, float3(0.0, 1.0, 0.0));
 }
 
-bool rtvdb_core_point_contains(
+bool point_contains(
     float3 position,
     float3 center,
     float radius,
@@ -146,7 +149,7 @@ bool rtvdb_core_point_contains(
     return dot(position - center, position - center) < radius_sq;
 }
 
-bool rtvdb_core_capsule_contains(
+bool capsule_contains(
     float3 position,
     float3 a,
     float3 b,
@@ -169,13 +172,13 @@ bool rtvdb_core_capsule_contains(
     return dot(position - closest, position - closest) < radius_sq;
 }
 
-float4 rtvdb_core_apply_display_mode(
+float4 apply_display_mode(
     float4 client_color,
     float3 normal,
-    uint primitive_seed,
-    uint geometry_index,
-    uint instance_index,
-    uint display_mode)
+    uint32_t primitive_seed,
+    uint32_t geometry_index,
+    uint32_t instance_index,
+    uint32_t display_mode)
 {
     const float alpha = clamp(client_color.a, 0.0, 1.0);
     if (display_mode == 1u)
@@ -187,30 +190,30 @@ float4 rtvdb_core_apply_display_mode(
         const float3 light_dir = normalize(float3(0.35, 0.70, 0.62));
         const float diffuse = max(0.0, dot(normal, light_dir));
         const float intensity = 0.18 + (1.0 - 0.18) * diffuse;
-        const float shaded = rtvdb_core_encode_srgb_channel(intensity);
+        const float shaded = encode_srgb_channel(intensity);
         return float4(shaded, shaded, shaded, 1.0);
     }
     if (display_mode == 3u)
     {
-        return float4(rtvdb_core_hash_color(primitive_seed + 1u), 1.0);
+        return float4(hash_color(primitive_seed + 1u), 1.0);
     }
     if (display_mode == 4u)
     {
-        return float4(rtvdb_core_hash_color(geometry_index + 1u), 1.0);
+        return float4(hash_color(geometry_index + 1u), 1.0);
     }
     if (display_mode == 5u)
     {
-        return float4(rtvdb_core_hash_color(instance_index + 1u), 1.0);
+        return float4(hash_color(instance_index + 1u), 1.0);
     }
     return float4(normal * 0.5 + 0.5, 1.0);
 }
 
-float4 rtvdb_core_apply_hover_highlight(
+float4 apply_hover_highlight(
     float4 color,
-    uint primitive_kind,
-    uint primitive_index,
-    uint hover_kind,
-    uint hover_primitive_index,
+    uint32_t primitive_kind,
+    uint32_t primitive_index,
+    uint32_t hover_kind,
+    uint32_t hover_primitive_index,
     float hover_mix)
 {
     if (hover_kind == 0u ||
@@ -230,8 +233,8 @@ float4 rtvdb_core_apply_hover_highlight(
     return color;
 }
 
-rtvdb_core_projection_ray rtvdb_core_build_projection_ray(
-    uint projection,
+projection_ray build_projection_ray(
+    uint32_t projection,
     float2 uv,
     float projection_param0,
     float projection_param1,
@@ -240,11 +243,11 @@ rtvdb_core_projection_ray rtvdb_core_build_projection_ray(
     float3 right,
     float3 up,
     float aspect,
-    uint scene_bounds_valid,
+    uint32_t scene_bounds_valid,
     float3 scene_bounds_min,
     float3 scene_bounds_max)
 {
-    rtvdb_core_projection_ray result;
+    projection_ray result;
     result.origin = origin;
     result.direction = forward;
     if (projection == 2u)
@@ -254,7 +257,7 @@ rtvdb_core_projection_ray rtvdb_core_build_projection_ray(
         result.origin += right * (uv.x * ortho_width * 0.5) + up * (uv.y * ortho_height * 0.5);
         if (scene_bounds_valid != 0u)
         {
-            const float min_forward = rtvdb_core_minimum_forward_projection(
+            const float min_forward = minimum_forward_projection(
                 scene_bounds_min,
                 scene_bounds_max,
                 forward);
@@ -285,13 +288,13 @@ rtvdb_core_projection_ray rtvdb_core_build_projection_ray(
     return result;
 }
 
-rtvdb_core_intersection rtvdb_core_intersect_sphere(
-    rtvdb_core_ray view_ray,
+intersection intersect_sphere(
+    ray view_ray,
     float3 center,
     float radius,
     float min_hit_distance)
 {
-    rtvdb_core_intersection result;
+    intersection result;
     result.hit = false;
     result.distance = 0.0;
     result.normal = float3(0.0, 1.0, 0.0);
@@ -301,7 +304,7 @@ rtvdb_core_intersection rtvdb_core_intersect_sphere(
     {
         return result;
     }
-    const float shift_t = rtvdb_core_approximate_ray_shift(
+    const float shift_t = approximate_ray_shift(
         view_ray.origin,
         view_ray.direction,
         center,
@@ -331,19 +334,19 @@ rtvdb_core_intersection rtvdb_core_intersect_sphere(
     const float3 position = view_ray.origin + view_ray.direction * distance;
     result.hit = true;
     result.distance = distance;
-    result.normal = rtvdb_core_safe_normalize(position - center, float3(0.0, 1.0, 0.0));
+    result.normal = safe_normalize(position - center, float3(0.0, 1.0, 0.0));
     return result;
 }
 
-rtvdb_core_intersection rtvdb_core_intersect_capsule(
-    rtvdb_core_ray view_ray,
+intersection intersect_capsule(
+    ray view_ray,
     float3 a,
     float3 b,
     float radius,
     float min_hit_distance,
     float length_sq_epsilon)
 {
-    rtvdb_core_intersection result;
+    intersection result;
     result.hit = false;
     result.distance = 0.0;
     result.normal = float3(0.0, 1.0, 0.0);
@@ -357,7 +360,7 @@ rtvdb_core_intersection rtvdb_core_intersect_capsule(
     }
 
     const float3 shift_target = baba <= length_sq_epsilon ? a : a + ba * 0.5;
-    const float shift_t = rtvdb_core_approximate_ray_shift(
+    const float shift_t = approximate_ray_shift(
         view_ray.origin,
         view_ray.direction,
         shift_target,
@@ -374,7 +377,7 @@ rtvdb_core_intersection rtvdb_core_intersect_capsule(
 
     if (baba <= length_sq_epsilon)
     {
-        return rtvdb_core_intersect_sphere(view_ray, a, radius, min_hit_distance);
+        return intersect_sphere(view_ray, a, radius, min_hit_distance);
     }
 
     {
@@ -403,7 +406,7 @@ rtvdb_core_intersection rtvdb_core_intersect_capsule(
         }
     }
 
-    const rtvdb_core_intersection hit_a = rtvdb_core_intersect_sphere(
+    const intersection hit_a = intersect_sphere(
         view_ray,
         a,
         radius,
@@ -412,7 +415,7 @@ rtvdb_core_intersection rtvdb_core_intersect_capsule(
     {
         best_distance = hit_a.distance;
     }
-    const rtvdb_core_intersection hit_b = rtvdb_core_intersect_sphere(
+    const intersection hit_b = intersect_sphere(
         view_ray,
         b,
         radius,
@@ -431,6 +434,9 @@ rtvdb_core_intersection rtvdb_core_intersect_capsule(
     const float3 axis_point = a + ba * u;
     result.hit = true;
     result.distance = best_distance;
-    result.normal = rtvdb_core_safe_normalize(position - axis_point, float3(0.0, 1.0, 0.0));
+    result.normal = safe_normalize(position - axis_point, float3(0.0, 1.0, 0.0));
     return result;
 }
+
+} // namespace core
+} // namespace rtvdb

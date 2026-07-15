@@ -2,6 +2,8 @@
 
 project(rtvdb VERSION 0.1.0 LANGUAGES CXX)
 
+set_property(GLOBAL PROPERTY USE_FOLDERS ON)
+
 if(APPLE)
     enable_language(OBJCXX)
 endif()
@@ -9,6 +11,15 @@ endif()
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+
+function(rtvdb_add_client target source)
+    add_executable(${target} "${source}")
+    set_target_properties(${target} PROPERTIES FOLDER clients)
+    target_link_libraries(${target} PRIVATE rtvdb_header)
+    if(WIN32)
+        target_link_libraries(${target} PRIVATE ws2_32)
+    endif()
+endfunction()
 
 if(WIN32)
     option(RTVDB_ENABLE_D3D12_DXR "Build the viewer against the D3D12 DXR backend" ON)
@@ -41,41 +52,78 @@ set(RTVDB_SHADER_SHARED_HEADERS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/viewer_backend/shaders/rt_logic_shared_impl.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/viewer_backend/shaders/rt_logic_shared_core.h
 )
+set(RTVDB_VIEWER_BACKEND_SHADER_OUTPUTS)
+
+function(rtvdb_set_hlsl_vs_custom_build source message command outputs additional_inputs)
+    if(CMAKE_GENERATOR MATCHES "Visual Studio")
+        set(_vs_settings
+            "Message=${message}"
+            "Command=${command}"
+            "Outputs=${outputs}"
+            "AdditionalInputs=${additional_inputs}")
+        list(JOIN _vs_settings ";" _vs_settings_value)
+        set_source_files_properties(${source} PROPERTIES
+            VS_TOOL_OVERRIDE CustomBuild
+            VS_SETTINGS "${_vs_settings_value}")
+    endif()
+endfunction()
 
 if(WIN32 AND RTVDB_ENABLE_D3D12_DXR)
     set(RTVDB_D3D12_RAYTRACING_HLSL ${CMAKE_CURRENT_SOURCE_DIR}/src/viewer_backend/d3d12/d3d12_raytracing.hlsl)
     set(RTVDB_D3D12_RAYTRACING_DXIL ${CMAKE_CURRENT_BINARY_DIR}/generated/d3d12_raytracing.dxil)
     set(RTVDB_D3D12_RAYTRACING_HEADER ${CMAKE_CURRENT_BINARY_DIR}/generated/rtvdb_d3d12_raytracing_dxil.h)
+    set(RTVDB_D3D12_RAYTRACING_STAMP ${CMAKE_CURRENT_BINARY_DIR}/generated/d3d12_raytracing.shader.stamp)
+    set(RTVDB_D3D12_SHADER_SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/cmake/compile_d3d12_raytracing_shader.cmake)
+    set(_rtvdb_d3d12_shader_inputs
+        ${RTVDB_D3D12_RAYTRACING_HLSL}
+        ${RTVDB_SHADER_SHARED_HEADERS}
+        ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary_as_header.cmake
+        ${RTVDB_D3D12_SHADER_SCRIPT})
+    list(JOIN _rtvdb_d3d12_shader_inputs ";" RTVDB_D3D12_SHADER_INPUTS)
 
     add_custom_command(
-        OUTPUT ${RTVDB_D3D12_RAYTRACING_DXIL} ${RTVDB_D3D12_RAYTRACING_HEADER}
-        MAIN_DEPENDENCY ${RTVDB_D3D12_RAYTRACING_HLSL}
-        COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/generated
-        COMMAND ${RTVDB_DXC_EXECUTABLE}
-            -T lib_6_6
-            -HV 2021
-            -Zi
-            -Qembed_debug
-            -Fo ${RTVDB_D3D12_RAYTRACING_DXIL}
-            ${RTVDB_D3D12_RAYTRACING_HLSL}
+        OUTPUT
+            ${RTVDB_D3D12_RAYTRACING_DXIL}
+            ${RTVDB_D3D12_RAYTRACING_HEADER}
+            ${RTVDB_D3D12_RAYTRACING_STAMP}
         COMMAND ${CMAKE_COMMAND}
-            -DINPUT_FILE=${RTVDB_D3D12_RAYTRACING_DXIL}
-            -DOUTPUT_FILE=${RTVDB_D3D12_RAYTRACING_HEADER}
-            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary_as_header.cmake
+            -DDXC_EXECUTABLE=${RTVDB_DXC_EXECUTABLE}
+            -DHLSL_INPUT=${RTVDB_D3D12_RAYTRACING_HLSL}
+            -DDXIL_OUTPUT=${RTVDB_D3D12_RAYTRACING_DXIL}
+            -DEMBEDDED_HEADER_OUTPUT=${RTVDB_D3D12_RAYTRACING_HEADER}
+            -DEMBED_SCRIPT=${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary_as_header.cmake
+            -DSTAMP_OUTPUT=${RTVDB_D3D12_RAYTRACING_STAMP}
+            -P ${RTVDB_D3D12_SHADER_SCRIPT}
         DEPENDS
             ${RTVDB_D3D12_RAYTRACING_HLSL}
             ${RTVDB_SHADER_SHARED_HEADERS}
             ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary_as_header.cmake
+            ${RTVDB_D3D12_SHADER_SCRIPT}
         VERBATIM
     )
 
-    add_custom_target(rtvdb_d3d12_raytracing_shaders
-        DEPENDS
-            ${RTVDB_D3D12_RAYTRACING_DXIL}
-            ${RTVDB_D3D12_RAYTRACING_HEADER})
+    set_source_files_properties(${RTVDB_D3D12_RAYTRACING_HLSL}
+        PROPERTIES HEADER_FILE_ONLY TRUE)
+    string(CONCAT _rtvdb_d3d12_vs_command
+        "\"${CMAKE_COMMAND}\" -DDXC_EXECUTABLE=\"${RTVDB_DXC_EXECUTABLE}\" "
+        "-DHLSL_INPUT=\"${RTVDB_D3D12_RAYTRACING_HLSL}\" "
+        "-DDXIL_OUTPUT=\"${RTVDB_D3D12_RAYTRACING_DXIL}\" "
+        "-DEMBEDDED_HEADER_OUTPUT=\"${RTVDB_D3D12_RAYTRACING_HEADER}\" "
+        "-DEMBED_SCRIPT=\"${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary_as_header.cmake\" "
+        "-DSTAMP_OUTPUT=\"${RTVDB_D3D12_RAYTRACING_STAMP}\" "
+        "-P \"${RTVDB_D3D12_SHADER_SCRIPT}\"")
+    rtvdb_set_hlsl_vs_custom_build(
+        ${RTVDB_D3D12_RAYTRACING_HLSL}
+        "Generating generated/d3d12_raytracing.dxil, generated/rtvdb_d3d12_raytracing_dxil.h"
+        "${_rtvdb_d3d12_vs_command}"
+        ${RTVDB_D3D12_RAYTRACING_STAMP}
+        "$(RTVDB_D3D12_SHADER_INPUTS)")
+    list(APPEND RTVDB_VIEWER_BACKEND_SHADER_OUTPUTS
+        ${RTVDB_D3D12_RAYTRACING_DXIL}
+        ${RTVDB_D3D12_RAYTRACING_HEADER}
+        ${RTVDB_D3D12_RAYTRACING_STAMP})
 
-    source_group("Shader Files" FILES ${RTVDB_D3D12_RAYTRACING_HLSL} ${RTVDB_SHADER_SHARED_HEADERS})
-    source_group("CMake Files" FILES ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary_as_header.cmake)
+    source_group("Source Files\\viewer_backend\\d3d12" FILES ${RTVDB_D3D12_RAYTRACING_HLSL})
 endif()
 
 if(RTVDB_ENABLE_VULKAN_RT)
@@ -101,6 +149,14 @@ if(RTVDB_ENABLE_VULKAN_RT)
     set(RTVDB_VULKAN_RT_POINT_RINT_SPV ${CMAKE_CURRENT_BINARY_DIR}/generated/vulkan_rt_point.rint.spv)
     set(RTVDB_VULKAN_RT_LINE_RCHIT_SPV ${CMAKE_CURRENT_BINARY_DIR}/generated/vulkan_rt_line.rchit.spv)
     set(RTVDB_VULKAN_RT_LINE_RINT_SPV ${CMAKE_CURRENT_BINARY_DIR}/generated/vulkan_rt_line.rint.spv)
+    set(RTVDB_VULKAN_RT_STAMP ${CMAKE_CURRENT_BINARY_DIR}/generated/vulkan_rt.shader.stamp)
+    set(RTVDB_VULKAN_SHADER_SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/cmake/compile_vulkan_rt_shaders.cmake)
+    set(_rtvdb_vulkan_shader_inputs
+        ${RTVDB_VULKAN_RT_HLSL}
+        ${RTVDB_SHADER_SHARED_HEADERS}
+        ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary_as_header.cmake
+        ${RTVDB_VULKAN_SHADER_SCRIPT})
+    list(JOIN _rtvdb_vulkan_shader_inputs ";" RTVDB_VULKAN_SHADER_INPUTS)
     set(RTVDB_VULKAN_RT_RGEN_HEADER ${CMAKE_CURRENT_BINARY_DIR}/generated/rtvdb_vulkan_rt_rgen_spv.h)
     set(RTVDB_VULKAN_RT_PICK_RGEN_HEADER ${CMAKE_CURRENT_BINARY_DIR}/generated/rtvdb_vulkan_rt_pick_rgen_spv.h)
     set(RTVDB_VULKAN_RT_RMISS_HEADER ${CMAKE_CURRENT_BINARY_DIR}/generated/rtvdb_vulkan_rt_rmiss_spv.h)
@@ -128,136 +184,47 @@ if(RTVDB_ENABLE_VULKAN_RT)
             ${RTVDB_VULKAN_RT_POINT_RINT_HEADER}
             ${RTVDB_VULKAN_RT_LINE_RCHIT_HEADER}
             ${RTVDB_VULKAN_RT_LINE_RINT_HEADER}
-        MAIN_DEPENDENCY ${RTVDB_VULKAN_RT_HLSL}
-        COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/generated
-        COMMAND ${RTVDB_SPIRV_DXC_EXECUTABLE}
-            -spirv
-            -fspv-target-env=vulkan1.3
-            -T lib_6_6
-            -E RayGen
-            -D RTVDB_VULKAN_COMPILE_RAYGEN=1
-            -HV 2021
-            -Fo ${RTVDB_VULKAN_RT_RGEN_SPV}
-            ${RTVDB_VULKAN_RT_HLSL}
-        COMMAND ${RTVDB_SPIRV_DXC_EXECUTABLE}
-            -spirv
-            -fspv-target-env=vulkan1.3
-            -T lib_6_6
-            -E PickRayGen
-            -D RTVDB_VULKAN_COMPILE_PICK_RAYGEN=1
-            -HV 2021
-            -Fo ${RTVDB_VULKAN_RT_PICK_RGEN_SPV}
-            ${RTVDB_VULKAN_RT_HLSL}
-        COMMAND ${RTVDB_SPIRV_DXC_EXECUTABLE}
-            -spirv
-            -fspv-target-env=vulkan1.3
-            -T lib_6_6
-            -E Miss
-            -D RTVDB_VULKAN_COMPILE_MISS=1
-            -HV 2021
-            -Fo ${RTVDB_VULKAN_RT_RMISS_SPV}
-            ${RTVDB_VULKAN_RT_HLSL}
-        COMMAND ${RTVDB_SPIRV_DXC_EXECUTABLE}
-            -spirv
-            -fspv-target-env=vulkan1.3
-            -T lib_6_6
-            -E ClosestHitTriangle
-            -D RTVDB_VULKAN_COMPILE_TRIANGLE_CLOSEST_HIT=1
-            -HV 2021
-            -Fo ${RTVDB_VULKAN_RT_RCHIT_SPV}
-            ${RTVDB_VULKAN_RT_HLSL}
-        COMMAND ${RTVDB_SPIRV_DXC_EXECUTABLE}
-            -spirv
-            -fspv-target-env=vulkan1.3
-            -T lib_6_6
-            -E ClosestHitPoint
-            -D RTVDB_VULKAN_COMPILE_POINT_CLOSEST_HIT=1
-            -HV 2021
-            -Fo ${RTVDB_VULKAN_RT_POINT_RCHIT_SPV}
-            ${RTVDB_VULKAN_RT_HLSL}
-        COMMAND ${RTVDB_SPIRV_DXC_EXECUTABLE}
-            -spirv
-            -fspv-target-env=vulkan1.3
-            -T lib_6_6
-            -E IntersectionPoint
-            -D RTVDB_VULKAN_COMPILE_POINT_INTERSECTION=1
-            -HV 2021
-            -Fo ${RTVDB_VULKAN_RT_POINT_RINT_SPV}
-            ${RTVDB_VULKAN_RT_HLSL}
-        COMMAND ${RTVDB_SPIRV_DXC_EXECUTABLE}
-            -spirv
-            -fspv-target-env=vulkan1.3
-            -T lib_6_6
-            -E ClosestHitLine
-            -D RTVDB_VULKAN_COMPILE_LINE_CLOSEST_HIT=1
-            -HV 2021
-            -Fo ${RTVDB_VULKAN_RT_LINE_RCHIT_SPV}
-            ${RTVDB_VULKAN_RT_HLSL}
-        COMMAND ${RTVDB_SPIRV_DXC_EXECUTABLE}
-            -spirv
-            -fspv-target-env=vulkan1.3
-            -T lib_6_6
-            -E IntersectionLine
-            -D RTVDB_VULKAN_COMPILE_LINE_INTERSECTION=1
-            -HV 2021
-            -Fo ${RTVDB_VULKAN_RT_LINE_RINT_SPV}
-            ${RTVDB_VULKAN_RT_HLSL}
+            ${RTVDB_VULKAN_RT_STAMP}
         COMMAND ${CMAKE_COMMAND}
-            -DINPUT_FILE=${RTVDB_VULKAN_RT_RGEN_SPV}
-            -DOUTPUT_FILE=${RTVDB_VULKAN_RT_RGEN_HEADER}
-            -DSYMBOL_NAME=kVulkanRtRaygenSpirv
-            -DSIZE_NAME=kVulkanRtRaygenSpirvSize
-            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary_as_header.cmake
-        COMMAND ${CMAKE_COMMAND}
-            -DINPUT_FILE=${RTVDB_VULKAN_RT_PICK_RGEN_SPV}
-            -DOUTPUT_FILE=${RTVDB_VULKAN_RT_PICK_RGEN_HEADER}
-            -DSYMBOL_NAME=kVulkanRtPickRaygenSpirv
-            -DSIZE_NAME=kVulkanRtPickRaygenSpirvSize
-            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary_as_header.cmake
-        COMMAND ${CMAKE_COMMAND}
-            -DINPUT_FILE=${RTVDB_VULKAN_RT_RMISS_SPV}
-            -DOUTPUT_FILE=${RTVDB_VULKAN_RT_RMISS_HEADER}
-            -DSYMBOL_NAME=kVulkanRtMissSpirv
-            -DSIZE_NAME=kVulkanRtMissSpirvSize
-            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary_as_header.cmake
-        COMMAND ${CMAKE_COMMAND}
-            -DINPUT_FILE=${RTVDB_VULKAN_RT_RCHIT_SPV}
-            -DOUTPUT_FILE=${RTVDB_VULKAN_RT_RCHIT_HEADER}
-            -DSYMBOL_NAME=kVulkanRtClosestHitSpirv
-            -DSIZE_NAME=kVulkanRtClosestHitSpirvSize
-            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary_as_header.cmake
-        COMMAND ${CMAKE_COMMAND}
-            -DINPUT_FILE=${RTVDB_VULKAN_RT_POINT_RCHIT_SPV}
-            -DOUTPUT_FILE=${RTVDB_VULKAN_RT_POINT_RCHIT_HEADER}
-            -DSYMBOL_NAME=kVulkanRtPointClosestHitSpirv
-            -DSIZE_NAME=kVulkanRtPointClosestHitSpirvSize
-            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary_as_header.cmake
-        COMMAND ${CMAKE_COMMAND}
-            -DINPUT_FILE=${RTVDB_VULKAN_RT_POINT_RINT_SPV}
-            -DOUTPUT_FILE=${RTVDB_VULKAN_RT_POINT_RINT_HEADER}
-            -DSYMBOL_NAME=kVulkanRtPointIntersectionSpirv
-            -DSIZE_NAME=kVulkanRtPointIntersectionSpirvSize
-            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary_as_header.cmake
-        COMMAND ${CMAKE_COMMAND}
-            -DINPUT_FILE=${RTVDB_VULKAN_RT_LINE_RCHIT_SPV}
-            -DOUTPUT_FILE=${RTVDB_VULKAN_RT_LINE_RCHIT_HEADER}
-            -DSYMBOL_NAME=kVulkanRtLineClosestHitSpirv
-            -DSIZE_NAME=kVulkanRtLineClosestHitSpirvSize
-            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary_as_header.cmake
-        COMMAND ${CMAKE_COMMAND}
-            -DINPUT_FILE=${RTVDB_VULKAN_RT_LINE_RINT_SPV}
-            -DOUTPUT_FILE=${RTVDB_VULKAN_RT_LINE_RINT_HEADER}
-            -DSYMBOL_NAME=kVulkanRtLineIntersectionSpirv
-            -DSIZE_NAME=kVulkanRtLineIntersectionSpirvSize
-            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary_as_header.cmake
+            -DDXC_EXECUTABLE=${RTVDB_SPIRV_DXC_EXECUTABLE}
+            -DHLSL_INPUT=${RTVDB_VULKAN_RT_HLSL}
+            -DOUTPUT_DIRECTORY=${CMAKE_CURRENT_BINARY_DIR}/generated
+            -DEMBED_SCRIPT=${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary_as_header.cmake
+            -DSTAMP_OUTPUT=${RTVDB_VULKAN_RT_STAMP}
+            -P ${RTVDB_VULKAN_SHADER_SCRIPT}
         DEPENDS
             ${RTVDB_VULKAN_RT_HLSL}
             ${RTVDB_SHADER_SHARED_HEADERS}
             ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary_as_header.cmake
+            ${RTVDB_VULKAN_SHADER_SCRIPT}
         VERBATIM
     )
 
-    set(RTVDB_VULKAN_RT_GENERATED_HEADERS
+    set_source_files_properties(${RTVDB_VULKAN_RT_HLSL}
+        PROPERTIES HEADER_FILE_ONLY TRUE)
+    string(CONCAT _rtvdb_vulkan_vs_command
+        "\"${CMAKE_COMMAND}\" -DDXC_EXECUTABLE=\"${RTVDB_SPIRV_DXC_EXECUTABLE}\" "
+        "-DHLSL_INPUT=\"${RTVDB_VULKAN_RT_HLSL}\" "
+        "-DOUTPUT_DIRECTORY=\"${CMAKE_CURRENT_BINARY_DIR}/generated\" "
+        "-DEMBED_SCRIPT=\"${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary_as_header.cmake\" "
+        "-DSTAMP_OUTPUT=\"${RTVDB_VULKAN_RT_STAMP}\" "
+        "-P \"${RTVDB_VULKAN_SHADER_SCRIPT}\"")
+    rtvdb_set_hlsl_vs_custom_build(
+        ${RTVDB_VULKAN_RT_HLSL}
+        "Generating Vulkan RT SPIR-V binaries and embedded headers"
+        "${_rtvdb_vulkan_vs_command}"
+        ${RTVDB_VULKAN_RT_STAMP}
+        "$(RTVDB_VULKAN_SHADER_INPUTS)")
+
+    list(APPEND RTVDB_VIEWER_BACKEND_SHADER_OUTPUTS
+        ${RTVDB_VULKAN_RT_RGEN_SPV}
+        ${RTVDB_VULKAN_RT_PICK_RGEN_SPV}
+        ${RTVDB_VULKAN_RT_RMISS_SPV}
+        ${RTVDB_VULKAN_RT_RCHIT_SPV}
+        ${RTVDB_VULKAN_RT_POINT_RCHIT_SPV}
+        ${RTVDB_VULKAN_RT_POINT_RINT_SPV}
+        ${RTVDB_VULKAN_RT_LINE_RCHIT_SPV}
+        ${RTVDB_VULKAN_RT_LINE_RINT_SPV}
         ${RTVDB_VULKAN_RT_RGEN_HEADER}
         ${RTVDB_VULKAN_RT_PICK_RGEN_HEADER}
         ${RTVDB_VULKAN_RT_RMISS_HEADER}
@@ -266,20 +233,8 @@ if(RTVDB_ENABLE_VULKAN_RT)
         ${RTVDB_VULKAN_RT_POINT_RINT_HEADER}
         ${RTVDB_VULKAN_RT_LINE_RCHIT_HEADER}
         ${RTVDB_VULKAN_RT_LINE_RINT_HEADER}
-    )
-    add_custom_target(rtvdb_vulkan_rt_shaders
-        DEPENDS
-            ${RTVDB_VULKAN_RT_RGEN_SPV}
-            ${RTVDB_VULKAN_RT_PICK_RGEN_SPV}
-            ${RTVDB_VULKAN_RT_RMISS_SPV}
-            ${RTVDB_VULKAN_RT_RCHIT_SPV}
-            ${RTVDB_VULKAN_RT_POINT_RCHIT_SPV}
-            ${RTVDB_VULKAN_RT_POINT_RINT_SPV}
-            ${RTVDB_VULKAN_RT_LINE_RCHIT_SPV}
-            ${RTVDB_VULKAN_RT_LINE_RINT_SPV}
-            ${RTVDB_VULKAN_RT_GENERATED_HEADERS})
-    source_group("Shader Files" FILES ${RTVDB_VULKAN_RT_HLSL} ${RTVDB_SHADER_SHARED_HEADERS})
-    source_group("CMake Files" FILES ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary_as_header.cmake)
+        ${RTVDB_VULKAN_RT_STAMP})
+    source_group("Source Files\\viewer_backend\\vulkan" FILES ${RTVDB_VULKAN_RT_HLSL})
 endif()
 
 if(APPLE)
@@ -350,8 +305,13 @@ if(APPLE)
     set(RTVDB_METAL_RT_GENERATED_HEADERS ${RTVDB_METAL_RT_SHADER_METALLIB_HEADER})
 
     source_group("Shader Files" FILES ${RTVDB_METAL_RT_SHADER_MSL} ${RTVDB_METAL_SHADER_SHARED_HEADERS})
-    source_group("CMake Files" FILES ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary_as_header.cmake)
 endif()
+
+source_group("Shader Files" FILES ${RTVDB_SHADER_SHARED_HEADERS})
+source_group("CMake Files" FILES
+    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary_as_header.cmake
+    ${RTVDB_D3D12_SHADER_SCRIPT}
+    ${RTVDB_VULKAN_SHADER_SCRIPT})
 
 set(SDL_SHARED OFF CACHE BOOL "Build SDL shared library" FORCE)
 set(SDL_STATIC ON CACHE BOOL "Build SDL static library" FORCE)
@@ -398,6 +358,18 @@ elseif(APPLE)
 endif()
 
 add_library(rtvdb_viewer_backend ${RTVDB_VIEWER_BACKEND_SOURCES})
+if(RTVDB_VIEWER_BACKEND_SHADER_OUTPUTS AND NOT CMAKE_GENERATOR MATCHES "Visual Studio")
+    set_property(SOURCE src/viewer_backend/backend.cpp APPEND PROPERTY OBJECT_DEPENDS
+        "${RTVDB_VIEWER_BACKEND_SHADER_OUTPUTS}")
+endif()
+if(WIN32 AND RTVDB_ENABLE_D3D12_DXR)
+    set_target_properties(rtvdb_viewer_backend PROPERTIES
+        VS_GLOBAL_RTVDB_D3D12_SHADER_INPUTS "${RTVDB_D3D12_SHADER_INPUTS}")
+endif()
+if(RTVDB_ENABLE_VULKAN_RT)
+    set_target_properties(rtvdb_viewer_backend PROPERTIES
+        VS_GLOBAL_RTVDB_VULKAN_SHADER_INPUTS "${RTVDB_VULKAN_SHADER_INPUTS}")
+endif()
 target_include_directories(rtvdb_viewer_backend PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -416,7 +388,6 @@ if(RTVDB_ENABLE_VULKAN_RT)
             ${RTVDB_SHADER_SHARED_HEADERS})
 endif()
 if(WIN32 AND RTVDB_ENABLE_D3D12_DXR)
-    add_dependencies(rtvdb_viewer_backend rtvdb_d3d12_raytracing_shaders)
     target_include_directories(rtvdb_viewer_backend PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 endif()
 if(APPLE)
@@ -427,7 +398,6 @@ if(APPLE)
     target_include_directories(rtvdb_viewer_backend PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 endif()
 if(RTVDB_ENABLE_VULKAN_RT)
-    add_dependencies(rtvdb_viewer_backend rtvdb_vulkan_rt_shaders)
     target_include_directories(rtvdb_viewer_backend PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 endif()
 if(WIN32 AND RTVDB_ENABLE_D3D12_DXR)
@@ -563,29 +533,9 @@ if(WIN32 AND RTVDB_ENABLE_D3D12_DXR)
     )
 endif()
 
-add_executable(rtvdb_example_client
-    examples/basic_client.cpp
-)
-target_link_libraries(rtvdb_example_client PRIVATE rtvdb_header)
-if(WIN32)
-    target_link_libraries(rtvdb_example_client PRIVATE ws2_32)
-endif()
-
-add_executable(rtvdb_obj_stream_client
-    examples/obj_stream_client.cpp
-)
-target_link_libraries(rtvdb_obj_stream_client PRIVATE rtvdb_header)
-if(WIN32)
-    target_link_libraries(rtvdb_obj_stream_client PRIVATE ws2_32)
-endif()
-
-add_executable(rtvdb_bt2020_volume_client
-    examples/bt2020_volume_client.cpp
-)
-target_link_libraries(rtvdb_bt2020_volume_client PRIVATE rtvdb_header)
-if(WIN32)
-    target_link_libraries(rtvdb_bt2020_volume_client PRIVATE ws2_32)
-endif()
+rtvdb_add_client(rtvdb_example_client examples/basic_client.cpp)
+rtvdb_add_client(rtvdb_obj_stream_client examples/obj_stream_client.cpp)
+rtvdb_add_client(rtvdb_bt2020_volume_client examples/bt2020_volume_client.cpp)
 
 install(FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/include/rtvdb/rtvdb.h

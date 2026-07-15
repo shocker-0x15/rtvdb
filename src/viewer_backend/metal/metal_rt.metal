@@ -3,6 +3,7 @@
 using namespace metal;
 using namespace metal::raytracing;
 #include "../shaders/rt_logic_shared_core.h"
+using namespace rtvdb;
 
 struct camera_gpu {
     float4 origin;
@@ -96,22 +97,22 @@ constant uint kLineFlagFixedColor = 1u << 0;
 constant uint kLineFlagNonPickable = 1u << 1;
 
 float scene_scale(constant camera_gpu &camera) {
-    return rtvdb_core_scene_scale(
+    return core::scene_scale(
         camera.scene_bounds_valid,
         camera.scene_bounds_min.xyz,
         camera.scene_bounds_max.xyz);
 }
 
 float scene_intersection_t_min(constant camera_gpu &camera) {
-    return max(rtvdb_core_scene_intersection_t_min(scene_scale(camera)), kRayMinDistanceFallback);
+    return max(core::scene_intersection_t_min(scene_scale(camera)), kRayMinDistanceFallback);
 }
 
 float scene_hit_advance_bias(constant camera_gpu &camera) {
-    return max(rtvdb_core_scene_hit_advance_bias(scene_scale(camera)), kRayHitAdvanceBiasFallback);
+    return max(core::scene_hit_advance_bias(scene_scale(camera)), kRayHitAdvanceBiasFallback);
 }
 
 float scene_length_sq_epsilon(constant camera_gpu &camera) {
-    return rtvdb_core_scene_length_sq_epsilon(scene_scale(camera));
+    return core::scene_length_sq_epsilon(scene_scale(camera));
 }
 
 hit_info trace_points(
@@ -156,12 +157,12 @@ bool intersect_sphere(
     float min_hit_distance,
     thread float &out_distance,
     thread float3 &out_normal) {
-    rtvdb_core_ray core_ray;
+    core::ray core_ray;
     core_ray.origin = view_ray.origin;
     core_ray.direction = view_ray.direction;
     core_ray.min_distance = min_hit_distance;
     core_ray.max_distance = view_ray.max_distance;
-    const rtvdb_core_intersection hit = rtvdb_core_intersect_sphere(
+    const core::intersection hit = core::intersect_sphere(
         core_ray,
         center,
         radius,
@@ -181,12 +182,12 @@ bool intersect_capsule(
     float length_sq_epsilon,
     thread float &out_distance,
     thread float3 &out_normal) {
-    rtvdb_core_ray core_ray;
+    core::ray core_ray;
     core_ray.origin = view_ray.origin;
     core_ray.direction = view_ray.direction;
     core_ray.min_distance = min_hit_distance;
     core_ray.max_distance = view_ray.max_distance;
-    const rtvdb_core_intersection hit = rtvdb_core_intersect_capsule(
+    const core::intersection hit = core::intersect_capsule(
         core_ray,
         float3(primitive.a),
         float3(primitive.b),
@@ -209,7 +210,7 @@ float4 shade_hit(const thread hit_info &hit, constant camera_gpu &camera) {
             : hit.kind == 1u
                 ? 1000000u + hit.primitive_id
                 : 2000000u + hit.primitive_id;
-        color = rtvdb_core_apply_display_mode(
+        color = core::apply_display_mode(
             hit.color,
             hit.normal,
             primitive_seed,
@@ -219,7 +220,7 @@ float4 shade_hit(const thread hit_info &hit, constant camera_gpu &camera) {
     }
 
     if ((hit.flags & kLineFlagFixedColor) == 0u) {
-        color = rtvdb_core_apply_hover_highlight(
+        color = core::apply_hover_highlight(
             color,
             hit.kind + 1u,
             hit.primitive_id,
@@ -347,7 +348,7 @@ hit_info trace_points(
             continue;
         }
         const point_gpu primitive = points[primitive_index];
-        if (rtvdb_core_point_contains(
+        if (core::point_contains(
                 camera.origin.xyz,
                 float3(primitive.position),
                 primitive.radius,
@@ -370,7 +371,7 @@ hit_info trace_points(
         return result;
     }
     const point_gpu primitive = points[primitive_index];
-    if (rtvdb_core_point_contains(
+    if (core::point_contains(
             camera.origin.xyz,
             float3(primitive.position),
             primitive.radius,
@@ -421,7 +422,7 @@ hit_info trace_lines(
         if (is_pick_pass && (primitive.flags & kLineFlagNonPickable) != 0u) {
             continue;
         }
-        if (rtvdb_core_capsule_contains(
+        if (core::capsule_contains(
                 camera.origin.xyz,
                 float3(primitive.a),
                 float3(primitive.b),
@@ -449,7 +450,7 @@ hit_info trace_lines(
     if (is_pick_pass && (primitive.flags & kLineFlagNonPickable) != 0u) {
         return result;
     }
-    if (rtvdb_core_capsule_contains(
+    if (core::capsule_contains(
             camera.origin.xyz,
             float3(primitive.a),
             float3(primitive.b),
@@ -499,7 +500,7 @@ void build_projection_ray(
     thread float3 &ray_origin,
     thread float3 &direction)
 {
-    const rtvdb_core_projection_ray result = rtvdb_core_build_projection_ray(
+    const core::projection_ray result = core::build_projection_ray(
         projection,
         ndc,
         projection_param0,

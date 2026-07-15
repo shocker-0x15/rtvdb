@@ -1,8 +1,10 @@
 ﻿#include "rt_logic_shared_core.h"
 
+using namespace rtvdb;
+
 float scene_scale()
 {
-    return rtvdb_core_scene_scale(
+    return core::scene_scale(
         shared_scene_bounds_valid(),
         shared_scene_bounds_min(),
         shared_scene_bounds_max());
@@ -10,17 +12,17 @@ float scene_scale()
 
 float scene_intersection_t_min()
 {
-    return max(rtvdb_core_scene_intersection_t_min(scene_scale()), kRayTMinFallback);
+    return max(core::scene_intersection_t_min(scene_scale()), kRayTMinFallback);
 }
 
 float scene_hit_advance_bias()
 {
-    return max(rtvdb_core_scene_hit_advance_bias(scene_scale()), kHitAdvanceBiasFallback);
+    return max(core::scene_hit_advance_bias(scene_scale()), kHitAdvanceBiasFallback);
 }
 
 float scene_length_sq_epsilon()
 {
-    return rtvdb_core_scene_length_sq_epsilon(scene_scale());
+    return core::scene_length_sq_epsilon(scene_scale());
 }
 
 float3 triangle_normal(uint32_t index_offset)
@@ -31,24 +33,24 @@ float3 triangle_normal(uint32_t index_offset)
     const float3 a = shared_scene_position(ia);
     const float3 b = shared_scene_position(ib);
     const float3 c = shared_scene_position(ic);
-    return rtvdb_core_triangle_normal(a, b, c);
+    return core::triangle_normal(a, b, c);
 }
 
 float3 point_normal(const SharedPointPrimitive point_primitive, float3 hit_position)
 {
-    return rtvdb_core_point_normal(point_primitive.position, hit_position);
+    return core::point_normal(point_primitive.position, hit_position);
 }
 
 float3 line_normal(const SharedLinePrimitive line_primitive, float3 hit_position)
 {
-    return rtvdb_core_line_normal(line_primitive.a, line_primitive.b, hit_position);
+    return core::line_normal(line_primitive.a, line_primitive.b, hit_position);
 }
 
 float4 apply_display_mode(
   float4 client_color, float3 n, uint32_t primitive_seed,
   uint32_t geometry_index, uint32_t instance_index)
 {
-    return rtvdb_core_apply_display_mode(
+    return core::apply_display_mode(
         client_color,
         n,
         primitive_seed,
@@ -59,7 +61,7 @@ float4 apply_display_mode(
 
 float4 apply_hover_highlight(float4 color, uint32_t primitive_kind, uint32_t primitive_index)
 {
-    return rtvdb_core_apply_hover_highlight(
+    return core::apply_hover_highlight(
         color,
         primitive_kind,
         primitive_index,
@@ -123,7 +125,7 @@ void build_projection_ray(
     ARG_OUT(float3, ray_origin),
     ARG_OUT(float3, ray_direction))
 {
-    const rtvdb_core_projection_ray result = rtvdb_core_build_projection_ray(
+    const core::projection_ray result = core::build_projection_ray(
         projection,
         uv,
         projection_param0,
@@ -321,7 +323,7 @@ void shared_intersection_point()
 {
     const uint32_t point_index = shared_procedural_primitive_offset(InstanceID()) + PrimitiveIndex();
     const SharedPointPrimitive point_primitive = shared_point_primitive(point_index);
-    if (rtvdb_core_point_contains(
+    if (core::point_contains(
             shared_origin(),
             point_primitive.position,
             point_primitive.radius,
@@ -332,12 +334,12 @@ void shared_intersection_point()
     const float3 ray_origin = ObjectRayOrigin();
     const float3 direction = ObjectRayDirection();
     const float min_t = max(RayTMin(), scene_intersection_t_min());
-    rtvdb_core_ray ray;
+    core::ray ray;
     ray.origin = ray_origin;
     ray.direction = direction;
     ray.min_distance = min_t;
     ray.max_distance = RayTCurrent();
-    const rtvdb_core_intersection hit = rtvdb_core_intersect_sphere(
+    const core::intersection hit = core::intersect_sphere(
         ray,
         point_primitive.position,
         point_primitive.radius,
@@ -370,7 +372,7 @@ void shared_intersection_line()
     {
         return;
     }
-    if (rtvdb_core_capsule_contains(
+    if (core::capsule_contains(
             shared_origin(),
             line_primitive.a,
             line_primitive.b,
@@ -383,12 +385,12 @@ void shared_intersection_line()
     const float3 ray_origin = ObjectRayOrigin();
     const float3 direction = ObjectRayDirection();
     const float min_t = max(RayTMin(), scene_intersection_t_min());
-    rtvdb_core_ray ray;
+    core::ray ray;
     ray.origin = ray_origin;
     ray.direction = direction;
     ray.min_distance = min_t;
     ray.max_distance = RayTCurrent();
-    const rtvdb_core_intersection hit = rtvdb_core_intersect_capsule(
+    const core::intersection hit = core::intersect_capsule(
         ray,
         line_primitive.a,
         line_primitive.b,
