@@ -1,81 +1,26 @@
-﻿float minimum_forward_projection(float3 bounds_min, float3 bounds_max, float3 forward)
-{
-    float min_projection = dot(bounds_min, forward);
-    LOOP_UNROLL
-    for (uint32_t corner_index = 1; corner_index < 8; ++corner_index)
-    {
-        const float3 corner = float3(
-            (corner_index & 1u) != 0u ? bounds_max.x : bounds_min.x,
-            (corner_index & 2u) != 0u ? bounds_max.y : bounds_min.y,
-            (corner_index & 4u) != 0u ? bounds_max.z : bounds_min.z);
-        min_projection = min(min_projection, dot(corner, forward));
-    }
-    return min_projection;
-}
+﻿#include "rt_logic_shared_core.h"
 
 float scene_scale()
 {
-    if (shared_scene_bounds_valid() != 0u)
-    {
-        return max(length(shared_scene_bounds_max() - shared_scene_bounds_min()), 1.0e-3);
-    }
-    return 1.0;
+    return rtvdb_core_scene_scale(
+        shared_scene_bounds_valid(),
+        shared_scene_bounds_min(),
+        shared_scene_bounds_max());
 }
 
 float scene_intersection_t_min()
 {
-    return max(scene_scale() * 1.0e-5, kRayTMinFallback);
+    return max(rtvdb_core_scene_intersection_t_min(scene_scale()), kRayTMinFallback);
 }
 
 float scene_hit_advance_bias()
 {
-    return max(scene_scale() * 1.0e-5, kHitAdvanceBiasFallback);
+    return max(rtvdb_core_scene_hit_advance_bias(scene_scale()), kHitAdvanceBiasFallback);
 }
 
 float scene_length_sq_epsilon()
 {
-    const float scale = scene_scale();
-    return max(scale * scale * 1.0e-12, 1.0e-12);
-}
-
-float approximate_ray_shift(
-  float3 ray_origin, float3 ray_direction, float3 target, float min_t, float max_t)
-{
-    const float direction_len_sq = dot(ray_direction, ray_direction);
-    if (direction_len_sq <= 1.0e-20 || max_t < min_t)
-    {
-        return 0.0;
-    }
-
-    const float projected_t = dot(target - ray_origin, ray_direction) / direction_len_sq;
-    return clamp(projected_t, min_t, max_t);
-}
-
-float encode_srgb_channel(float value)
-{
-    float x = saturate(value);
-    if (x <= 0.0031308)
-    {
-        return x * 12.92;
-    }
-    return 1.055 * pow(x, 1.0 / 2.4) - 0.055;
-}
-
-float3 hash_color(uint32_t seed)
-{
-    float3 h = frac(float3(seed * 0.1031, seed * 0.11369, seed * 0.13787));
-    h += dot(h, h.yzx + 19.19);
-    return frac(float3((h.x + h.y) * h.z, (h.x + h.z) * h.y, (h.y + h.z) * h.x));
-}
-
-float3 safe_normalize(float3 v, float3 fallback)
-{
-    const float len_sq = dot(v, v);
-    if (len_sq <= 1.0e-12)
-    {
-        return fallback;
-    }
-    return v * rsqrt(len_sq);
+    return rtvdb_core_scene_length_sq_epsilon(scene_scale());
 }
 
 float3 triangle_normal(uint32_t index_offset)
@@ -86,77 +31,41 @@ float3 triangle_normal(uint32_t index_offset)
     const float3 a = shared_scene_position(ia);
     const float3 b = shared_scene_position(ib);
     const float3 c = shared_scene_position(ic);
-    return safe_normalize(cross(b - a, c - a), float3(0.0, 1.0, 0.0));
+    return rtvdb_core_triangle_normal(a, b, c);
 }
 
 float3 point_normal(const SharedPointPrimitive point_primitive, float3 hit_position)
 {
-    return safe_normalize(hit_position - point_primitive.position, float3(0.0, 1.0, 0.0));
+    return rtvdb_core_point_normal(point_primitive.position, hit_position);
 }
 
 float3 line_normal(const SharedLinePrimitive line_primitive, float3 hit_position)
 {
-    const float3 ab = line_primitive.b - line_primitive.a;
-    const float ab_len_sq = dot(ab, ab);
-    if (ab_len_sq <= 1.0e-12)
-    {
-        return safe_normalize(hit_position - line_primitive.a, float3(0.0, 1.0, 0.0));
-    }
-
-    const float u = saturate(dot(hit_position - line_primitive.a, ab) / ab_len_sq);
-    const float3 closest = lerp(line_primitive.a, line_primitive.b, u);
-    return safe_normalize(hit_position - closest, float3(0.0, 1.0, 0.0));
+    return rtvdb_core_line_normal(line_primitive.a, line_primitive.b, hit_position);
 }
 
 float4 apply_display_mode(
   float4 client_color, float3 n, uint32_t primitive_seed,
   uint32_t geometry_index, uint32_t instance_index)
 {
-    const float alpha = saturate(client_color.a);
-    if (shared_display_mode() == 1u)
-    {
-        return float4(client_color.rgb, alpha);
-    }
-    if (shared_display_mode() == 2u)
-    {
-        const float3 light_dir = normalize(float3(0.35, 0.70, 0.62));
-        const float diffuse = max(0.0, dot(n, light_dir));
-        const float intensity = 0.18 + (1.0 - 0.18) * diffuse;
-        const float shaded = encode_srgb_channel(intensity);
-        return float4(shaded, shaded, shaded, 1.0);
-    }
-    if (shared_display_mode() == 3u)
-    {
-        return float4(hash_color(primitive_seed + 1), 1.0);
-    }
-    if (shared_display_mode() == 4u)
-    {
-        return float4(hash_color(geometry_index + 1), 1.0);
-    }
-    if (shared_display_mode() == 5u)
-    {
-        return float4(hash_color(instance_index + 1), 1.0);
-    }
-    return float4(n * 0.5 + 0.5, 1.0);
+    return rtvdb_core_apply_display_mode(
+        client_color,
+        n,
+        primitive_seed,
+        geometry_index,
+        instance_index,
+        shared_display_mode());
 }
 
 float4 apply_hover_highlight(float4 color, uint32_t primitive_kind, uint32_t primitive_index)
 {
-    if (shared_hover_highlight_kind() == 0u ||
-        primitive_kind != shared_hover_highlight_kind() ||
-        primitive_index != shared_hover_primitive_index())
-    {
-        return color;
-    }
-
-    const float luminance = dot(color.rgb, float3(0.299, 0.587, 0.114));
-    const float3 complement = 1.0 - color.rgb;
-    const float3 bias = luminance >= 0.45
-        ? float3(0.15, 0.15, 0.15)
-        : float3(0.35, 0.35, 0.35);
-    const float3 target = saturate(complement + bias);
-    color.rgb = lerp(color.rgb, target, saturate(shared_hover_highlight_mix()));
-    return color;
+    return rtvdb_core_apply_hover_highlight(
+        color,
+        primitive_kind,
+        primitive_index,
+        shared_hover_highlight_kind(),
+        shared_hover_primitive_index(),
+        shared_hover_highlight_mix());
 }
 
 float4 triangle_surface_rgba(
@@ -214,47 +123,21 @@ void build_projection_ray(
     ARG_OUT(float3, ray_origin),
     ARG_OUT(float3, ray_direction))
 {
-    ray_origin = shared_origin();
-    ray_direction = shared_forward();
-    if (projection == kProjectionOrthographic)
-    {
-        const float ortho_width = max(projection_param0, 0.001);
-        const float ortho_height = max(projection_param1, 0.001);
-        ray_origin +=
-            shared_right() * (uv.x * ortho_width * 0.5) +
-            shared_up() * (uv.y * ortho_height * 0.5);
-        if (shared_scene_bounds_valid() != 0u)
-        {
-            const float min_forward = minimum_forward_projection(
-                shared_scene_bounds_min(),
-                shared_scene_bounds_max(),
-                shared_forward());
-            const float scene_depth = max(length(shared_scene_bounds_max() - shared_scene_bounds_min()), 0.001);
-            const float forward_margin = max(scene_depth * 0.001, 0.001);
-            const float origin_forward = dot(ray_origin, shared_forward());
-            const float max_origin_forward = min_forward - forward_margin;
-            if (origin_forward > max_origin_forward)
-            {
-                ray_origin -= shared_forward() * (origin_forward - max_origin_forward);
-            }
-        }
-        return;
-    }
-    if (projection == kProjectionFisheye)
-    {
-        const float yaw = uv.x * projection_param0 * 0.5;
-        const float pitch = uv.y * projection_param1 * 0.5;
-        ray_direction = normalize(
-            shared_forward() * (cos(yaw) * cos(pitch)) +
-            shared_right() * sin(yaw) +
-            shared_up() * sin(pitch));
-        return;
-    }
-
-    const float tan_half_fov = projection_param0;
-    ray_direction = normalize(
-        shared_forward() + uv.x * shared_aspect() * tan_half_fov * shared_right() +
-        uv.y * tan_half_fov * shared_up());
+    const rtvdb_core_projection_ray result = rtvdb_core_build_projection_ray(
+        projection,
+        uv,
+        projection_param0,
+        projection_param1,
+        shared_origin(),
+        shared_forward(),
+        shared_right(),
+        shared_up(),
+        shared_aspect(),
+        shared_scene_bounds_valid(),
+        shared_scene_bounds_min(),
+        shared_scene_bounds_max());
+    ray_origin = result.origin;
+    ray_direction = result.direction;
 }
 
 void shared_raygen()
@@ -438,41 +321,33 @@ void shared_intersection_point()
 {
     const uint32_t point_index = shared_procedural_primitive_offset(InstanceID()) + PrimitiveIndex();
     const SharedPointPrimitive point_primitive = shared_point_primitive(point_index);
+    if (rtvdb_core_point_contains(
+            shared_origin(),
+            point_primitive.position,
+            point_primitive.radius,
+            scene_length_sq_epsilon()))
+    {
+        return;
+    }
     const float3 ray_origin = ObjectRayOrigin();
     const float3 direction = ObjectRayDirection();
     const float min_t = max(RayTMin(), scene_intersection_t_min());
-    const float shift_t = approximate_ray_shift(
-        ray_origin,
-        direction,
+    rtvdb_core_ray ray;
+    ray.origin = ray_origin;
+    ray.direction = direction;
+    ray.min_distance = min_t;
+    ray.max_distance = RayTCurrent();
+    const rtvdb_core_intersection hit = rtvdb_core_intersect_sphere(
+        ray,
         point_primitive.position,
-        min_t,
-        RayTCurrent());
-    const float3 shifted_origin = ray_origin + direction * shift_t;
-    const float3 oc = shifted_origin - point_primitive.position;
-    const float a = dot(direction, direction);
-    const float b = dot(oc, direction);
-    const float c = dot(oc, oc) - point_primitive.radius * point_primitive.radius;
-    const float h = b * b - a * c;
-    if (h < 0.0)
-    {
-        return;
-    }
-
-    const float sqrt_h = sqrt(h);
-    const float inv_a = 1.0 / a;
-    const float t0 = (-b - sqrt_h) * inv_a + shift_t;
-    const float t1 = (-b + sqrt_h) * inv_a + shift_t;
+        point_primitive.radius,
+        min_t);
 
     ProceduralAttributes attrs;
     attrs.uv = float2(0.0, 0.0);
-    if (t0 >= min_t && t0 <= RayTCurrent())
+    if (hit.hit)
     {
-        ReportHit(t0, 0, attrs);
-        return;
-    }
-    if (t1 >= min_t && t1 <= RayTCurrent())
-    {
-        ReportHit(t1, 0, attrs);
+        ReportHit(hit.distance, 0, attrs);
     }
 }
 
@@ -495,136 +370,37 @@ void shared_intersection_line()
     {
         return;
     }
-    const float3 pa = line_primitive.a;
-    const float3 pb = line_primitive.b;
-    const float radius = line_primitive.radius;
-    const float radius_sq = radius * radius;
-    const float3 ray_origin = ObjectRayOrigin();
-    const float3 rd = ObjectRayDirection();
-    const float3 ba = pb - pa;
-    const float baba = dot(ba, ba);
-    const float rdrd = dot(rd, rd);
-    const float min_t = max(RayTMin(), scene_intersection_t_min());
-    const float length_sq_epsilon = scene_length_sq_epsilon();
-    if (rdrd <= 1.0e-20)
+    if (rtvdb_core_capsule_contains(
+            shared_origin(),
+            line_primitive.a,
+            line_primitive.b,
+            line_primitive.radius,
+            scene_length_sq_epsilon(),
+            scene_length_sq_epsilon()))
     {
         return;
     }
-
-    const float3 shift_target = baba <= length_sq_epsilon ? pa : lerp(pa, pb, 0.5);
-    const float shift_t = approximate_ray_shift(ray_origin, rd, shift_target, min_t, RayTCurrent());
-    const float3 ro = ray_origin + rd * shift_t;
-    const float3 oa = ro - pa;
-
-    const float bard = dot(ba, rd);
-    const float baoa = dot(ba, oa);
-    const float rdoa = dot(rd, oa);
-    const float oaoa = dot(oa, oa);
+    const float3 ray_origin = ObjectRayOrigin();
+    const float3 direction = ObjectRayDirection();
+    const float min_t = max(RayTMin(), scene_intersection_t_min());
+    rtvdb_core_ray ray;
+    ray.origin = ray_origin;
+    ray.direction = direction;
+    ray.min_distance = min_t;
+    ray.max_distance = RayTCurrent();
+    const rtvdb_core_intersection hit = rtvdb_core_intersect_capsule(
+        ray,
+        line_primitive.a,
+        line_primitive.b,
+        line_primitive.radius,
+        min_t,
+        scene_length_sq_epsilon());
 
     ProceduralAttributes attrs;
     attrs.uv = float2(0.0, 0.0);
-    float best_t = RayTCurrent();
-
-    if (baba <= length_sq_epsilon)
+    if (hit.hit)
     {
-        const float b = dot(oa, rd);
-        const float c = oaoa - radius_sq;
-        const float h = b * b - rdrd * c;
-        if (h < 0.0)
-        {
-            return;
-        }
-
-        const float s = sqrt(h);
-        const float t0 = (-b - s) / rdrd + shift_t;
-        const float t1 = (-b + s) / rdrd + shift_t;
-        if (t0 >= min_t && t0 <= best_t)
-        {
-            best_t = t0;
-        }
-        if (t1 >= min_t && t1 <= best_t)
-        {
-            best_t = t1;
-        }
-        if (best_t <= RayTCurrent())
-        {
-            ReportHit(best_t, 0, attrs);
-        }
-        return;
-    }
-
-    {
-        const float a = baba * rdrd - bard * bard;
-        const float b = baba * rdoa - baoa * bard;
-        const float c = baba * oaoa - baoa * baoa - radius_sq * baba;
-        const float h = b * b - a * c;
-        if (h >= 0.0 && abs(a) > length_sq_epsilon)
-        {
-            const float s = sqrt(h);
-
-            const float local_t0 = (-b - s) / a;
-            const float t0 = local_t0 + shift_t;
-            const float y0 = baoa + local_t0 * bard;
-            if (t0 >= min_t && t0 <= best_t && y0 >= 0.0 && y0 <= baba)
-            {
-                best_t = t0;
-            }
-
-            const float local_t1 = (-b + s) / a;
-            const float t1 = local_t1 + shift_t;
-            const float y1 = baoa + local_t1 * bard;
-            if (t1 >= min_t && t1 <= best_t && y1 >= 0.0 && y1 <= baba)
-            {
-                best_t = t1;
-            }
-        }
-    }
-
-    {
-        const float3 oc = ro - pa;
-        const float b = dot(rd, oc);
-        const float c = dot(oc, oc) - radius_sq;
-        const float h = b * b - rdrd * c;
-        if (h >= 0.0)
-        {
-            const float s = sqrt(h);
-            const float t0 = (-b - s) / rdrd + shift_t;
-            const float t1 = (-b + s) / rdrd + shift_t;
-            if (t0 >= min_t && t0 <= best_t)
-            {
-                best_t = t0;
-            }
-            if (t1 >= min_t && t1 <= best_t)
-            {
-                best_t = t1;
-            }
-        }
-    }
-
-    {
-        const float3 oc = ro - pb;
-        const float b = dot(rd, oc);
-        const float c = dot(oc, oc) - radius_sq;
-        const float h = b * b - rdrd * c;
-        if (h >= 0.0)
-        {
-            const float s = sqrt(h);
-            const float t0 = (-b - s) / rdrd + shift_t;
-            const float t1 = (-b + s) / rdrd + shift_t;
-            if (t0 >= min_t && t0 <= best_t)
-            {
-                best_t = t0;
-            }
-            if (t1 >= min_t && t1 <= best_t)
-            {
-                best_t = t1;
-            }
-        }
-    }
-
-    if (best_t < RayTCurrent())
-    {
-        ReportHit(best_t, 0, attrs);
+        ReportHit(hit.distance, 0, attrs);
     }
 }
 

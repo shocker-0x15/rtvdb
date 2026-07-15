@@ -2,6 +2,7 @@
 #include <metal_raytracing>
 using namespace metal;
 using namespace metal::raytracing;
+#include "../shaders/rt_logic_shared_core.h"
 
 struct camera_gpu {
     float4 origin;
@@ -29,9 +30,6 @@ struct camera_gpu {
     float2 accumulation_jitter;
     uint scene_bounds_valid;
 };
-
-constant uint kProjectionFisheye = 1;
-constant uint kProjectionOrthographic = 2;
 
 struct point_gpu {
     packed_float3 position;
@@ -98,23 +96,22 @@ constant uint kLineFlagFixedColor = 1u << 0;
 constant uint kLineFlagNonPickable = 1u << 1;
 
 float scene_scale(constant camera_gpu &camera) {
-    if (camera.scene_bounds_valid != 0u) {
-        return max(length(camera.scene_bounds_max.xyz - camera.scene_bounds_min.xyz), 1.0e-3f);
-    }
-    return 1.0f;
+    return rtvdb_core_scene_scale(
+        camera.scene_bounds_valid,
+        camera.scene_bounds_min.xyz,
+        camera.scene_bounds_max.xyz);
 }
 
 float scene_intersection_t_min(constant camera_gpu &camera) {
-    return max(scene_scale(camera) * 1.0e-5f, kRayMinDistanceFallback);
+    return max(rtvdb_core_scene_intersection_t_min(scene_scale(camera)), kRayMinDistanceFallback);
 }
 
 float scene_hit_advance_bias(constant camera_gpu &camera) {
-    return max(scene_scale(camera) * 1.0e-5f, kRayHitAdvanceBiasFallback);
+    return max(rtvdb_core_scene_hit_advance_bias(scene_scale(camera)), kRayHitAdvanceBiasFallback);
 }
 
 float scene_length_sq_epsilon(constant camera_gpu &camera) {
-    const float scale = scene_scale(camera);
-    return max(scale * scale * 1.0e-12f, 1.0e-12f);
+    return rtvdb_core_scene_length_sq_epsilon(scene_scale(camera));
 }
 
 hit_info trace_points(
@@ -152,29 +149,6 @@ bool procedural_primitive_visible(
     return true;
 }
 
-float3 hash_color(uint seed) {
-    const float x = fmod(float(seed) * 0.1031f, 1.0f);
-    const float y = fmod(float(seed) * 0.11369f, 1.0f);
-    const float z = fmod(float(seed) * 0.13787f, 1.0f);
-    const float3 h0 = float3(x, y, z);
-    const float d = dot(h0, float3(h0.y + 19.19f, h0.z + 19.19f, h0.x + 19.19f));
-    const float3 h1 = float3(fmod(h0.x + d, 1.0f), fmod(h0.y + d, 1.0f), fmod(h0.z + d, 1.0f));
-    return float3(
-        fmod((h1.x + h1.y) * h1.z, 1.0f),
-        fmod((h1.x + h1.z) * h1.y, 1.0f),
-        fmod((h1.y + h1.z) * h1.x, 1.0f));
-}
-
-float approximate_ray_shift(ray view_ray, float3 target, float min_t, float max_t) {
-    const float direction_len_sq = dot(view_ray.direction, view_ray.direction);
-    if (direction_len_sq <= 1.0e-20f || max_t < min_t) {
-        return 0.0f;
-    }
-
-    const float projected_t = dot(target - view_ray.origin, view_ray.direction) / direction_len_sq;
-    return clamp(projected_t, min_t, max_t);
-}
-
 bool intersect_sphere(
     ray view_ray,
     float3 center,
@@ -182,30 +156,21 @@ bool intersect_sphere(
     float min_hit_distance,
     thread float &out_distance,
     thread float3 &out_normal) {
-    const float a = dot(view_ray.direction, view_ray.direction);
-    if (a <= 1.0e-20f) {
+    rtvdb_core_ray core_ray;
+    core_ray.origin = view_ray.origin;
+    core_ray.direction = view_ray.direction;
+    core_ray.min_distance = min_hit_distance;
+    core_ray.max_distance = view_ray.max_distance;
+    const rtvdb_core_intersection hit = rtvdb_core_intersect_sphere(
+        core_ray,
+        center,
+        radius,
+        min_hit_distance);
+    if (!hit.hit) {
         return false;
     }
-    const float shift_t = approximate_ray_shift(view_ray, center, min_hit_distance, view_ray.max_distance);
-    const float3 shifted_origin = view_ray.origin + view_ray.direction * shift_t;
-    const float3 oc = shifted_origin - center;
-    const float b = dot(oc, view_ray.direction);
-    const float c = dot(oc, oc) - radius * radius;
-    const float discriminant = b * b - a * c;
-    if (discriminant < 0.0f) {
-        return false;
-    }
-    const float sqrt_disc = sqrt(discriminant);
-    float t = (-b - sqrt_disc) / a + shift_t;
-    if (t <= min_hit_distance) {
-        t = (-b + sqrt_disc) / a + shift_t;
-    }
-    if (t <= min_hit_distance) {
-        return false;
-    }
-    const float3 position = view_ray.origin + view_ray.direction * t;
-    out_distance = t;
-    out_normal = normalize(position - center);
+    out_distance = hit.distance;
+    out_normal = hit.normal;
     return true;
 }
 
@@ -216,129 +181,51 @@ bool intersect_capsule(
     float length_sq_epsilon,
     thread float &out_distance,
     thread float3 &out_normal) {
-    const float3 a = float3(primitive.a);
-    const float3 b = float3(primitive.b);
-    const float3 ba = b - a;
-    const float baba = dot(ba, ba);
-    const float rdrd = dot(view_ray.direction, view_ray.direction);
-    if (rdrd <= 1.0e-20f) {
+    rtvdb_core_ray core_ray;
+    core_ray.origin = view_ray.origin;
+    core_ray.direction = view_ray.direction;
+    core_ray.min_distance = min_hit_distance;
+    core_ray.max_distance = view_ray.max_distance;
+    const rtvdb_core_intersection hit = rtvdb_core_intersect_capsule(
+        core_ray,
+        float3(primitive.a),
+        float3(primitive.b),
+        primitive.radius,
+        min_hit_distance,
+        length_sq_epsilon);
+    if (!hit.hit) {
         return false;
     }
-    const float3 shift_target = baba <= length_sq_epsilon ? a : mix(a, b, 0.5f);
-    const float shift_t = approximate_ray_shift(view_ray, shift_target, min_hit_distance, view_ray.max_distance);
-    const float3 shifted_origin = view_ray.origin + view_ray.direction * shift_t;
-
-    const float bard = dot(ba, view_ray.direction);
-    const float3 shifted_oa = shifted_origin - a;
-    const float baoa = dot(ba, shifted_oa);
-    const float rdoa = dot(view_ray.direction, shifted_oa);
-    const float oaoa = dot(shifted_oa, shifted_oa);
-    const float radius_sq = primitive.radius * primitive.radius;
-    float best_distance = INFINITY;
-    float3 best_normal = float3(0.0f, 1.0f, 0.0f);
-
-    if (baba <= length_sq_epsilon) {
-        float sphere_distance = 0.0f;
-        float3 sphere_normal = float3(0.0f);
-        if (!intersect_sphere(view_ray, a, primitive.radius, min_hit_distance, sphere_distance, sphere_normal)) {
-            return false;
-        }
-        out_distance = sphere_distance;
-        out_normal = sphere_normal;
-        return true;
-    }
-
-    {
-        const float qa = baba * rdrd - bard * bard;
-        const float qb = baba * rdoa - baoa * bard;
-        const float qc = baba * oaoa - baoa * baoa - radius_sq * baba;
-        const float h = qb * qb - qa * qc;
-        if (h >= 0.0f && fabs(qa) > length_sq_epsilon) {
-            const float s = sqrt(h);
-            const float local_t0 = (-qb - s) / qa;
-            const float t0 = local_t0 + shift_t;
-            const float y0 = baoa + local_t0 * bard;
-            if (t0 >= min_hit_distance && t0 < best_distance && y0 >= 0.0f && y0 <= baba) {
-                best_distance = t0;
-            }
-
-            const float local_t1 = (-qb + s) / qa;
-            const float t1 = local_t1 + shift_t;
-            const float y1 = baoa + local_t1 * bard;
-            if (t1 >= min_hit_distance && t1 < best_distance && y1 >= 0.0f && y1 <= baba) {
-                best_distance = t1;
-            }
-        }
-    }
-
-    float sphere_distance = 0.0f;
-    float3 sphere_normal = float3(0.0f);
-    if (intersect_sphere(view_ray, a, primitive.radius, min_hit_distance, sphere_distance, sphere_normal) &&
-        sphere_distance < best_distance) {
-        best_distance = sphere_distance;
-        best_normal = sphere_normal;
-    }
-    if (intersect_sphere(view_ray, b, primitive.radius, min_hit_distance, sphere_distance, sphere_normal) &&
-        sphere_distance < best_distance) {
-        best_distance = sphere_distance;
-        best_normal = sphere_normal;
-    }
-
-    if (!isfinite(best_distance)) {
-        return false;
-    }
-    const float3 position = view_ray.origin + view_ray.direction * best_distance;
-    const float u = clamp(dot(position - a, ba) / baba, 0.0f, 1.0f);
-    const float3 axis_point = a + ba * u;
-    best_normal = normalize(position - axis_point);
-    out_distance = best_distance;
-    out_normal = best_normal;
+    out_distance = hit.distance;
+    out_normal = hit.normal;
     return true;
 }
 
 float4 shade_hit(const thread hit_info &hit, constant camera_gpu &camera) {
     float4 color = hit.color;
     if ((hit.flags & kLineFlagFixedColor) == 0u) {
-        switch (camera.display_mode) {
-        case 0u:
-            color = float4(hit.normal * 0.5f + 0.5f, 1.0f);
-            break;
-        case 1u:
-            color = hit.color;
-            break;
-        case 2u: {
-            const float3 light_direction = normalize(float3(0.35f, 0.70f, 0.62f));
-            const float diffuse = max(dot(hit.normal, light_direction), 0.0f);
-            const float shaded = 0.18f + (1.0f - 0.18f) * diffuse;
-            color = float4(float3(shaded), 1.0f);
-            break;
-        }
-        case 3u:
-            color = float4(hash_color(hit.primitive_id + hit.kind * 4099u + 1u), 1.0f);
-            break;
-        case 4u:
-            color = float4(hash_color(hit.geometry_index + 1u), 1.0f);
-            break;
-        case 5u:
-            color = float4(hash_color(hit.instance_index + 1u), 1.0f);
-            break;
-        default:
-            color = hit.color;
-            break;
-        }
+        const uint primitive_seed = hit.kind == 0u
+            ? hit.primitive_id
+            : hit.kind == 1u
+                ? 1000000u + hit.primitive_id
+                : 2000000u + hit.primitive_id;
+        color = rtvdb_core_apply_display_mode(
+            hit.color,
+            hit.normal,
+            primitive_seed,
+            hit.geometry_index,
+            hit.instance_index,
+            camera.display_mode);
     }
 
-    if ((hit.flags & kLineFlagFixedColor) == 0u &&
-        camera.hover_highlight_kind != 0u &&
-        camera.hover_highlight_kind == hit.kind + 1u &&
-        camera.hover_primitive_index == hit.primitive_id) {
-        const float luminance = dot(color.rgb, float3(0.299f, 0.587f, 0.114f));
-        const float3 complement = 1.0f - color.rgb;
-        const float3 bias = luminance >= 0.45f
-            ? float3(0.15f, 0.15f, 0.15f)
-            : float3(0.35f, 0.35f, 0.35f);
-        const float3 target = clamp(complement + bias, 0.0f, 1.0f);
-        color.rgb = mix(color.rgb, target, clamp(camera.hover_highlight_mix, 0.0f, 1.0f));
+    if ((hit.flags & kLineFlagFixedColor) == 0u) {
+        color = rtvdb_core_apply_hover_highlight(
+            color,
+            hit.kind + 1u,
+            hit.primitive_id,
+            camera.hover_highlight_kind,
+            camera.hover_primitive_index,
+            camera.hover_highlight_mix);
     }
     return color;
 }
@@ -460,6 +347,13 @@ hit_info trace_points(
             continue;
         }
         const point_gpu primitive = points[primitive_index];
+        if (rtvdb_core_point_contains(
+                camera.origin.xyz,
+                float3(primitive.position),
+                primitive.radius,
+                scene_length_sq_epsilon(camera))) {
+            continue;
+        }
         float distance = 0.0f;
         float3 normal = float3(0.0f);
         if (intersect_sphere(view_ray, float3(primitive.position), primitive.radius, min_hit_distance, distance, normal)) {
@@ -476,6 +370,13 @@ hit_info trace_points(
         return result;
     }
     const point_gpu primitive = points[primitive_index];
+    if (rtvdb_core_point_contains(
+            camera.origin.xyz,
+            float3(primitive.position),
+            primitive.radius,
+            scene_length_sq_epsilon(camera))) {
+        return result;
+    }
     float distance = 0.0f;
     float3 normal = float3(0.0f);
     if (!intersect_sphere(view_ray, float3(primitive.position), primitive.radius, min_hit_distance, distance, normal)) {
@@ -520,6 +421,15 @@ hit_info trace_lines(
         if (is_pick_pass && (primitive.flags & kLineFlagNonPickable) != 0u) {
             continue;
         }
+        if (rtvdb_core_capsule_contains(
+                camera.origin.xyz,
+                float3(primitive.a),
+                float3(primitive.b),
+                primitive.radius,
+                length_sq_epsilon,
+                length_sq_epsilon)) {
+            continue;
+        }
         float distance = 0.0f;
         float3 normal = float3(0.0f);
         if (intersect_capsule(view_ray, primitive, min_hit_distance, length_sq_epsilon, distance, normal)) {
@@ -537,6 +447,15 @@ hit_info trace_lines(
     }
     const line_gpu primitive = lines[primitive_index];
     if (is_pick_pass && (primitive.flags & kLineFlagNonPickable) != 0u) {
+        return result;
+    }
+    if (rtvdb_core_capsule_contains(
+            camera.origin.xyz,
+            float3(primitive.a),
+            float3(primitive.b),
+            primitive.radius,
+            length_sq_epsilon,
+            length_sq_epsilon)) {
         return result;
     }
     float distance = 0.0f;
@@ -571,18 +490,6 @@ float4 to_rgb_linear(float3 color) {
     return float4(clamped, 1.0f);
 }
 
-float minimum_forward_projection(float3 bounds_min, float3 bounds_max, float3 forward) {
-    float min_projection = dot(bounds_min, forward);
-    for (uint corner_index = 1u; corner_index < 8u; ++corner_index) {
-        const float3 corner(
-            (corner_index & 1u) != 0u ? bounds_max.x : bounds_min.x,
-            (corner_index & 2u) != 0u ? bounds_max.y : bounds_min.y,
-            (corner_index & 4u) != 0u ? bounds_max.z : bounds_min.z);
-        min_projection = min(min_projection, dot(corner, forward));
-    }
-    return min_projection;
-}
-
 void build_projection_ray(
     constant camera_gpu &camera,
     uint projection,
@@ -592,44 +499,21 @@ void build_projection_ray(
     thread float3 &ray_origin,
     thread float3 &direction)
 {
-    ray_origin = camera.origin.xyz;
-    direction = camera.forward.xyz;
-    if (projection == kProjectionOrthographic) {
-        const float ortho_width = max(projection_param0, 0.001f);
-        const float ortho_height = max(projection_param1, 0.001f);
-        ray_origin +=
-            camera.right.xyz * (ndc.x * ortho_width * 0.5f) +
-            camera.up.xyz * (ndc.y * ortho_height * 0.5f);
-        if (camera.scene_bounds_valid != 0u) {
-            const float min_forward = minimum_forward_projection(
-                camera.scene_bounds_min.xyz,
-                camera.scene_bounds_max.xyz,
-                camera.forward.xyz);
-            const float scene_depth = max(length(camera.scene_bounds_max.xyz - camera.scene_bounds_min.xyz), 0.001f);
-            const float forward_margin = max(scene_depth * 0.001f, 0.001f);
-            const float origin_forward = dot(ray_origin, camera.forward.xyz);
-            const float max_origin_forward = min_forward - forward_margin;
-            if (origin_forward > max_origin_forward) {
-                ray_origin -= camera.forward.xyz * (origin_forward - max_origin_forward);
-            }
-        }
-        return;
-    }
-    if (projection == kProjectionFisheye) {
-        const float yaw = ndc.x * projection_param0 * 0.5f;
-        const float pitch = ndc.y * projection_param1 * 0.5f;
-        direction = normalize(
-            camera.forward.xyz * (cos(yaw) * cos(pitch)) +
-            camera.right.xyz * sin(yaw) +
-            camera.up.xyz * sin(pitch));
-        return;
-    }
-
-    const float tan_half_fov = projection_param0;
-    direction = normalize(
-        camera.forward.xyz +
-        camera.right.xyz * (ndc.x * camera.aspect * tan_half_fov) +
-        camera.up.xyz * (ndc.y * tan_half_fov));
+    const rtvdb_core_projection_ray result = rtvdb_core_build_projection_ray(
+        projection,
+        ndc,
+        projection_param0,
+        projection_param1,
+        camera.origin.xyz,
+        camera.forward.xyz,
+        camera.right.xyz,
+        camera.up.xyz,
+        camera.aspect,
+        camera.scene_bounds_valid,
+        camera.scene_bounds_min.xyz,
+        camera.scene_bounds_max.xyz);
+    ray_origin = result.origin;
+    direction = result.direction;
 }
 
 kernel void rtvdb_trace_kernel(

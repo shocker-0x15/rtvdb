@@ -465,7 +465,10 @@ void frame_current_scene();
 void apply_camera_from_viewer_ui(const rtvdb::camera &target_camera, const char* update_reason, bool animated);
 void update_camera_projection_from_viewer_ui(rtvdb::camera_projection projection);
 void cycle_camera_projection_from_viewer_ui();
-void animate_camera_to(const rtvdb::camera &target_camera, const char* update_reason);
+void animate_camera_to(
+    const rtvdb::camera &target_camera,
+    const char* update_reason,
+    bool disable_auto_frame = true);
 void set_camera_control_mode(camera_control_mode mode);
 bool adjust_camera_speed_log10(float delta);
 void schedule_manual_capture_refresh(std::chrono::steady_clock::time_point due_time);
@@ -473,6 +476,10 @@ void stop_camera_animation();
 bool update_keyboard_camera();
 float camera_speed_multiplier();
 bool try_compute_scene_aabb(const rtvdb::viewer_backend::frame_scene &scene, scene_aabb* out_bounds);
+bool try_build_fitted_camera(
+    const rtvdb::camera &camera,
+    const primitive_focus_fit &fit,
+    rtvdb::camera* out_camera);
 void reset_view_for_new_connection(std::uint64_t connection_serial);
 std::vector<std::string> collect_layer_paths(const rtvdb::viewer_backend::frame_scene &scene);
 
@@ -2654,7 +2661,7 @@ bool try_compute_hovered_primitive_fit(primitive_focus_fit* out_fit) {
     return true;
 }
 
-void disable_auto_frame_for_manual_camera() {
+void ensure_camera_override() {
     if (!g_camera_override.active) {
         bool has_frame = false;
         rtvdb::camera camera{};
@@ -2675,6 +2682,10 @@ void disable_auto_frame_for_manual_camera() {
             g_camera_override.projection_blend_t = projection_blend_t;
         }
     }
+}
+
+void disable_auto_frame_for_manual_camera() {
+    ensure_camera_override();
     progress_camera_animation();
     rtvdb::viewer_backend::set_auto_frame_enabled(false);
 }
@@ -2750,7 +2761,30 @@ void update_camera_projection_from_viewer_ui(rtvdb::camera_projection projection
         camera.fisheye_theta_degrees = 180.0f;
         camera.fisheye_phi_degrees = 360.0f;
     }
-    apply_camera_from_viewer_ui(camera, "projection", true);
+    if (!rtvdb::viewer_backend::auto_frame_enabled()) {
+        apply_camera_from_viewer_ui(camera, "projection", true);
+        return;
+    }
+
+    rtvdb::viewer_backend::frame_scene scene{};
+    bool has_frame = false;
+    if (!copy_effective_present_scene(&scene, &has_frame) || !has_frame) {
+        animate_camera_to(camera, "projection", false);
+        return;
+    }
+
+    primitive_focus_fit fit{};
+    if (!try_compute_scene_fit(scene, &fit)) {
+        animate_camera_to(camera, "projection", false);
+        return;
+    }
+
+    rtvdb::camera fitted_camera{};
+    if (!try_build_fitted_camera(camera, fit, &fitted_camera)) {
+        animate_camera_to(camera, "projection", false);
+        return;
+    }
+    animate_camera_to(fitted_camera, "projection", false);
 }
 
 void cycle_camera_projection_from_viewer_ui() {
@@ -2776,9 +2810,14 @@ void cycle_camera_projection_from_viewer_ui() {
 
 void animate_camera_to(
     const rtvdb::camera &target_camera,
-    const char* update_reason)
+    const char* update_reason,
+    bool disable_auto_frame)
 {
-    disable_auto_frame_for_manual_camera();
+    if (disable_auto_frame) {
+        disable_auto_frame_for_manual_camera();
+    } else {
+        ensure_camera_override();
+    }
     progress_camera_animation();
     if (!is_finite(target_camera)) {
         return;
@@ -2799,24 +2838,25 @@ void animate_camera_to(
     record_camera_update(update_reason);
 }
 
-void focus_camera_on_fit(
+bool try_build_fitted_camera(
+    const rtvdb::camera &camera,
     const primitive_focus_fit &fit,
-    const char* update_reason)
+    rtvdb::camera* out_camera)
 {
-    disable_auto_frame_for_manual_camera();
-    progress_camera_animation();
-    const rtvdb::camera &camera = g_camera_override.camera;
-    rtvdb::camera target_camera = camera;
-    const rtvdb::vec3 forward = normalize_or(camera.target - camera.origin, {0.0f, 0.0f, 1.0f});
+    if (out_camera == nullptr) {
+        return false;
+    }
 
     int width = 0;
     int height = 0;
     if (!rtvdb::viewer_shell::render_window_size(&width, &height) || width <= 0 || height <= 0) {
-        return;
+        return false;
     }
 
     const float aspect = static_cast<float>(width) / static_cast<float>(height);
     const float padded_radius = fit.radius * 1.35f;
+    rtvdb::camera target_camera = camera;
+    const rtvdb::vec3 forward = normalize_or(camera.target - camera.origin, {0.0f, 0.0f, 1.0f});
     target_camera.target = fit.center;
     if (camera.projection == rtvdb::camera_projection::orthographic) {
         const float padded_diameter = (std::max)(padded_radius * 2.0f, 0.01f);
@@ -2824,7 +2864,10 @@ void focus_camera_on_fit(
             ? padded_diameter
             : padded_diameter / (std::max)(aspect, 0.01f);
         const float current_distance = length(camera.target - camera.origin);
-        const float new_distance = (std::clamp)((std::max)(current_distance, padded_radius * 2.0f), kMinCameraDistance, kMaxCameraDistance);
+        const float new_distance = (std::clamp)(
+            (std::max)(current_distance, padded_radius * 2.0f),
+            kMinCameraDistance,
+            kMaxCameraDistance);
         target_camera.origin = fit.center - forward * new_distance;
     } else {
         const float limiting_half_fov = (std::max)(projection_half_angle_radians(camera, aspect), 0.1f);
@@ -2833,6 +2876,21 @@ void focus_camera_on_fit(
         target_camera.origin = fit.center - forward * new_distance;
     }
     if (!is_finite(target_camera)) {
+        return false;
+    }
+    *out_camera = target_camera;
+    return true;
+}
+
+void focus_camera_on_fit(
+    const primitive_focus_fit &fit,
+    const char* update_reason)
+{
+    disable_auto_frame_for_manual_camera();
+    progress_camera_animation();
+    const rtvdb::camera &camera = g_camera_override.camera;
+    rtvdb::camera target_camera{};
+    if (!try_build_fitted_camera(camera, fit, &target_camera)) {
         return;
     }
     animate_camera_to(target_camera, update_reason);
@@ -4766,12 +4824,6 @@ void on_ui(void*) {
                     "Focus: %s #%llu",
                     primitive_kind_label(g_camera_focus.primitive_kind),
                     static_cast<unsigned long long>(g_camera_focus.primitive_index)
-                );
-                ImGui::Text(
-                    "Focus Pos: %.3f %.3f %.3f",
-                    g_camera_focus.focus_position.x,
-                    g_camera_focus.focus_position.y,
-                    g_camera_focus.focus_position.z
                 );
             } else {
                 ImGui::TextUnformatted("Focus: none");

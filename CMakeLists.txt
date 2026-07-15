@@ -39,6 +39,7 @@ endif()
 set(RTVDB_SHADER_SHARED_HEADERS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/viewer_backend/shaders/rt_logic_shared_types.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/viewer_backend/shaders/rt_logic_shared_impl.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/viewer_backend/shaders/rt_logic_shared_core.h
 )
 
 if(WIN32 AND RTVDB_ENABLE_D3D12_DXR)
@@ -67,6 +68,11 @@ if(WIN32 AND RTVDB_ENABLE_D3D12_DXR)
             ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary_as_header.cmake
         VERBATIM
     )
+
+    add_custom_target(rtvdb_d3d12_raytracing_shaders
+        DEPENDS
+            ${RTVDB_D3D12_RAYTRACING_DXIL}
+            ${RTVDB_D3D12_RAYTRACING_HEADER})
 
     source_group("Shader Files" FILES ${RTVDB_D3D12_RAYTRACING_HLSL} ${RTVDB_SHADER_SHARED_HEADERS})
     source_group("CMake Files" FILES ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary_as_header.cmake)
@@ -261,12 +267,25 @@ if(RTVDB_ENABLE_VULKAN_RT)
         ${RTVDB_VULKAN_RT_LINE_RCHIT_HEADER}
         ${RTVDB_VULKAN_RT_LINE_RINT_HEADER}
     )
+    add_custom_target(rtvdb_vulkan_rt_shaders
+        DEPENDS
+            ${RTVDB_VULKAN_RT_RGEN_SPV}
+            ${RTVDB_VULKAN_RT_PICK_RGEN_SPV}
+            ${RTVDB_VULKAN_RT_RMISS_SPV}
+            ${RTVDB_VULKAN_RT_RCHIT_SPV}
+            ${RTVDB_VULKAN_RT_POINT_RCHIT_SPV}
+            ${RTVDB_VULKAN_RT_POINT_RINT_SPV}
+            ${RTVDB_VULKAN_RT_LINE_RCHIT_SPV}
+            ${RTVDB_VULKAN_RT_LINE_RINT_SPV}
+            ${RTVDB_VULKAN_RT_GENERATED_HEADERS})
     source_group("Shader Files" FILES ${RTVDB_VULKAN_RT_HLSL} ${RTVDB_SHADER_SHARED_HEADERS})
     source_group("CMake Files" FILES ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary_as_header.cmake)
 endif()
 
 if(APPLE)
     set(RTVDB_METAL_RT_SHADER_MSL ${CMAKE_CURRENT_SOURCE_DIR}/src/viewer_backend/metal/metal_rt.metal)
+    set(RTVDB_METAL_SHADER_SHARED_HEADERS
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/viewer_backend/shaders/rt_logic_shared_core.h)
     find_program(RTVDB_METAL_EXECUTABLE NAMES metal)
     find_program(RTVDB_METALLIB_EXECUTABLE NAMES metallib)
     if(NOT RTVDB_METAL_EXECUTABLE OR NOT RTVDB_METALLIB_EXECUTABLE)
@@ -324,12 +343,13 @@ if(APPLE)
             -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary_as_header.cmake
         DEPENDS
             ${RTVDB_METAL_RT_SHADER_MSL}
+            ${RTVDB_METAL_SHADER_SHARED_HEADERS}
             ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary_as_header.cmake
         VERBATIM
     )
     set(RTVDB_METAL_RT_GENERATED_HEADERS ${RTVDB_METAL_RT_SHADER_METALLIB_HEADER})
 
-    source_group("Shader Files" FILES ${RTVDB_METAL_RT_SHADER_MSL})
+    source_group("Shader Files" FILES ${RTVDB_METAL_RT_SHADER_MSL} ${RTVDB_METAL_SHADER_SHARED_HEADERS})
     source_group("CMake Files" FILES ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary_as_header.cmake)
 endif()
 
@@ -396,17 +416,18 @@ if(RTVDB_ENABLE_VULKAN_RT)
             ${RTVDB_SHADER_SHARED_HEADERS})
 endif()
 if(WIN32 AND RTVDB_ENABLE_D3D12_DXR)
-    target_sources(
-        rtvdb_viewer_backend PRIVATE
-            ${RTVDB_D3D12_RAYTRACING_HEADER})
+    add_dependencies(rtvdb_viewer_backend rtvdb_d3d12_raytracing_shaders)
     target_include_directories(rtvdb_viewer_backend PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 endif()
 if(APPLE)
-    target_sources(rtvdb_viewer_backend PRIVATE ${RTVDB_METAL_RT_GENERATED_HEADERS})
+    target_sources(
+        rtvdb_viewer_backend PRIVATE
+            ${RTVDB_METAL_RT_GENERATED_HEADERS}
+            ${RTVDB_METAL_SHADER_SHARED_HEADERS})
     target_include_directories(rtvdb_viewer_backend PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 endif()
 if(RTVDB_ENABLE_VULKAN_RT)
-    target_sources(rtvdb_viewer_backend PRIVATE ${RTVDB_VULKAN_RT_GENERATED_HEADERS})
+    add_dependencies(rtvdb_viewer_backend rtvdb_vulkan_rt_shaders)
     target_include_directories(rtvdb_viewer_backend PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 endif()
 if(WIN32 AND RTVDB_ENABLE_D3D12_DXR)
@@ -464,11 +485,7 @@ source_group("Viewer" FILES ${RTVDB_VIEWER_MAIN_GROUP_FILES})
 source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR}/src PREFIX "Source Files" FILES ${RTVDB_VIEWER_SOURCE_GROUP_FILES})
 source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui PREFIX "External Libraries\\ImGui" FILES ${RTVDB_IMGUI_GROUP_FILES})
 source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/fpng PREFIX "External Libraries\\fpng" FILES ${RTVDB_FPNG_GROUP_FILES})
-if(WIN32 AND RTVDB_ENABLE_D3D12_DXR)
-    source_group("Generated Files" FILES ${RTVDB_D3D12_RAYTRACING_HEADER})
-elseif(RTVDB_ENABLE_VULKAN_RT)
-    source_group("Generated Files" FILES ${RTVDB_VULKAN_RT_GENERATED_HEADERS})
-elseif(APPLE)
+if(APPLE)
     source_group("Generated Files" FILES ${RTVDB_METAL_RT_GENERATED_HEADERS})
 endif()
 
