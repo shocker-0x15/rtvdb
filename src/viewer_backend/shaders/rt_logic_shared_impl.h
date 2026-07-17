@@ -207,7 +207,7 @@ void shared_raygen()
         }
 
         accum += throughput * payload.color.rgb * alpha;
-        throughput *= lerp(float3(1.0, 1.0, 1.0), payload.color.rgb, alpha);
+        throughput *= 1.0 - alpha;
         ray_origin += direction * (payload.hit_t + scene_hit_advance_bias());
 
         if (max(throughput.r, max(throughput.g, throughput.b)) <= 0.001)
