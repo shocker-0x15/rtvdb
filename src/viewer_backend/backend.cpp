@@ -1,11 +1,13 @@
 ﻿#include "viewer_backend/backend_internal.h"
 #include "viewer_backend/helper_overlay.h"
 #include "viewer_backend/rt_scene_builder.h"
+#include "viewer_capture/png.h"
 
 #include <algorithm>
 #include <cmath>
 #include <condition_variable>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <thread>
 
@@ -32,7 +34,7 @@ struct backend_state {
     bool present_client_has_frame = false;
     std::uint64_t present_client_revision = 0;
     rt_scene_build present_client_rt_build{};
-    frame_scene present_render_scene;
+    std::shared_ptr<const frame_scene> present_render_scene;
     bool present_render_has_frame = false;
     std::uint64_t present_render_revision = 0;
     rt_scene_build present_render_rt_build{};
@@ -49,25 +51,15 @@ backend_info unsupported_backend_info() {
     return {
         backend_kind::unsupported,
         "unsupported",
-        {false, false, false}
+        {false}
     };
 }
 
 const backend_ops* select_backend_ops(backend_preference preference) {
     switch (preference) {
     case backend_preference::d3d12_dxr:
-#if defined(_WIN32) && defined(RTVDB_ENABLE_D3D12_DXR)
-        return d3d12_dxr_backend_ops();
-#else
-        return nullptr;
-#endif
     case backend_preference::vulkan_rt:
-#if defined(RTVDB_ENABLE_VULKAN_RT) && \
-    (defined(_WIN32) || defined(__linux__) || defined(__FreeBSD__))
-        return vulkan_rt_backend_ops();
-#else
-        return nullptr;
-#endif
+        return select_rt_rhi(preference) ? rt_backend_ops() : nullptr;
     case backend_preference::metal_rt:
 #if defined(__APPLE__)
         return metal_rt_backend_ops();
@@ -76,16 +68,10 @@ const backend_ops* select_backend_ops(backend_preference preference) {
 #endif
     case backend_preference::automatic:
     default:
-#if defined(_WIN32) && defined(RTVDB_ENABLE_D3D12_DXR)
-        return d3d12_dxr_backend_ops();
-#elif defined(RTVDB_ENABLE_VULKAN_RT) && defined(_WIN32)
-        return vulkan_rt_backend_ops();
-#elif defined(__APPLE__)
+#if defined(__APPLE__)
         return metal_rt_backend_ops();
-#elif defined(RTVDB_ENABLE_VULKAN_RT) && (defined(__linux__) || defined(__FreeBSD__))
-        return vulkan_rt_backend_ops();
 #else
-        return nullptr;
+        return select_rt_rhi(backend_preference::automatic) ? rt_backend_ops() : nullptr;
 #endif
     }
 }
@@ -216,7 +202,7 @@ void backend_worker() {
                 pending_scene,
                 previous_client_build.revision != 0 ? &previous_client_build : nullptr,
                 pending_revision,
-                kDefaultRtSceneChunkTriangles,
+                kDefaultRtSceneTriangleChunkPrimitives,
                 &client_rt_build)) {
             lock.lock();
             g_backend.build_in_progress = false;
@@ -242,7 +228,7 @@ void backend_worker() {
                 render_scene,
                 previous_render_build.revision != 0 ? &previous_render_build : nullptr,
                 pending_revision,
-                kDefaultRtSceneChunkTriangles,
+                kDefaultRtSceneTriangleChunkPrimitives,
                 &render_rt_build)) {
             lock.lock();
             g_backend.build_in_progress = false;
@@ -258,20 +244,20 @@ void backend_worker() {
         if (g_backend.stop_worker) {
             break;
         }
-        if (pending_revision != g_backend.pending_revision) {
-            continue;
-        }
+        const bool superseded_by_newer_scene = pending_revision != g_backend.pending_revision;
 
         g_backend.present_client_scene = pending_scene;
         g_backend.present_client_has_frame = pending_has_frame;
         g_backend.present_client_revision = pending_revision;
         g_backend.present_client_rt_build = std::move(client_rt_build);
-        g_backend.present_render_scene = render_scene;
+        g_backend.present_render_scene = std::make_shared<frame_scene>(std::move(render_scene));
         g_backend.present_render_has_frame = pending_has_frame;
         g_backend.present_render_revision = pending_revision;
         g_backend.present_render_rt_build = std::move(render_rt_build);
-        g_backend.pending_revision = 0;
-        g_backend.build_in_progress = false;
+        if (!superseded_by_newer_scene) {
+            g_backend.pending_revision = 0;
+            g_backend.build_in_progress = false;
+        }
 
         ready_scene = g_backend.present_client_scene;
         ready_has_frame = g_backend.present_client_has_frame;
@@ -454,7 +440,7 @@ void shutdown_backend() {
     g_backend.present_client_has_frame = false;
     g_backend.present_client_revision = 0;
     g_backend.present_client_rt_build = {};
-    g_backend.present_render_scene = {};
+    g_backend.present_render_scene.reset();
     g_backend.present_render_has_frame = false;
     g_backend.present_render_revision = 0;
     g_backend.present_render_rt_build = {};
@@ -500,16 +486,24 @@ void copy_present_camera(
 {
     std::scoped_lock lock(g_backend.mutex);
     if (out_camera != nullptr) {
-        *out_camera = g_backend.present_render_scene.camera;
+        *out_camera = g_backend.present_render_scene != nullptr
+            ? g_backend.present_render_scene->camera
+            : rtvdb::camera{};
     }
     if (out_projection_blend_from != nullptr) {
-        *out_projection_blend_from = g_backend.present_render_scene.projection_blend_from;
+        *out_projection_blend_from = g_backend.present_render_scene != nullptr
+            ? g_backend.present_render_scene->projection_blend_from
+            : rtvdb::camera_projection::perspective;
     }
     if (out_projection_blend_to != nullptr) {
-        *out_projection_blend_to = g_backend.present_render_scene.projection_blend_to;
+        *out_projection_blend_to = g_backend.present_render_scene != nullptr
+            ? g_backend.present_render_scene->projection_blend_to
+            : rtvdb::camera_projection::perspective;
     }
     if (out_projection_blend_t != nullptr) {
-        *out_projection_blend_t = g_backend.present_render_scene.projection_blend_t;
+        *out_projection_blend_t = g_backend.present_render_scene != nullptr
+            ? g_backend.present_render_scene->projection_blend_t
+            : 1.0f;
     }
     if (out_has_frame != nullptr) {
         *out_has_frame = g_backend.present_render_has_frame;
@@ -519,11 +513,25 @@ void copy_present_camera(
 void copy_present_render_scene(frame_scene* out_scene, bool* out_has_frame) {
     std::scoped_lock lock(g_backend.mutex);
     if (out_scene != nullptr) {
+        *out_scene = g_backend.present_render_scene != nullptr ? *g_backend.present_render_scene : frame_scene{};
+    }
+    if (out_has_frame != nullptr) {
+        *out_has_frame = g_backend.present_render_has_frame;
+    }
+}
+
+bool acquire_present_render_scene(
+    std::shared_ptr<const frame_scene>* out_scene,
+    bool* out_has_frame)
+{
+    std::scoped_lock lock(g_backend.mutex);
+    if (out_scene != nullptr) {
         *out_scene = g_backend.present_render_scene;
     }
     if (out_has_frame != nullptr) {
         *out_has_frame = g_backend.present_render_has_frame;
     }
+    return g_backend.present_render_scene != nullptr;
 }
 
 void copy_present_client_rt_scene_build(rt_scene_build* out_build) {
@@ -552,9 +560,14 @@ void copy_present_build_info(scene_build_info* out_info) {
         out_info->triangle_count = g_backend.present_client_rt_build.triangle_count;
         out_info->point_count = g_backend.present_client_rt_build.point_count;
         out_info->line_count = g_backend.present_client_rt_build.line_count;
-        out_info->chunk_count = g_backend.present_client_rt_build.chunks.size();
-        out_info->reused_chunk_count = g_backend.present_client_rt_build.reused_chunk_count;
-        out_info->rebuilt_chunk_count = g_backend.present_client_rt_build.rebuilt_chunk_count;
+        out_info->triangle_chunk_count = g_backend.present_client_rt_build.triangle_chunks.size();
+        out_info->point_chunk_count = g_backend.present_client_rt_build.point_chunks.size();
+        out_info->line_chunk_count = g_backend.present_client_rt_build.line_chunks.size();
+        out_info->triangle_blas_chunk_set_count = g_backend.present_client_rt_build.triangle_blas_chunk_sets.size();
+        out_info->point_blas_chunk_set_count = g_backend.present_client_rt_build.point_blas_chunk_sets.size();
+        out_info->line_blas_chunk_set_count = g_backend.present_client_rt_build.line_blas_chunk_sets.size();
+        out_info->reused_triangle_chunk_count = g_backend.present_client_rt_build.reused_triangle_chunk_count;
+        out_info->rebuilt_triangle_chunk_count = g_backend.present_client_rt_build.rebuilt_triangle_chunk_count;
         out_info->vertex_count = g_backend.present_client_rt_build.vertex_count;
         out_info->index_count = g_backend.present_client_rt_build.index_count;
         if (g_backend.ops != nullptr) {
@@ -565,6 +578,21 @@ void copy_present_build_info(scene_build_info* out_info) {
     if (fill_build_info != nullptr) {
         fill_build_info(out_info);
     }
+}
+
+bool copy_present_client_scene_bounds(rtvdb::vec3* out_min, rtvdb::vec3* out_max) {
+    std::scoped_lock lock(g_backend.mutex);
+    const scene_bounds &bounds = g_backend.present_client_rt_build.bounds;
+    if (!bounds.valid) {
+        return false;
+    }
+    if (out_min != nullptr) {
+        *out_min = bounds.min;
+    }
+    if (out_max != nullptr) {
+        *out_max = bounds.max;
+    }
+    return true;
 }
 
 bool build_in_progress() {
@@ -622,6 +650,40 @@ helper_plane current_helper_overlay_plane() {
     return g_backend.helper_overlay_plane;
 }
 
+void apply_reference_grid_request(rtvdb::reference_grid value) {
+    if (!g_backend.initialized || g_backend.ops == nullptr || value == rtvdb::reference_grid::viewer_default) {
+        return;
+    }
+
+    bool enabled = true;
+    helper_plane plane = helper_plane::xy;
+    switch (value) {
+    case rtvdb::reference_grid::off:
+        enabled = false;
+        break;
+    case rtvdb::reference_grid::xz_grid:
+        plane = helper_plane::xz;
+        break;
+    case rtvdb::reference_grid::yz_grid:
+        plane = helper_plane::yz;
+        break;
+    case rtvdb::reference_grid::xy_grid:
+    case rtvdb::reference_grid::viewer_default:
+    default:
+        break;
+    }
+
+    std::scoped_lock lock(g_backend.mutex);
+    if (g_backend.helper_overlay == enabled && (!enabled || g_backend.helper_overlay_plane == plane)) {
+        return;
+    }
+    g_backend.helper_overlay = enabled;
+    if (enabled) {
+        g_backend.helper_overlay_plane = plane;
+    }
+    schedule_helper_overlay_rebuild_locked();
+}
+
 void set_capture_size(int width, int height) {
     if (width <= 0 || height <= 0) {
         return;
@@ -668,10 +730,18 @@ bool pick(
     bool has_frame,
     pick_result* out_result)
 {
+    const rt_pick_request request{{width, height, &scene, has_frame}, pixel_x, pixel_y};
     if (!g_backend.initialized || g_backend.ops == nullptr || g_backend.ops->pick == nullptr) {
         return false;
     }
-    return g_backend.ops->pick(width, height, pixel_x, pixel_y, scene, has_frame, out_result);
+    return g_backend.ops->pick(request, out_result);
+}
+
+bool pick_query_pending() {
+    return g_backend.initialized &&
+        g_backend.ops != nullptr &&
+        g_backend.ops->pick_query_pending != nullptr &&
+        g_backend.ops->pick_query_pending();
 }
 
 bool accumulation_in_progress() {
@@ -717,10 +787,11 @@ bool render_frame_to_native_d3d12_texture(
     bool has_frame,
     void* texture_resource)
 {
+    const rt_render_request request{width, height, &scene, has_frame};
     if (!g_backend.initialized || g_backend.ops == nullptr || g_backend.ops->render_to_native_d3d12_texture == nullptr) {
         return false;
     }
-    if (g_backend.ops->render_to_native_d3d12_texture(width, height, scene, has_frame, texture_resource)) {
+    if (g_backend.ops->render_to_native_d3d12_texture(request, texture_resource)) {
         return true;
     }
     if (!try_recover_backend(scene, has_frame)) {
@@ -729,7 +800,7 @@ bool render_frame_to_native_d3d12_texture(
     if (!g_backend.initialized || g_backend.ops == nullptr || g_backend.ops->render_to_native_d3d12_texture == nullptr) {
         return false;
     }
-    return g_backend.ops->render_to_native_d3d12_texture(width, height, scene, has_frame, texture_resource);
+    return g_backend.ops->render_to_native_d3d12_texture(request, texture_resource);
 }
 
 bool render_frame_to_native_metal_texture(
@@ -739,10 +810,11 @@ bool render_frame_to_native_metal_texture(
     bool has_frame,
     void* pixel_buffer)
 {
+    const rt_render_request request{width, height, &scene, has_frame};
     if (!g_backend.initialized || g_backend.ops == nullptr || g_backend.ops->render_to_native_metal_texture == nullptr) {
         return false;
     }
-    return g_backend.ops->render_to_native_metal_texture(width, height, scene, has_frame, pixel_buffer);
+    return g_backend.ops->render_to_native_metal_texture(request, pixel_buffer);
 }
 
 bool render_frame_to_native_vulkan_texture(
@@ -752,6 +824,7 @@ bool render_frame_to_native_vulkan_texture(
     bool has_frame,
     void** out_image)
 {
+    const rt_render_request request{width, height, &scene, has_frame};
     if (out_image == nullptr ||
         !g_backend.initialized ||
         g_backend.ops == nullptr ||
@@ -759,7 +832,7 @@ bool render_frame_to_native_vulkan_texture(
         return false;
     }
     *out_image = nullptr;
-    return g_backend.ops->render_to_native_vulkan_texture(width, height, scene, has_frame, out_image);
+    return g_backend.ops->render_to_native_vulkan_texture(request, out_image);
 }
 
 bool capture_frame_to_bgra(
@@ -769,10 +842,11 @@ bool capture_frame_to_bgra(
     std::vector<std::uint8_t>* out_pixels,
     bool update_build_info)
 {
+    const rt_render_request request{width, height, &scene, has_frame};
     if (!g_backend.initialized || g_backend.ops == nullptr || g_backend.ops->capture_to_bgra == nullptr) {
         return false;
     }
-    if (g_backend.ops->capture_to_bgra(width, height, scene, has_frame, out_pixels, update_build_info)) {
+    if (g_backend.ops->capture_to_bgra(request, out_pixels, update_build_info)) {
         return true;
     }
     if (!try_recover_backend(scene, has_frame)) {
@@ -781,14 +855,35 @@ bool capture_frame_to_bgra(
     if (!g_backend.initialized || g_backend.ops == nullptr || g_backend.ops->capture_to_bgra == nullptr) {
         return false;
     }
-    return g_backend.ops->capture_to_bgra(width, height, scene, has_frame, out_pixels, update_build_info);
+    return g_backend.ops->capture_to_bgra(request, out_pixels, update_build_info);
+}
+
+bool readback_current_frame_to_bgra(
+    int width,
+    int height,
+    std::vector<std::uint8_t>* out_pixels)
+{
+    if (!g_backend.initialized || g_backend.ops == nullptr ||
+        g_backend.ops->readback_current_frame_to_bgra == nullptr) {
+        return false;
+    }
+    return g_backend.ops->readback_current_frame_to_bgra(width, height, out_pixels);
 }
 
 bool capture_frame_to_png(const wchar_t* path, int width, int height, const frame_scene &scene, bool has_frame) {
-    if (!g_backend.initialized || g_backend.ops == nullptr) {
+    if (!g_backend.initialized || g_backend.ops == nullptr || path == nullptr) {
         return false;
     }
-    return g_backend.ops->capture_to_png(path, width, height, scene, has_frame);
+    const backend_kind kind = g_backend.ops->info().kind;
+    if (kind == backend_kind::d3d12_dxr || kind == backend_kind::vulkan_rt) {
+        std::vector<std::uint8_t> pixels;
+        if (!capture_frame_to_bgra(width, height, scene, has_frame, &pixels, false)) {
+            return false;
+        }
+        return viewer_capture::write_png_bgra8(path, pixels.data(), width, height, width * 4);
+    }
+    const rt_render_request request{width, height, &scene, has_frame};
+    return g_backend.ops->capture_to_png != nullptr && g_backend.ops->capture_to_png(path, request);
 }
 
 } // namespace rtvdb::viewer_backend

@@ -1,4 +1,4 @@
-#if defined(__INTELLISENSE__)
+﻿#if defined(__INTELLISENSE__)
 #   define ARG_IN(Type, var) const Type &var
 #   define ARG_OUT(Type, var) Type &var
 #   define ARG_INOUT(Type, var) Type &var
@@ -96,10 +96,27 @@ struct PickResult
 
 struct GeometryMetadata
 {
-    uint32_t first_triangle;
+    uint32_t primitive_base;
     uint32_t index_offset;
     uint32_t primitive_offset;
     uint32_t primitive_count;
+};
+
+struct ViewerConstants
+{
+    float4 origin;
+    float4 forward;
+    float4 right;
+    float4 up;
+    float4 scene_bounds_min;
+    float4 scene_bounds_max;
+    uint4 size_and_mode;
+    float4 projection_from;
+    float4 projection_to;
+    uint4 projection_modes;
+    float4 blend_and_jitter;
+    uint4 pick_and_flags;
+    uint4 pick_params;
 };
 
 struct SharedPointPrimitive

@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -26,8 +27,6 @@ enum class backend_preference {
 
 struct backend_caps {
     bool hardware_ray_tracing;
-    bool order_independent_transparency;
-    bool cross_platform_target;
 };
 
 enum class display_mode {
@@ -129,13 +128,18 @@ struct scene_build_info {
     std::size_t triangle_count = 0;
     std::size_t point_count = 0;
     std::size_t line_count = 0;
-    std::size_t chunk_count = 0;
-    std::size_t reused_chunk_count = 0;
-    std::size_t rebuilt_chunk_count = 0;
+    std::size_t triangle_chunk_count = 0;
+    std::size_t point_chunk_count = 0;
+    std::size_t line_chunk_count = 0;
+    std::size_t triangle_blas_chunk_set_count = 0;
+    std::size_t point_blas_chunk_set_count = 0;
+    std::size_t line_blas_chunk_set_count = 0;
+    std::size_t reused_triangle_chunk_count = 0;
+    std::size_t rebuilt_triangle_chunk_count = 0;
     std::size_t blas_reused_count = 0;
     std::size_t blas_rebuilt_count = 0;
-    std::size_t blas_reused_chunk_count = 0;
-    std::size_t blas_rebuilt_chunk_count = 0;
+    std::size_t blas_reused_triangle_chunk_count = 0;
+    std::size_t blas_rebuilt_triangle_chunk_count = 0;
     std::size_t tlas_rebuild_count = 0;
     double accel_build_ms = 0.0;
     double accel_host_prep_ms = 0.0;
@@ -145,6 +149,17 @@ struct scene_build_info {
     double accel_resource_alloc_ms = 0.0;
     double accel_build_call_record_ms = 0.0;
     double accel_prebuild_info_ms = 0.0;
+    double accel_chunk_blas_prebuild_info_ms = 0.0;
+    std::uint32_t accel_chunk_blas_prebuild_info_count = 0;
+    double accel_group_blas_prebuild_info_ms = 0.0;
+    std::uint32_t accel_group_blas_prebuild_info_count = 0;
+    double accel_point_blas_prebuild_info_ms = 0.0;
+    std::uint32_t accel_point_blas_prebuild_info_count = 0;
+    double accel_line_blas_prebuild_info_ms = 0.0;
+    std::uint32_t accel_line_blas_prebuild_info_count = 0;
+    double accel_tlas_prebuild_info_ms = 0.0;
+    std::uint32_t accel_tlas_prebuild_info_count = 0;
+    double accel_startup_prebuild_warmup_ms = 0.0;
     double accel_tlas_instance_upload_ms = 0.0;
     double accel_submit_cpu_ms = 0.0;
     double accel_gpu_wait_ms = 0.0;
@@ -153,6 +168,7 @@ struct scene_build_info {
     double dispatch_submit_cpu_ms = 0.0;
     double dispatch_gpu_wait_ms = 0.0;
     double dispatch_gpu_ms = 0.0;
+    double command_slot_reuse_wait_ms = 0.0;
     double readback_ms = 0.0;
     std::uint32_t accumulation_sample_count = 0;
     std::uint32_t accumulation_target_sample_count = 0;
@@ -170,6 +186,9 @@ struct pick_result {
     hover_highlight_kind kind = hover_highlight_kind::none;
     std::uint32_t primitive_index = 0;
     float distance = 0.0f;
+    int pixel_x = -1;
+    int pixel_y = -1;
+    bool completed = false;
 };
 
 struct d3d12_interop_config {
@@ -207,6 +226,9 @@ void shutdown_backend();
 bool submit_scene_build(const frame_scene &scene, bool has_frame, bool allow_auto_frame = true);
 void copy_present_scene(frame_scene* out_scene, bool* out_has_frame);
 void copy_present_render_scene(frame_scene* out_scene, bool* out_has_frame);
+bool acquire_present_render_scene(
+    std::shared_ptr<const frame_scene>* out_scene,
+    bool* out_has_frame);
 void copy_present_camera(
     rtvdb::camera* out_camera,
     rtvdb::camera_projection* out_projection_blend_from,
@@ -214,6 +236,7 @@ void copy_present_camera(
     float* out_projection_blend_t,
     bool* out_has_frame);
 void copy_present_build_info(scene_build_info* out_info);
+bool copy_present_client_scene_bounds(rtvdb::vec3* out_min, rtvdb::vec3* out_max);
 bool build_in_progress();
 void set_auto_frame_enabled(bool enabled);
 bool auto_frame_enabled();
@@ -221,6 +244,7 @@ void set_helper_overlay_enabled(bool enabled);
 bool helper_overlay_enabled();
 void set_helper_overlay_plane(helper_plane plane);
 helper_plane current_helper_overlay_plane();
+void apply_reference_grid_request(rtvdb::reference_grid value);
 void set_capture_size(int width, int height);
 void set_display_mode(display_mode mode);
 bool get_display_mode(display_mode* out_mode);
@@ -234,6 +258,7 @@ bool pick(
     const frame_scene &scene,
     bool has_frame,
     pick_result* out_result);
+bool pick_query_pending();
 bool accumulation_in_progress();
 bool native_d3d12_texture_present_supported();
 bool get_vulkan_renderer_interop(vulkan_renderer_interop* out_interop);
@@ -262,6 +287,10 @@ bool capture_frame_to_bgra(
     bool has_frame,
     std::vector<std::uint8_t>* out_pixels,
     bool update_build_info = true);
+bool readback_current_frame_to_bgra(
+    int width,
+    int height,
+    std::vector<std::uint8_t>* out_pixels);
 bool capture_frame_to_png(const wchar_t* path, int width, int height, const frame_scene &scene, bool has_frame);
 
 } // namespace rtvdb::viewer_backend

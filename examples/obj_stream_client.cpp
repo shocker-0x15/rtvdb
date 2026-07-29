@@ -34,6 +34,15 @@ struct options {
     rtvdb::rgba color_override{1.0f, 1.0f, 1.0f, 1.0f};
 };
 
+enum class exit_code : int {
+    success = 0,
+    invalid_arguments,
+    mesh_load_failed,
+    connection_failed,
+    triangle_send_failed,
+    frame_publish_failed,
+};
+
 rtvdb::vec3 operator-(const rtvdb::vec3 &a, const rtvdb::vec3 &b) {
     return {a.x - b.x, a.y - b.y, a.z - b.z};
 }
@@ -208,12 +217,12 @@ std::uint64_t select_sleep_ms(const options &opts, std::mt19937_64* rng) {
 int main(int argc, char** argv) {
     options opts{};
     if (!parse_args(argc, argv, &opts)) {
-        return 2;
+        return static_cast<int>(exit_code::invalid_arguments);
     }
 
     std::vector<streamed_triangle> triangles;
     if (!load_obj_mesh(opts.mesh_path, opts, &triangles)) {
-        return 3;
+        return static_cast<int>(exit_code::mesh_load_failed);
     }
 
     if (opts.triangle_limit > 0 && opts.triangle_limit < triangles.size()) {
@@ -222,7 +231,7 @@ int main(int argc, char** argv) {
 
     const std::string app_name = opts.mesh_path.stem().string();
     if (!rtvdb::connect(nullptr, app_name.c_str())) {
-        return 4;
+        return static_cast<int>(exit_code::connection_failed);
     }
 
     rtvdb::clear();
@@ -241,14 +250,10 @@ int main(int argc, char** argv) {
             rtvdb::set_color(tri.color);
             if (!rtvdb::triangle(tri.a, tri.b, tri.c)) {
                 rtvdb::disconnect();
-                return 5;
+                return static_cast<int>(exit_code::triangle_send_failed);
             }
         }
 
-        if (!rtvdb::end_frame()) {
-            rtvdb::disconnect();
-            return 6;
-        }
         const std::uint64_t sleep_ms = select_sleep_ms(opts, &rng);
         if (sleep_ms > 0) {
             std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
@@ -257,5 +262,5 @@ int main(int argc, char** argv) {
 
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
     rtvdb::disconnect();
-    return 0;
+    return static_cast<int>(exit_code::success);
 }

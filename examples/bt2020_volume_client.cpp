@@ -15,6 +15,20 @@ namespace {
 
 bool g_triangle_approx = false;
 
+enum class exit_code : int {
+    success = 0,
+    connection_failed,
+    invalid_arguments,
+    bounds_or_frame_setup_failed,
+    base_triangle_failed,
+    red_line_failed,
+    green_line_failed,
+    blue_line_failed,
+    point_failed,
+    direct_volume_failed,
+    frame_publish_failed,
+};
+
 struct sample_config {
     enum class volume_mode {
         cube,
@@ -631,11 +645,11 @@ int main(int argc, char** argv) {
     sample_config cfg{};
     if (!parse_args(argc, argv, &cfg)) {
         print_usage();
-        return 2;
+        return static_cast<int>(exit_code::invalid_arguments);
     }
 
     if (!rtvdb::connect(nullptr, "bt2020_volume_client")) {
-        return 1;
+        return static_cast<int>(exit_code::connection_failed);
     }
 
     // BT.2020 色域をサンプルして、ボリューム全体の bounds とカメラ基準を決める。
@@ -651,7 +665,7 @@ int main(int argc, char** argv) {
         }
     } else if (!append_xyy_direct_bounds(&gamut_bounds, cfg.point_grid)) {
         rtvdb::disconnect();
-        return 3;
+        return static_cast<int>(exit_code::bounds_or_frame_setup_failed);
     }
 
     const vec3 extent = gamut_bounds.max - gamut_bounds.min;
@@ -675,7 +689,7 @@ int main(int argc, char** argv) {
         !rtvdb::clear() ||
         !rtvdb::set_perspective_camera(camera_origin, camera_target, camera_up, camera_vertical_fov_degrees)) {
         rtvdb::disconnect();
-        return 3;
+        return static_cast<int>(exit_code::bounds_or_frame_setup_failed);
     }
 
     std::size_t line_count = 0;
@@ -702,7 +716,7 @@ int main(int argc, char** argv) {
             chroma_xy_to_floor_position(r_xyY.x, r_xyY.y),
             cfg.line_radius, base_tri_color)) {
         rtvdb::disconnect();
-        return 6;
+        return static_cast<int>(exit_code::base_triangle_failed);
     }
     line_count += 3;
 
@@ -721,7 +735,7 @@ int main(int argc, char** argv) {
                                 cfg.line_radius,
                                 rgb_to_rgba(avg_rgb))) {
                             rtvdb::disconnect();
-                            return 7;
+                            return static_cast<int>(exit_code::red_line_failed);
                         }
                         line_count += 1;
                     }
@@ -734,7 +748,7 @@ int main(int argc, char** argv) {
                                 cfg.line_radius,
                                 rgb_to_rgba(avg_rgb))) {
                             rtvdb::disconnect();
-                            return 8;
+                            return static_cast<int>(exit_code::green_line_failed);
                         }
                         line_count += 1;
                     }
@@ -747,7 +761,7 @@ int main(int argc, char** argv) {
                                 cfg.line_radius,
                                 rgb_to_rgba(avg_rgb))) {
                             rtvdb::disconnect();
-                            return 9;
+                            return static_cast<int>(exit_code::blue_line_failed);
                         }
                         line_count += 1;
                     }
@@ -765,7 +779,7 @@ int main(int argc, char** argv) {
                     const rgb rgb_value = rgb_sample(r, g, b, cfg.point_grid);
                     if (!emit_point_primitive(bt2020_to_volume_position(rgb_value), cfg.point_radius, rgb_to_rgba(rgb_value))) {
                         rtvdb::disconnect();
-                        return 10;
+                        return static_cast<int>(exit_code::point_failed);
                     }
                     point_count += 1;
                 }
@@ -774,12 +788,12 @@ int main(int argc, char** argv) {
         rtvdb::pop_layer();
     } else if (!emit_xyy_direct_volume(cfg, &point_count, &line_count)) {
         rtvdb::disconnect();
-        return 11;
+        return static_cast<int>(exit_code::direct_volume_failed);
     }
 
     if (!rtvdb::end_frame()) {
         rtvdb::disconnect();
-        return 12;
+        return static_cast<int>(exit_code::frame_publish_failed);
     }
 
     const std::size_t total_triangles = g_triangle_approx
@@ -802,5 +816,5 @@ int main(int argc, char** argv) {
     // Viewer で見える時間を少し確保してから切断する。
     std::this_thread::sleep_for(std::chrono::milliseconds(cfg.hold_ms));
     rtvdb::disconnect();
-    return 0;
+    return static_cast<int>(exit_code::success);
 }

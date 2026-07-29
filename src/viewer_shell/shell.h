@@ -69,6 +69,14 @@ struct renderer_config {
     std::uint32_t vulkan_present_queue_family_index = 0;
 };
 
+struct frame_timing {
+    double frame_interval_ms = 0.0;
+    double pre_composition_ms = 0.0;
+    double composition_cpu_ms = 0.0;
+    double present_cpu_ms = 0.0;
+    double idle_sleep_ms = 0.0;
+};
+
 struct render_callbacks {
     void (*paint)(void* user_data);
     void (*pre_present)(void* user_data);
@@ -100,9 +108,11 @@ bool initialize_shell(
 bool initialize_renderer(const renderer_config &config);
 void run_shell_loop();
 void request_repaint();
+void set_window_title(const wchar_t* title);
 native_window_handle native_window();
 bool render_window_size(int* out_width, int* out_height);
 bool render_coordinate_to_pixel(int x, int y, int* out_pixel_x, int* out_pixel_y);
+void copy_frame_timing(frame_timing* out_timing);
 bool key_pressed(key_code key);
 bool get_d3d12_renderer_interop(d3d12_renderer_interop* out_interop);
 bool copy_vulkan_instance_extensions(std::vector<const char*>* out_extensions);

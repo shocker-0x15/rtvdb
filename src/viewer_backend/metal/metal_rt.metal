@@ -1,4 +1,4 @@
-#include <metal_stdlib>
+﻿#include <metal_stdlib>
 #include <metal_raytracing>
 using namespace metal;
 using namespace metal::raytracing;
@@ -65,16 +65,16 @@ struct triangle_instance_metadata_gpu {
     uint index_offset;
 };
 
-struct procedural_group_metadata_gpu {
+struct procedural_chunk_metadata_gpu {
     uint first_primitive;
     uint primitive_count;
     uint visible;
     uint pad;
 };
 
-struct procedural_group_count_gpu {
-    uint point_group_count;
-    uint line_group_count;
+struct procedural_chunk_count_gpu {
+    uint point_chunk_count;
+    uint line_chunk_count;
 };
 
 struct hit_info {
@@ -120,28 +120,28 @@ hit_info trace_points(
     constant camera_gpu &camera,
     primitive_acceleration_structure point_scene,
     constant point_gpu* points,
-    constant procedural_group_metadata_gpu* point_groups,
-    uint point_group_count);
+    constant procedural_chunk_metadata_gpu* point_chunks,
+    uint point_chunk_count);
 
 hit_info trace_lines(
     ray view_ray,
     constant camera_gpu &camera,
     primitive_acceleration_structure line_scene,
     constant line_gpu* lines,
-    constant procedural_group_metadata_gpu* line_groups,
-    uint line_group_count,
+    constant procedural_chunk_metadata_gpu* line_chunks,
+    uint line_chunk_count,
     bool is_pick_pass);
 
 bool procedural_primitive_visible(
     uint primitive_index,
-    constant procedural_group_metadata_gpu* groups,
+    constant procedural_chunk_metadata_gpu* groups,
     uint group_count)
 {
     if (groups == nullptr) {
         return true;
     }
     for (uint i = 0u; i < group_count; ++i) {
-        const procedural_group_metadata_gpu group = groups[i];
+        const procedural_chunk_metadata_gpu group = groups[i];
         if (primitive_index >= group.first_primitive &&
             primitive_index < group.first_primitive + group.primitive_count) {
             return group.visible != 0u;
@@ -292,10 +292,10 @@ hit_info trace_nearest_hit(
     constant uint* triangle_geometry_indices,
     constant uint* triangle_instance_indices,
     constant triangle_instance_metadata_gpu* triangle_instance_metadata,
-    constant procedural_group_metadata_gpu* point_groups,
-    uint point_group_count,
-    constant procedural_group_metadata_gpu* line_groups,
-    uint line_group_count,
+    constant procedural_chunk_metadata_gpu* point_chunks,
+    uint point_chunk_count,
+    constant procedural_chunk_metadata_gpu* line_chunks,
+    uint line_chunk_count,
     bool is_pick_pass)
 {
     hit_info best_hit = trace_triangles(
@@ -308,7 +308,7 @@ hit_info trace_nearest_hit(
         triangle_instance_indices,
         triangle_instance_metadata);
 
-    const hit_info point_hit = trace_points(view_ray, camera, point_scene, points, point_groups, point_group_count);
+    const hit_info point_hit = trace_points(view_ray, camera, point_scene, points, point_chunks, point_chunk_count);
     if (point_hit.hit && (!best_hit.hit || point_hit.distance < best_hit.distance)) {
         best_hit = point_hit;
     }
@@ -318,8 +318,8 @@ hit_info trace_nearest_hit(
         camera,
         line_scene,
         lines,
-        line_groups,
-        line_group_count,
+        line_chunks,
+        line_chunk_count,
         is_pick_pass);
     if (line_hit.hit && (!best_hit.hit || line_hit.distance < best_hit.distance)) {
         best_hit = line_hit;
@@ -332,8 +332,8 @@ hit_info trace_points(
     constant camera_gpu &camera,
     primitive_acceleration_structure point_scene,
     constant point_gpu* points,
-    constant procedural_group_metadata_gpu* point_groups,
-    uint point_group_count)
+    constant procedural_chunk_metadata_gpu* point_chunks,
+    uint point_chunk_count)
 {
     hit_info result{};
     if (is_null_acceleration_structure(point_scene) || points == nullptr) {
@@ -344,7 +344,7 @@ hit_info trace_points(
     intersection_query<> query(view_ray, point_scene);
     while (query.next()) {
         const uint primitive_index = query.get_candidate_primitive_id();
-        if (!procedural_primitive_visible(primitive_index, point_groups, point_group_count)) {
+        if (!procedural_primitive_visible(primitive_index, point_chunks, point_chunk_count)) {
             continue;
         }
         const point_gpu primitive = points[primitive_index];
@@ -367,7 +367,7 @@ hit_info trace_points(
     }
 
     const uint primitive_index = query.get_committed_primitive_id();
-    if (!procedural_primitive_visible(primitive_index, point_groups, point_group_count)) {
+    if (!procedural_primitive_visible(primitive_index, point_chunks, point_chunk_count)) {
         return result;
     }
     const point_gpu primitive = points[primitive_index];
@@ -401,8 +401,8 @@ hit_info trace_lines(
     constant camera_gpu &camera,
     primitive_acceleration_structure line_scene,
     constant line_gpu* lines,
-    constant procedural_group_metadata_gpu* line_groups,
-    uint line_group_count,
+    constant procedural_chunk_metadata_gpu* line_chunks,
+    uint line_chunk_count,
     bool is_pick_pass)
 {
     hit_info result{};
@@ -415,7 +415,7 @@ hit_info trace_lines(
     intersection_query<> query(view_ray, line_scene);
     while (query.next()) {
         const uint primitive_index = query.get_candidate_primitive_id();
-        if (!procedural_primitive_visible(primitive_index, line_groups, line_group_count)) {
+        if (!procedural_primitive_visible(primitive_index, line_chunks, line_chunk_count)) {
             continue;
         }
         const line_gpu primitive = lines[primitive_index];
@@ -443,7 +443,7 @@ hit_info trace_lines(
     }
 
     const uint primitive_index = query.get_committed_primitive_id();
-    if (!procedural_primitive_visible(primitive_index, line_groups, line_group_count)) {
+    if (!procedural_primitive_visible(primitive_index, line_chunks, line_chunk_count)) {
         return result;
     }
     const line_gpu primitive = lines[primitive_index];
@@ -532,9 +532,9 @@ kernel void rtvdb_trace_kernel(
     constant uint* triangle_instance_indices [[buffer(11)]],
     device float4* accumulation_pixels [[buffer(13)]],
     constant triangle_instance_metadata_gpu* triangle_instance_metadata [[buffer(14)]],
-    constant procedural_group_metadata_gpu* point_groups [[buffer(15)]],
-    constant procedural_group_metadata_gpu* line_groups [[buffer(16)]],
-    constant procedural_group_count_gpu &group_counts [[buffer(17)]],
+    constant procedural_chunk_metadata_gpu* point_chunks [[buffer(15)]],
+    constant procedural_chunk_metadata_gpu* line_chunks [[buffer(16)]],
+    constant procedural_chunk_count_gpu &chunk_counts [[buffer(17)]],
     uint2 tid [[thread_position_in_grid]])
 {
     if (tid.x >= camera.width || tid.y >= camera.height) {
@@ -589,10 +589,10 @@ kernel void rtvdb_trace_kernel(
             triangle_geometry_indices,
             triangle_instance_indices,
             triangle_instance_metadata,
-            point_groups,
-            group_counts.point_group_count,
-            line_groups,
-            group_counts.line_group_count,
+            point_chunks,
+            chunk_counts.point_chunk_count,
+            line_chunks,
+            chunk_counts.line_chunk_count,
             false);
         if (!best_hit.hit) {
             break;
@@ -606,7 +606,7 @@ kernel void rtvdb_trace_kernel(
         }
 
         accum += throughput * shaded.rgb * alpha;
-        throughput *= mix(float3(1.0f), shaded.rgb, alpha);
+        throughput *= 1.0f - alpha;
         ray_origin += direction * (best_hit.distance + scene_hit_advance_bias(camera));
         if (max(throughput.r, max(throughput.g, throughput.b)) <= 0.001f) {
             break;
@@ -643,9 +643,9 @@ kernel void rtvdb_pick_kernel(
     constant uint* triangle_instance_indices [[buffer(11)]],
     constant pick_request_gpu &pick_request [[buffer(12)]],
     constant triangle_instance_metadata_gpu* triangle_instance_metadata [[buffer(14)]],
-    constant procedural_group_metadata_gpu* point_groups [[buffer(15)]],
-    constant procedural_group_metadata_gpu* line_groups [[buffer(16)]],
-    constant procedural_group_count_gpu &group_counts [[buffer(17)]],
+    constant procedural_chunk_metadata_gpu* point_chunks [[buffer(15)]],
+    constant procedural_chunk_metadata_gpu* line_chunks [[buffer(16)]],
+    constant procedural_chunk_count_gpu &chunk_counts [[buffer(17)]],
     uint tid [[thread_position_in_grid]])
 {
     if (tid != 0u || pick_result == nullptr) {
@@ -707,10 +707,10 @@ kernel void rtvdb_pick_kernel(
         triangle_geometry_indices,
         triangle_instance_indices,
         triangle_instance_metadata,
-        point_groups,
-        group_counts.point_group_count,
-        line_groups,
-        group_counts.line_group_count,
+        point_chunks,
+        chunk_counts.point_chunk_count,
+        line_chunks,
+        chunk_counts.line_chunk_count,
         true);
     if (!best_hit.hit) {
         return;

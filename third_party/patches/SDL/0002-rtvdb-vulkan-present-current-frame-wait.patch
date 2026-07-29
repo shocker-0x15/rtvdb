@@ -1,0 +1,58 @@
+From: rtvdb maintainers
+Subject: [rtvdb] Drain the Vulkan renderer queue at present
+
+Match the D3D12 renderer's present pacing for the rtvdb Vulkan RT viewer.
+After SDL submits the composition command buffer and queues presentation, wait
+for that same command buffer's fence before returning to the application.
+This keeps the shared graphics queue drained outside the viewer paint callback,
+so RT command-slot reuse does not inherit display pacing.
+
+Upstream baseline: SDL release-3.4.10, commit
+8e37db5e797b6167f3a00d697d816a684bd259c7. The insertion point is
+VULKAN_RenderPresent(), after vkQueuePresentKHR() accepts the current frame
+and before currentCommandBufferIndex advances. On an SDL update, retain that
+ordering: wait for the fence submitted for the current composition command
+buffer, then advance the ring and retain SDL's existing prior-slot reuse wait.
+Do not move this wait before vkQueuePresentKHR(), and do not replace it with a
+device-wide idle wait; either would change the D3D12-equivalent boundary.
+
+---
+ src/render/vulkan/SDL_render_vulkan.c | 25 +++++++++++++++++++++++++
+ 1 file changed, 25 insertions(+)
+
+diff --git a/src/render/vulkan/SDL_render_vulkan.c b/src/render/vulkan/SDL_render_vulkan.c
+--- a/src/render/vulkan/SDL_render_vulkan.c
++++ b/src/render/vulkan/SDL_render_vulkan.c
+@@ -4474,6 +4474,31 @@ static bool VULKAN_RenderPresent(SDL_Renderer *renderer)
+             SET_ERROR_CODE("vkQueuePresentKHR()", result);
+             return false;
+         }
+ 
++        /*
++         * rtvdb uses this renderer with RT commands on the same graphics queue.
++         * Keep the queue-completion wait at present, matching the D3D12 renderer,
++         * rather than deferring display pacing to an application's next command
++         * allocator reuse.
++         */
++        result = vkWaitForFences(
++            rendererData->device,
++            1,
++            &rendererData->fences[rendererData->currentCommandBufferIndex],
++            VK_TRUE,
++            UINT64_MAX);
++        if (result != VK_SUCCESS) {
++            if (result == VK_ERROR_DEVICE_LOST) {
++                if (VULKAN_HandleDeviceLost(renderer)) {
++                    SDL_SetError("Present failed, device lost");
++                } else {
++                    // Recovering from device lost failed, error is already set
++                }
++            } else {
++                SET_ERROR_CODE("vkWaitForFences()", result);
++            }
++            return false;
++        }
++
+         rendererData->currentCommandBufferIndex = ( rendererData->currentCommandBufferIndex + 1 ) % rendererData->swapchainImageCount;
+ 
+         // Wait for previous time this command buffer was submitted, will be N frames ago

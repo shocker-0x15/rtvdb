@@ -32,7 +32,8 @@
 namespace rtvdb::viewer_session {
 namespace {
 
-constexpr auto kImplicitSnapshotDelay = std::chrono::milliseconds(200);
+constexpr auto kImplicitSnapshotDelay = std::chrono::milliseconds(250);
+constexpr std::size_t kImplicitSnapshotPrimitiveDelta = 32768;
 constexpr std::size_t kMaxRecentLogCount = 128;
 
 #if defined(_WIN32)
@@ -50,12 +51,17 @@ struct shared_state {
     viewer_backend::frame_scene published_scene;
     bool has_frame = false;
     bool dirty = false;
+    bool explicit_frame_open = false;
+    std::size_t last_published_triangle_count = 0;
+    std::size_t last_published_point_count = 0;
+    std::size_t last_published_line_count = 0;
     std::uint64_t published_revision = 0;
     std::uint64_t current_revision = 0;
     std::uint64_t connection_serial = 0;
     std::vector<std::string> layer_stack;
     std::chrono::steady_clock::time_point session_start_time{};
     std::chrono::steady_clock::time_point last_change_time{};
+    std::chrono::steady_clock::time_point dirty_since_time{};
     session_callbacks callbacks{};
     bool started = false;
     platform_socket listener = kInvalidSocket;
@@ -165,9 +171,30 @@ void ensure_pending_revision_locked() {
 
 void mark_dirty_locked() {
     ensure_pending_revision_locked();
+    const auto now = std::chrono::steady_clock::now();
+    if (!g_state.dirty) {
+        g_state.dirty_since_time = now;
+    }
     g_state.dirty = true;
-    g_state.last_change_time = std::chrono::steady_clock::now();
+    g_state.last_change_time = now;
     g_state.condition.notify_all();
+}
+
+bool primitive_delta_reached(std::size_t current_count, std::size_t published_count) {
+    return current_count >= published_count &&
+        current_count - published_count >= kImplicitSnapshotPrimitiveDelta;
+}
+
+bool implicit_snapshot_primitive_threshold_reached_locked() {
+    return primitive_delta_reached(
+               g_state.working_scene.triangles.size(),
+               g_state.last_published_triangle_count) ||
+        primitive_delta_reached(
+            g_state.working_scene.points.size(),
+            g_state.last_published_point_count) ||
+        primitive_delta_reached(
+            g_state.working_scene.lines.size(),
+            g_state.last_published_line_count);
 }
 
 std::string current_layer_path_locked() {
@@ -189,7 +216,11 @@ bool publish_locked(viewer_backend::frame_scene* out_scene, session_callbacks* o
     g_state.published_scene = g_state.working_scene;
     g_state.has_frame = true;
     g_state.published_revision = g_state.current_revision;
+    g_state.last_published_triangle_count = g_state.working_scene.triangles.size();
+    g_state.last_published_point_count = g_state.working_scene.points.size();
+    g_state.last_published_line_count = g_state.working_scene.lines.size();
     g_state.dirty = false;
+    g_state.dirty_since_time = {};
 
     if (out_scene != nullptr) {
         *out_scene = g_state.published_scene;
@@ -224,9 +255,7 @@ void append_triangles_locked(const rtvdb::triangle_payload* triangles, std::size
         g_state.working_scene.triangles.push_back(
             {payload.a, payload.b, payload.c, payload.color, payload.user_data, current_layer_path_locked()});
     }
-    g_state.dirty = true;
-    g_state.last_change_time = std::chrono::steady_clock::now();
-    g_state.condition.notify_all();
+    mark_dirty_locked();
 }
 
 void append_points_locked(const rtvdb::point_payload* points, std::size_t point_count) {
@@ -240,9 +269,7 @@ void append_points_locked(const rtvdb::point_payload* points, std::size_t point_
         g_state.working_scene.points.push_back(
             {payload.position, payload.radius, payload.color, payload.user_data, current_layer_path_locked()});
     }
-    g_state.dirty = true;
-    g_state.last_change_time = std::chrono::steady_clock::now();
-    g_state.condition.notify_all();
+    mark_dirty_locked();
 }
 
 void append_lines_locked(const rtvdb::line_payload* lines, std::size_t line_count) {
@@ -257,26 +284,24 @@ void append_lines_locked(const rtvdb::line_payload* lines, std::size_t line_coun
             {payload.a, payload.radius, payload.b, payload.color, payload.user_data, viewer_backend::line_flags::none,
              current_layer_path_locked()});
     }
-    g_state.dirty = true;
-    g_state.last_change_time = std::chrono::steady_clock::now();
-    g_state.condition.notify_all();
+    mark_dirty_locked();
 }
 
 void implicit_snapshot_thread() {
     std::unique_lock lock(g_state.mutex);
     for (;;) {
-        g_state.condition.wait(lock, [] { return g_state.dirty; });
+        g_state.condition.wait(lock, [] { return g_state.dirty && !g_state.explicit_frame_open; });
 
-        const auto due_time = g_state.last_change_time + kImplicitSnapshotDelay;
-        if (g_state.condition.wait_until(lock, due_time, [] {
-            return !g_state.dirty ||
-                (std::chrono::steady_clock::now() - g_state.last_change_time) >= kImplicitSnapshotDelay;
-        })) {
-            if (!g_state.dirty) {
+        if (!implicit_snapshot_primitive_threshold_reached_locked()) {
+            const auto due_time = g_state.dirty_since_time + kImplicitSnapshotDelay;
+            (void)g_state.condition.wait_until(lock, due_time, [] {
+                return !g_state.dirty ||
+                    g_state.explicit_frame_open ||
+                    implicit_snapshot_primitive_threshold_reached_locked();
+            });
+            if (!g_state.dirty || g_state.explicit_frame_open) {
                 continue;
             }
-        } else {
-            continue;
         }
 
         viewer_backend::frame_scene scene{};
@@ -332,6 +357,7 @@ void network_thread() {
                     g_state.working_scene.triangles.clear();
                     g_state.working_scene.points.clear();
                     g_state.working_scene.lines.clear();
+                    g_state.explicit_frame_open = false;
                     append_log_locked(log_event_kind::handshake, header.payload_size, 0, payload.app_name);
                     mark_dirty_locked();
                     publish_cleared_scene = true;
@@ -347,15 +373,17 @@ void network_thread() {
                 }
                 {
                     std::scoped_lock lock(g_state.mutex);
+                    if (g_state.explicit_frame_open) {
+                        goto connection_end;
+                    }
                     g_state.current_revision = g_state.published_revision + 1;
                     g_state.working_scene.frame_serial = g_state.current_revision;
                     g_state.working_scene.triangles.clear();
                     g_state.working_scene.points.clear();
                     g_state.working_scene.lines.clear();
-                    g_state.dirty = true;
-                    g_state.last_change_time = std::chrono::steady_clock::now();
+                    g_state.explicit_frame_open = true;
+                    mark_dirty_locked();
                     append_log_locked(log_event_kind::begin_frame, header.payload_size, 0, nullptr);
-                    g_state.condition.notify_all();
                 }
                 break;
             }
@@ -369,10 +397,8 @@ void network_thread() {
                     g_state.working_scene.triangles.clear();
                     g_state.working_scene.points.clear();
                     g_state.working_scene.lines.clear();
-                    g_state.dirty = true;
-                    g_state.last_change_time = std::chrono::steady_clock::now();
+                    mark_dirty_locked();
                     append_log_locked(log_event_kind::clear, header.payload_size, 0, nullptr);
-                    g_state.condition.notify_all();
                 }
                 break;
             }
@@ -387,6 +413,31 @@ void network_thread() {
                     g_state.working_scene.camera_set_by_client = true;
                     append_log_locked(log_event_kind::set_camera, header.payload_size, 0, nullptr);
                     mark_dirty_locked();
+                }
+                break;
+            }
+            case rtvdb::message_kind::set_reference_grid: {
+                if (header.payload_size != sizeof(rtvdb::reference_grid_payload)) {
+                    goto connection_end;
+                }
+                rtvdb::reference_grid_payload payload{};
+                if (!recv_all(client, &payload, sizeof(payload))) {
+                    goto connection_end;
+                }
+                switch (payload.value) {
+                case rtvdb::reference_grid::viewer_default:
+                case rtvdb::reference_grid::off:
+                case rtvdb::reference_grid::xy_grid:
+                case rtvdb::reference_grid::xz_grid:
+                case rtvdb::reference_grid::yz_grid:
+                    break;
+                default:
+                    goto connection_end;
+                }
+                rtvdb::viewer_backend::apply_reference_grid_request(payload.value);
+                {
+                    std::scoped_lock lock(g_state.mutex);
+                    append_log_locked(log_event_kind::set_reference_grid, header.payload_size, 0, nullptr);
                 }
                 break;
             }
@@ -528,6 +579,10 @@ void network_thread() {
                 }
                 {
                     std::scoped_lock lock(g_state.mutex);
+                    if (!g_state.explicit_frame_open) {
+                        goto connection_end;
+                    }
+                    g_state.explicit_frame_open = false;
                     append_log_locked(log_event_kind::end_frame, header.payload_size, 0, nullptr);
                 }
                 publish_now();
@@ -544,9 +599,27 @@ void network_thread() {
 
 connection_end:
         {
-            std::scoped_lock lock(g_state.mutex);
-            g_state.layer_stack.clear();
-            append_log_locked(log_event_kind::connection_closed, 0, 0, nullptr);
+            viewer_backend::frame_scene scene{};
+            session_callbacks callbacks{};
+            bool publish_on_disconnect = false;
+            {
+                std::scoped_lock lock(g_state.mutex);
+                if (g_state.explicit_frame_open) {
+                    g_state.working_scene.triangles.clear();
+                    g_state.working_scene.points.clear();
+                    g_state.working_scene.lines.clear();
+                    g_state.explicit_frame_open = false;
+                    g_state.dirty = false;
+                } else if (g_state.dirty) {
+                    publish_locked(&scene, &callbacks);
+                    publish_on_disconnect = true;
+                }
+                g_state.layer_stack.clear();
+                append_log_locked(log_event_kind::connection_closed, 0, 0, nullptr);
+            }
+            if (publish_on_disconnect && callbacks.frame_ready != nullptr) {
+                callbacks.frame_ready(&scene, callbacks.user_data);
+            }
         }
         close_platform_socket(client);
     }

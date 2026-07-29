@@ -49,29 +49,16 @@ StructuredBuffer<PointPrimitiveVk> g_points REGISTER(t5);
 [[vk::binding(7, 0)]]
 StructuredBuffer<LinePrimitiveVk> g_lines REGISTER(t6);
 
-struct ViewerConstantsVk
-{
-    float4 origin;
-    float4 forward;
-    float4 right;
-    float4 up;
-    float4 scene_bounds_min;
-    float4 scene_bounds_max;
-    uint4 size_and_mode;
-    float4 projection_from;
-    float4 projection_to;
-    uint4 projection_modes;
-    float4 blend_and_jitter;
-    uint4 pick_and_flags;
-    uint4 pick_params;
-};
-
 [[vk::binding(8, 0)]]
-ConstantBuffer<ViewerConstantsVk> g_view REGISTER(b0);
+ConstantBuffer<ViewerConstants> g_view REGISTER(b0);
 
 float4 shared_triangle_color(uint32_t triangle_index) { return g_triangle_color[triangle_index]; }
 GeometryMetadata shared_instance_metadata(uint32_t metadata_index) { return g_instance_metadata[metadata_index]; }
-uint32_t shared_procedural_primitive_offset(uint32_t instance_index) { return instance_index; }
+uint32_t shared_procedural_primitive_offset(uint32_t instance_index, uint32_t geometry_index)
+{
+    // The first metadata field is the source primitive base for every geometry kind.
+    return g_instance_metadata[instance_index * kMaxInstanceGeometryCount + geometry_index].primitive_base;
+}
 float3 shared_scene_position(uint32_t vertex_index) { return g_scene_positions[vertex_index].xyz; }
 uint32_t shared_scene_index(uint32_t index_index) { return g_scene_indices[index_index]; }
 SharedPointPrimitive shared_point_primitive(uint32_t point_index)
@@ -124,67 +111,5 @@ float shared_hover_highlight_mix() { return g_view.blend_and_jitter.w; }
 uint32_t shared_is_pick_pass() { return g_view.pick_params.z; }
 
 #include "../shaders/rt_logic_shared_impl.h"
-
-#if defined(RTVDB_VULKAN_COMPILE_RAYGEN)
-[shader("raygeneration")]
-void RayGen()
-{
-    shared_raygen();
-}
-#endif
-
-#if defined(RTVDB_VULKAN_COMPILE_PICK_RAYGEN)
-[shader("raygeneration")]
-void PickRayGen()
-{
-    shared_pick_raygen();
-}
-#endif
-
-#if defined(RTVDB_VULKAN_COMPILE_MISS)
-[shader("miss")]
-void Miss(ARG_INOUT(Payload, payload))
-{
-    shared_miss(payload);
-}
-#endif
-
-#if defined(RTVDB_VULKAN_COMPILE_TRIANGLE_CLOSEST_HIT)
-[shader("closesthit")]
-void ClosestHitTriangle(ARG_INOUT(Payload, payload), ARG_IN(BuiltInTriangleIntersectionAttributes, attr))
-{
-    shared_closest_hit_triangle(payload, GeometryIndex(), InstanceID());
-}
-#endif
-
-#if defined(RTVDB_VULKAN_COMPILE_POINT_CLOSEST_HIT)
-[shader("closesthit")]
-void ClosestHitPoint(ARG_INOUT(Payload, payload), ARG_IN(ProceduralAttributes, attr))
-{
-    shared_closest_hit_point(payload, InstanceID());
-}
-#endif
-
-#if defined(RTVDB_VULKAN_COMPILE_POINT_INTERSECTION)
-[shader("intersection")]
-void IntersectionPoint()
-{
-    shared_intersection_point();
-}
-#endif
-
-#if defined(RTVDB_VULKAN_COMPILE_LINE_CLOSEST_HIT)
-[shader("closesthit")]
-void ClosestHitLine(ARG_INOUT(Payload, payload), ARG_IN(ProceduralAttributes, attr))
-{
-    shared_closest_hit_line(payload, InstanceID());
-}
-#endif
-
-#if defined(RTVDB_VULKAN_COMPILE_LINE_INTERSECTION)
-[shader("intersection")]
-void IntersectionLine()
-{
-    shared_intersection_line();
-}
-#endif
+#define RTVDB_VULKAN_SHADER 1
+#include "../shaders/rt_shader_entrypoints.h"

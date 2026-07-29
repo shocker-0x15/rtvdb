@@ -310,7 +310,7 @@ void shared_closest_hit_triangle(
         local_primitive_index -= metadata.primitive_offset;
     }
 
-    const uint32_t triangle_index = metadata.first_triangle + local_primitive_index;
+    const uint32_t triangle_index = metadata.primitive_base + local_primitive_index;
     const uint32_t index_offset = metadata.index_offset + local_primitive_index * 3;
     payload.color = triangle_surface_rgba(triangle_index, index_offset, geometry_index, instance_index);
     payload.hit_t = RayTCurrent();
@@ -321,7 +321,7 @@ void shared_closest_hit_triangle(
 
 void shared_intersection_point()
 {
-    const uint32_t point_index = shared_procedural_primitive_offset(InstanceID()) + PrimitiveIndex();
+    const uint32_t point_index = shared_procedural_primitive_offset(InstanceID(), GeometryIndex()) + PrimitiveIndex();
     const SharedPointPrimitive point_primitive = shared_point_primitive(point_index);
     if (core::point_contains(
             shared_origin(),
@@ -353,9 +353,9 @@ void shared_intersection_point()
     }
 }
 
-void shared_closest_hit_point(ARG_INOUT(Payload, payload), uint32_t instance_index)
+void shared_closest_hit_point(ARG_INOUT(Payload, payload), uint32_t instance_index, uint32_t geometry_index)
 {
-    const uint32_t point_index = shared_procedural_primitive_offset(instance_index) + PrimitiveIndex();
+    const uint32_t point_index = shared_procedural_primitive_offset(instance_index, geometry_index) + PrimitiveIndex();
     const float3 hit_position = WorldRayOrigin() + WorldRayDirection() * RayTCurrent();
     payload.color = point_surface_rgba(point_index, hit_position, instance_index);
     payload.hit_t = RayTCurrent();
@@ -366,7 +366,7 @@ void shared_closest_hit_point(ARG_INOUT(Payload, payload), uint32_t instance_ind
 
 void shared_intersection_line()
 {
-    const uint32_t line_index = shared_procedural_primitive_offset(InstanceID()) + PrimitiveIndex();
+    const uint32_t line_index = shared_procedural_primitive_offset(InstanceID(), GeometryIndex()) + PrimitiveIndex();
     const SharedLinePrimitive line_primitive = shared_line_primitive(line_index);
     if (shared_is_pick_pass() != 0u && (line_primitive.flags & kLineFlagNonPickable) != 0u)
     {
@@ -406,9 +406,9 @@ void shared_intersection_line()
     }
 }
 
-void shared_closest_hit_line(ARG_INOUT(Payload, payload), uint32_t instance_index)
+void shared_closest_hit_line(ARG_INOUT(Payload, payload), uint32_t instance_index, uint32_t geometry_index)
 {
-    const uint32_t line_index = shared_procedural_primitive_offset(instance_index) + PrimitiveIndex();
+    const uint32_t line_index = shared_procedural_primitive_offset(instance_index, geometry_index) + PrimitiveIndex();
     const float3 hit_position = WorldRayOrigin() + WorldRayDirection() * RayTCurrent();
     payload.color = line_surface_rgba(line_index, hit_position, instance_index);
     payload.hit_t = RayTCurrent();

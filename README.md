@@ -1,5 +1,7 @@
 # rtvdb
 
+![Demo](media/demo.webp)
+
 [`rtvdb`](https://github.com/shocker-0x15/rtvdb) は、クライアントアプリからビューワーへ 3D デバッグ描画を送るためのシングルヘッダーライブラリです。\
 [`rtvdb`](https://github.com/shocker-0x15/rtvdb) is a single-header library for sending 3D debug drawing from client applications to a viewer.
 
@@ -44,8 +46,8 @@ int main() {
 
 ビューワー側の表示 / Viewer output
 <p>
-    <img src="images/demo_view_a.png" alt="DemoView A" width="360">
-    <img src="images/demo_view_b.png" alt="DemoView B" width="360">
+    <img src="media/demo_view_a.png" alt="DemoView A" width="360">
+    <img src="media/demo_view_b.png" alt="DemoView B" width="360">
 </p>
 
 ## API
@@ -87,7 +89,8 @@ bool is_connected(); // Check the current connection state
 bool clear(); // Clear the current scene contents
 bool flush(); // Send pending primitive batches immediately
 
-// The section enclosed by begin/end is displayed atomically
+// An explicit frame is displayed atomically. end_frame() requires begin_frame().
+// The viewer does not publish an explicit frame until it receives end_frame().
 bool begin_frame();
 bool end_frame();
 
@@ -116,6 +119,16 @@ bool set_orthographic_camera(
 // Set a layer for the section enclosed by push/pop
 bool push_layer(const char* name);
 bool pop_layer();
+
+// Select the viewer reference grid and coordinate axes
+enum class reference_grid : std::uint32_t {
+    viewer_default,
+    off,
+    xy_grid,
+    xz_grid,
+    yz_grid,
+};
+bool set_reference_grid(reference_grid value);
 ```
 
 - ローカル viewer (`127.0.0.1:47909`) への既定接続は、最初の送信系 API 呼び出し時に暗黙接続されます。別ホストへ接続する場合は `connect()` を明示します。\
@@ -124,6 +137,13 @@ The default connection to the local viewer (`127.0.0.1:47909`) is established im
 `push_layer("name")` / `pop_layer()` classify primitives into layers. Nested layers form parent-child relationships in the viewer's Layers UI.
 - レイヤー名は空文字と `/` を含む名前を受け付けず、1階層あたり63 byteまでです。\
 Layer names cannot be empty or contain `/`, and are limited to 63 bytes per level.
+- `set_reference_grid()` は viewer に表示する座標軸と基準グリッドの平面の変更を要求します。`off` は非表示、
+  `xy_grid` / `xz_grid` / `yz_grid` は対応する平面を表示します。指定は永続的な client 設定ではないため、
+  呼び出し後も viewer の Display UI にある `XYZ Grid` 設定で自由に変更できます。`viewer_default` は変更しません。\
+`set_reference_grid()` requests a change to the coordinate axes and reference-grid plane shown by the viewer. `off`
+hides them, while `xy_grid`, `xz_grid`, and `yz_grid` select the corresponding plane. It is not a persistent client
+setting, so the viewer's `XYZ Grid` setting in the Display UI remains freely editable after the call.
+`viewer_default` makes no change.
 
 ## Samples
 
@@ -210,6 +230,30 @@ backend別の追加要件
 ```powershell
 git submodule update --init --recursive
 ```
+
+### SDL Vulkan 低レイテンシーパッチ / SDL Vulkan low-latency patch
+
+Vulkan RT をビルドする場合、CMake configure は submodule の初期化または更新後に
+rtvdb 管理の SDL patch series を自動適用します。\
+For Vulkan RT builds, CMake configure automatically applies the rtvdb-managed SDL patch series
+after submodules have been initialized or updated.
+
+```powershell
+cmake -S . -B build -DRTVDB_ENABLE_VULKAN_RT=ON
+```
+
+このパッチは、表示レイテンシーを抑えるため SDL Vulkan renderer が要求する swapchain image 数を
+surface の最小数にします。CMake は未適用の patch だけを適用し、適用済みの場合は何も変更しません。\
+The patch reduces the SDL Vulkan renderer's requested swapchain image count to the surface
+minimum for lower presentation latency. CMake applies only patches that have not already been
+applied and leaves an already patched submodule unchanged.
+
+SDL 更新後は次回の Vulkan RT configure 時に再適用されます。適用に失敗した場合は、更新された SDL に
+patch を追従させてから再configureしてください。適用・更新時の詳細およびライセンス上の扱いは
+[`third_party/patches/SDL/README.md`](third_party/patches/SDL/README.md) を参照してください。\
+After an SDL update, it is reapplied by the next Vulkan RT configure. If it fails, update the
+patch for the new SDL source before reconfiguring. See
+[`third_party/patches/SDL/README.md`](third_party/patches/SDL/README.md) for update and license details.
 
 Windows既定構成のビルド
 

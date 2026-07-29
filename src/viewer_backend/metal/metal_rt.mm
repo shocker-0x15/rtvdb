@@ -3,11 +3,13 @@
 #import <CoreVideo/CoreVideo.h>
 
 #include "viewer_backend/backend_internal.h"
+#include "viewer_backend/rt_backend_common.h"
 #include "viewer_capture/png.h"
 #include <dispatch/dispatch.h>
 #include "rtvdb_metal_rt_metallib.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -36,7 +38,7 @@ constexpr NSUInteger kAccumulationBufferBinding = 13;
 constexpr NSUInteger kTriangleInstanceMetadataBinding = 14;
 constexpr NSUInteger kPointGroupMetadataBinding = 15;
 constexpr NSUInteger kLineGroupMetadataBinding = 16;
-constexpr NSUInteger kProceduralGroupCountBinding = 17;
+constexpr NSUInteger kProceduralChunkCountBinding = 17;
 constexpr std::uint32_t kBlasGroupChunkCount = 4;
 
 struct camera_gpu {
@@ -105,16 +107,16 @@ struct triangle_instance_metadata_gpu {
     std::uint32_t index_offset = 0;
 };
 
-struct procedural_group_metadata_gpu {
+struct procedural_chunk_metadata_gpu {
     std::uint32_t first_primitive = 0;
     std::uint32_t primitive_count = 0;
     std::uint32_t visible = 0;
     std::uint32_t pad = 0;
 };
 
-struct procedural_group_count_gpu {
-    std::uint32_t point_group_count = 0;
-    std::uint32_t line_group_count = 0;
+struct procedural_chunk_count_gpu {
+    std::uint32_t point_chunk_count = 0;
+    std::uint32_t line_chunk_count = 0;
 };
 
 struct triangle_chunk_blas_entry {
@@ -139,9 +141,40 @@ struct accumulation_key {
 };
 
 struct command_timing {
+    double command_record_cpu_ms = 0.0;
+    double build_call_record_cpu_ms = 0.0;
     double submit_cpu_ms = 0.0;
     double gpu_wait_ms = 0.0;
     double gpu_ms = 0.0;
+};
+
+enum class metal_submission_kind : std::uint8_t {
+    none,
+    acceleration,
+    trace,
+    native_present,
+    pick,
+};
+
+struct metal_command_slot {
+    id<MTLCommandBuffer> command_buffer = nil;
+    CVMetalTextureRef presentation_texture = nullptr;
+    metal_submission_kind kind = metal_submission_kind::none;
+    bool pending = false;
+    std::uint64_t submission_serial = 0;
+    double submit_cpu_ms = 0.0;
+};
+
+struct metal_pick_key {
+    std::uint64_t revision = 0;
+    int width = 0;
+    int height = 0;
+    int pixel_x = 0;
+    int pixel_y = 0;
+    rtvdb::camera camera{};
+    rtvdb::camera_projection projection_blend_from = rtvdb::camera_projection::perspective;
+    rtvdb::camera_projection projection_blend_to = rtvdb::camera_projection::perspective;
+    float projection_blend_t = 1.0f;
 };
 
 struct metal_state {
@@ -171,8 +204,8 @@ struct metal_state {
     id<MTLBuffer> line_aabb_buffer = nil;
     id<MTLBuffer> point_group_metadata_buffer = nil;
     id<MTLBuffer> line_group_metadata_buffer = nil;
-    std::uint32_t point_group_count = 0;
-    std::uint32_t line_group_count = 0;
+    std::uint32_t point_chunk_count = 0;
+    std::uint32_t line_chunk_count = 0;
     std::vector<triangle_chunk_blas_entry> triangle_blas_cache;
     std::vector<id<MTLAccelerationStructure>> triangle_scene_blas;
     id<MTLBuffer> point_blas_scratch = nil;
@@ -186,6 +219,14 @@ struct metal_state {
     id<MTLBuffer> tlas_instance_buffer = nil;
     id<MTLBuffer> tlas_scratch = nil;
     id<MTLAccelerationStructure> tlas = nil;
+    std::array<metal_command_slot, kRtCommandSlotCount> command_slots{};
+    std::uint64_t next_submission_serial = 1;
+    bool trace_pending = false;
+    bool pick_pending = false;
+    bool pick_result_ready = false;
+    metal_pick_key pending_pick{};
+    metal_pick_key completed_pick{};
+    pick_result completed_pick_result{};
     scene_build_info build_info{};
     accumulation_key accumulation{};
     std::uint32_t accumulation_sample_count = 0;
@@ -193,8 +234,8 @@ struct metal_state {
     std::uint64_t synced_revision = 0;
     std::size_t synced_blas_reused_count = 0;
     std::size_t synced_blas_rebuilt_count = 0;
-    std::size_t synced_blas_reused_chunk_count = 0;
-    std::size_t synced_blas_rebuilt_chunk_count = 0;
+    std::size_t synced_blas_reused_triangle_chunk_count = 0;
+    std::size_t synced_blas_rebuilt_triangle_chunk_count = 0;
     NSUInteger synced_width = 0;
     NSUInteger synced_height = 0;
     std::mutex mutex;
@@ -230,8 +271,8 @@ void reset_metal_state_contents() {
     g_metal.line_aabb_buffer = nil;
     g_metal.point_group_metadata_buffer = nil;
     g_metal.line_group_metadata_buffer = nil;
-    g_metal.point_group_count = 0;
-    g_metal.line_group_count = 0;
+    g_metal.point_chunk_count = 0;
+    g_metal.line_chunk_count = 0;
     g_metal.triangle_blas_cache.clear();
     g_metal.triangle_scene_blas.clear();
     g_metal.point_blas_scratch = nil;
@@ -245,6 +286,21 @@ void reset_metal_state_contents() {
     g_metal.tlas_instance_buffer = nil;
     g_metal.tlas_scratch = nil;
     g_metal.tlas = nil;
+    for (metal_command_slot &slot : g_metal.command_slots) {
+        if (slot.presentation_texture != nullptr) {
+            CFRelease(slot.presentation_texture);
+        }
+        if (slot.command_buffer != nil) {
+            [slot.command_buffer release];
+        }
+        slot = {};
+    }
+    g_metal.trace_pending = false;
+    g_metal.pick_pending = false;
+    g_metal.pick_result_ready = false;
+    g_metal.pending_pick = {};
+    g_metal.completed_pick = {};
+    g_metal.completed_pick_result = {};
     g_metal.build_info = {};
     g_metal.accumulation = {};
     g_metal.accumulation_sample_count = 0;
@@ -252,8 +308,8 @@ void reset_metal_state_contents() {
     g_metal.synced_revision = 0;
     g_metal.synced_blas_reused_count = 0;
     g_metal.synced_blas_rebuilt_count = 0;
-    g_metal.synced_blas_reused_chunk_count = 0;
-    g_metal.synced_blas_rebuilt_chunk_count = 0;
+    g_metal.synced_blas_reused_triangle_chunk_count = 0;
+    g_metal.synced_blas_rebuilt_triangle_chunk_count = 0;
     g_metal.synced_width = 0;
     g_metal.synced_height = 0;
 }
@@ -415,7 +471,7 @@ backend_info metal_backend_info_locked() {
     return {
         backend_kind::metal_rt,
         "metal_rt",
-        {g_metal.hardware_ray_tracing, true, false}
+        {g_metal.hardware_ray_tracing}
     };
 }
 
@@ -446,6 +502,10 @@ backend_info metal_backend_info() {
     return metal_backend_info_locked();
 }
 
+// =============================================================================
+// Resource lifetime and allocation.
+// =============================================================================
+
 id<MTLBuffer> new_shared_buffer(const void* bytes, NSUInteger length) {
     if (g_metal.device == nil || length == 0) {
         return nil;
@@ -458,49 +518,6 @@ id<MTLBuffer> new_shared_buffer(NSUInteger length) {
         return nil;
     }
     return [g_metal.device newBufferWithLength:length options:MTLResourceStorageModeShared];
-}
-
-bool ensure_shader_pipeline() {
-    if (g_metal.library != nil && g_metal.trace_pipeline != nil && g_metal.pick_pipeline != nil) {
-        return true;
-    }
-
-    NSError* error = nil;
-    dispatch_data_t shader_data = dispatch_data_create(
-        kMetalRtMetallib,
-        kMetalRtMetallibSize,
-        dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0),
-        DISPATCH_DATA_DESTRUCTOR_DEFAULT);
-    g_metal.library = [g_metal.device newLibraryWithData:shader_data error:&error];
-    if (g_metal.library == nil) {
-        log_metal_error(@"newLibraryWithData", error);
-        return false;
-    }
-
-    id<MTLFunction> kernel = [g_metal.library newFunctionWithName:@"rtvdb_trace_kernel"];
-    if (kernel == nil) {
-        NSLog(@"rtvdb metal_rt missing function rtvdb_trace_kernel");
-        return false;
-    }
-
-    g_metal.trace_pipeline = [g_metal.device newComputePipelineStateWithFunction:kernel error:&error];
-    if (g_metal.trace_pipeline == nil) {
-        log_metal_error(@"newComputePipelineStateWithFunction", error);
-        return false;
-    }
-
-    id<MTLFunction> pick_kernel = [g_metal.library newFunctionWithName:@"rtvdb_pick_kernel"];
-    if (pick_kernel == nil) {
-        NSLog(@"rtvdb metal_rt missing function rtvdb_pick_kernel");
-        return false;
-    }
-
-    g_metal.pick_pipeline = [g_metal.device newComputePipelineStateWithFunction:pick_kernel error:&error];
-    if (g_metal.pick_pipeline == nil) {
-        log_metal_error(@"newComputePipelineStateWithFunction(pick)", error);
-        return false;
-    }
-    return true;
 }
 
 bool ensure_output_buffer(int width, int height) {
@@ -573,7 +590,7 @@ void fill_triangle_colors(const rt_scene_build &build, std::vector<rtvdb::rgba>*
         return;
     }
     out_colors->assign(build.triangle_count, {});
-    for (const rt_scene_chunk &chunk : build.chunks) {
+    for (const rt_triangle_chunk &chunk : build.triangle_chunks) {
         for (std::size_t local_triangle = 0; local_triangle < chunk.triangle_count; ++local_triangle) {
             const std::size_t index_base = chunk.index_offset + local_triangle * 3u;
             const std::uint32_t ia = build.indices[index_base + 0];
@@ -599,8 +616,8 @@ void fill_triangle_display_indices(
 
     out_geometry_indices->assign(build.triangle_count, 0u);
     out_instance_indices->assign(build.triangle_count, 0u);
-    for (std::size_t chunk_index = 0; chunk_index < build.chunks.size(); ++chunk_index) {
-        const rt_scene_chunk &chunk = build.chunks[chunk_index];
+    for (std::size_t chunk_index = 0; chunk_index < build.triangle_chunks.size(); ++chunk_index) {
+        const rt_triangle_chunk &chunk = build.triangle_chunks[chunk_index];
         const std::uint32_t geometry_index = static_cast<std::uint32_t>(chunk_index % kBlasGroupChunkCount);
         const std::uint32_t instance_index = static_cast<std::uint32_t>(chunk_index / kBlasGroupChunkCount);
         for (std::size_t local_triangle = 0; local_triangle < chunk.triangle_count; ++local_triangle) {
@@ -723,7 +740,169 @@ void build_render_triangle_scene(const rt_scene_build &build, render_triangle_sc
     }
 }
 
-bool build_acceleration_structure(
+bool metal_pick_key_equals(const metal_pick_key &left, const metal_pick_key &right) {
+    return left.revision == right.revision &&
+        left.width == right.width &&
+        left.height == right.height &&
+        left.pixel_x == right.pixel_x &&
+        left.pixel_y == right.pixel_y &&
+        std::memcmp(&left.camera, &right.camera, sizeof(rtvdb::camera)) == 0 &&
+        left.projection_blend_from == right.projection_blend_from &&
+        left.projection_blend_to == right.projection_blend_to &&
+        left.projection_blend_t == right.projection_blend_t;
+}
+
+void release_metal_command_slot(metal_command_slot* slot) {
+    if (slot == nullptr) {
+        return;
+    }
+    if (slot->presentation_texture != nullptr) {
+        CFRelease(slot->presentation_texture);
+    }
+    if (slot->command_buffer != nil) {
+        [slot->command_buffer release];
+    }
+    *slot = {};
+}
+
+void collect_completed_metal_commands() {
+    for (metal_command_slot &slot : g_metal.command_slots) {
+        if (!slot.pending || slot.command_buffer == nil) {
+            continue;
+        }
+        const MTLCommandBufferStatus status = slot.command_buffer.status;
+        if (status != MTLCommandBufferStatusCompleted && status != MTLCommandBufferStatusError) {
+            continue;
+        }
+
+        const bool succeeded = status == MTLCommandBufferStatusCompleted;
+        const double gpu_ms = slot.command_buffer.GPUEndTime >= slot.command_buffer.GPUStartTime
+            ? (slot.command_buffer.GPUEndTime - slot.command_buffer.GPUStartTime) * 1000.0
+            : 0.0;
+        switch (slot.kind) {
+        case metal_submission_kind::acceleration:
+            g_metal.build_info.accel_gpu_ms += gpu_ms;
+            break;
+        case metal_submission_kind::trace:
+            g_metal.trace_pending = false;
+            g_metal.build_info.dispatch_gpu_ms += gpu_ms;
+            break;
+        case metal_submission_kind::native_present:
+            g_metal.build_info.dispatch_gpu_ms += gpu_ms;
+            break;
+        case metal_submission_kind::pick:
+            g_metal.pick_pending = false;
+            if (succeeded && g_metal.pick_buffer != nil) {
+                const auto* mapped = static_cast<const pick_result_gpu*>([g_metal.pick_buffer contents]);
+                if (mapped != nullptr) {
+                    g_metal.completed_pick_result.kind = static_cast<hover_highlight_kind>(mapped->primitive_kind);
+                    g_metal.completed_pick_result.primitive_index = mapped->primitive_index;
+                    g_metal.completed_pick_result.distance = mapped->distance;
+                    g_metal.completed_pick = g_metal.pending_pick;
+                    g_metal.pick_result_ready = true;
+                }
+            }
+            break;
+        case metal_submission_kind::none:
+            break;
+        }
+        if (!succeeded) {
+            log_metal_error(@"metal_command_completion", slot.command_buffer.error);
+        }
+        release_metal_command_slot(&slot);
+    }
+}
+
+bool acquire_metal_command_slot(metal_submission_kind kind, metal_command_slot** out_slot) {
+    if (out_slot == nullptr) {
+        return false;
+    }
+    *out_slot = nullptr;
+    collect_completed_metal_commands();
+    for (metal_command_slot &slot : g_metal.command_slots) {
+        if (!slot.pending) {
+            slot.kind = kind;
+            *out_slot = &slot;
+            return true;
+        }
+    }
+
+    metal_command_slot* oldest = &g_metal.command_slots[0];
+    for (metal_command_slot &slot : g_metal.command_slots) {
+        if (slot.submission_serial < oldest->submission_serial) {
+            oldest = &slot;
+        }
+    }
+    if (oldest->command_buffer == nil) {
+        return false;
+    }
+    const auto wait_start = std::chrono::steady_clock::now();
+    [oldest->command_buffer waitUntilCompleted];
+    g_metal.build_info.command_slot_reuse_wait_ms +=
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wait_start).count();
+    collect_completed_metal_commands();
+    for (metal_command_slot &slot : g_metal.command_slots) {
+        if (!slot.pending) {
+            slot.kind = kind;
+            *out_slot = &slot;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool submit_metal_command(
+    metal_command_slot* slot,
+    id<MTLCommandBuffer> command_buffer,
+    command_timing* out_timing)
+{
+    if (slot == nullptr || command_buffer == nil) {
+        return false;
+    }
+    const auto submit_start = std::chrono::steady_clock::now();
+    [command_buffer commit];
+    const double submit_cpu_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - submit_start).count();
+    slot->command_buffer = [command_buffer retain];
+    slot->pending = true;
+    slot->submission_serial = g_metal.next_submission_serial++;
+    slot->submit_cpu_ms = submit_cpu_ms;
+    if (out_timing != nullptr) {
+        out_timing->submit_cpu_ms += submit_cpu_ms;
+    }
+    return true;
+}
+
+bool wait_for_metal_command_kind(metal_submission_kind kind, command_timing* out_timing) {
+    for (metal_command_slot &slot : g_metal.command_slots) {
+        if (!slot.pending || slot.kind != kind || slot.command_buffer == nil) {
+            continue;
+        }
+        const auto wait_start = std::chrono::steady_clock::now();
+        [slot.command_buffer waitUntilCompleted];
+        if (out_timing != nullptr) {
+            out_timing->gpu_wait_ms +=
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wait_start).count();
+        }
+    }
+    collect_completed_metal_commands();
+    return true;
+}
+
+void wait_for_all_metal_commands() {
+    for (metal_command_slot &slot : g_metal.command_slots) {
+        if (slot.pending && slot.command_buffer != nil) {
+            [slot.command_buffer waitUntilCompleted];
+        }
+    }
+    collect_completed_metal_commands();
+}
+
+// =============================================================================
+// Acceleration structure creation and build recording.
+// =============================================================================
+
+bool submit_acceleration_structure_build(
     id<MTLAccelerationStructure> acceleration_structure,
     MTLAccelerationStructureDescriptor* descriptor,
     id<MTLBuffer> scratch_buffer,
@@ -733,6 +912,11 @@ bool build_acceleration_structure(
         return false;
     }
 
+    const auto record_start = std::chrono::steady_clock::now();
+    metal_command_slot* slot = nullptr;
+    if (!acquire_metal_command_slot(metal_submission_kind::acceleration, &slot)) {
+        return false;
+    }
     id<MTLCommandBuffer> command_buffer = [g_metal.command_queue commandBuffer];
     if (command_buffer == nil) {
         return false;
@@ -742,28 +926,23 @@ bool build_acceleration_structure(
         return false;
     }
 
+    const auto build_call_start = std::chrono::steady_clock::now();
     [encoder buildAccelerationStructure:acceleration_structure
                              descriptor:descriptor
                           scratchBuffer:scratch_buffer
                     scratchBufferOffset:0];
+    const auto build_call_end = std::chrono::steady_clock::now();
     [encoder endEncoding];
-    const auto submit_start = std::chrono::steady_clock::now();
-    [command_buffer commit];
-    const auto submit_end = std::chrono::steady_clock::now();
-    [command_buffer waitUntilCompleted];
-    const auto wait_end = std::chrono::steady_clock::now();
     if (out_timing != nullptr) {
-        out_timing->submit_cpu_ms +=
-            std::chrono::duration<double, std::milli>(submit_end - submit_start).count();
-        out_timing->gpu_wait_ms += std::chrono::duration<double, std::milli>(wait_end - submit_end).count();
-        if (command_buffer.GPUEndTime >= command_buffer.GPUStartTime) {
-            out_timing->gpu_ms += (command_buffer.GPUEndTime - command_buffer.GPUStartTime) * 1000.0;
-        }
+        out_timing->command_record_cpu_ms +=
+            std::chrono::duration<double, std::milli>(build_call_end - record_start).count();
+        out_timing->build_call_record_cpu_ms +=
+            std::chrono::duration<double, std::milli>(build_call_end - build_call_start).count();
     }
-    return command_buffer.status == MTLCommandBufferStatusCompleted;
+    return submit_metal_command(slot, command_buffer, out_timing);
 }
 
-bool build_bounding_box_acceleration_structure(
+bool build_procedural_blas(
     const void* primitive_bytes,
     NSUInteger primitive_stride,
     NSUInteger primitive_count,
@@ -814,7 +993,7 @@ bool build_bounding_box_acceleration_structure(
     if (acceleration_structure == nil || scratch_buffer == nil) {
         return false;
     }
-    if (!build_acceleration_structure(acceleration_structure, descriptor, scratch_buffer, out_timing)) {
+    if (!submit_acceleration_structure_build(acceleration_structure, descriptor, scratch_buffer, out_timing)) {
         return false;
     }
 
@@ -864,14 +1043,14 @@ std::uint64_t line_fingerprint(const rt_scene_build &build) {
     return fingerprint;
 }
 
-bool sync_triangle_scene_resources(const rt_scene_build &build, command_timing* out_timing) {
+bool sync_scene_resources(const rt_scene_build &build, command_timing* out_timing) {
     if (g_metal.device == nil) {
         return false;
     }
     std::size_t blas_reused_count = 0;
     std::size_t blas_rebuilt_count = 0;
-    std::size_t blas_reused_chunk_count = 0;
-    std::size_t blas_rebuilt_chunk_count = 0;
+    std::size_t blas_reused_triangle_chunk_count = 0;
+    std::size_t blas_rebuilt_triangle_chunk_count = 0;
 
     if (build.triangle_count == 0) {
         g_metal.position_buffer = nil;
@@ -917,9 +1096,9 @@ bool sync_triangle_scene_resources(const rt_scene_build &build, command_timing* 
         std::vector<bool> claimed_entries(g_metal.triangle_blas_cache.size(), false);
         std::vector<triangle_instance_metadata_gpu> instance_metadata;
         g_metal.triangle_scene_blas.clear();
-        g_metal.triangle_scene_blas.reserve(build.chunks.size());
-        instance_metadata.reserve(build.chunks.size());
-        for (const rt_scene_chunk &chunk : build.chunks) {
+        g_metal.triangle_scene_blas.reserve(build.triangle_chunks.size());
+        instance_metadata.reserve(build.triangle_chunks.size());
+        for (const rt_triangle_chunk &chunk : build.triangle_chunks) {
             std::size_t cache_index = g_metal.triangle_blas_cache.size();
             for (std::size_t i = 0; i < g_metal.triangle_blas_cache.size(); ++i) {
                 const triangle_chunk_blas_entry &candidate = g_metal.triangle_blas_cache[i];
@@ -991,7 +1170,7 @@ bool sync_triangle_scene_resources(const rt_scene_build &build, command_timing* 
                     [g_metal.device newAccelerationStructureWithSize:blas_sizes.accelerationStructureSize];
                 entry.scratch_buffer = new_shared_buffer(blas_sizes.buildScratchBufferSize);
                 if (entry.acceleration_structure == nil || entry.scratch_buffer == nil ||
-                    !build_acceleration_structure(
+                    !submit_acceleration_structure_build(
                         entry.acceleration_structure,
                         blas_descriptor,
                         entry.scratch_buffer,
@@ -1001,10 +1180,10 @@ bool sync_triangle_scene_resources(const rt_scene_build &build, command_timing* 
                 entry.fingerprint = chunk.fingerprint;
                 entry.triangle_count = chunk.triangle_count;
                 ++blas_rebuilt_count;
-                ++blas_rebuilt_chunk_count;
+                ++blas_rebuilt_triangle_chunk_count;
             } else {
                 ++blas_reused_count;
-                ++blas_reused_chunk_count;
+                ++blas_reused_triangle_chunk_count;
             }
             claimed_entries[cache_index] = true;
             g_metal.triangle_scene_blas.push_back(entry.acceleration_structure);
@@ -1025,7 +1204,7 @@ bool sync_triangle_scene_resources(const rt_scene_build &build, command_timing* 
         g_metal.tlas_scratch = nil;
         g_metal.tlas = nil;
     } else {
-        std::vector<MTLAccelerationStructureInstanceDescriptor> instance_descriptors(build.chunks.size());
+        std::vector<MTLAccelerationStructureInstanceDescriptor> instance_descriptors(build.triangle_chunks.size());
         for (std::size_t i = 0; i < instance_descriptors.size(); ++i) {
             MTLAccelerationStructureInstanceDescriptor &instance_descriptor = instance_descriptors[i];
             instance_descriptor.transformationMatrix = MTLPackedFloat4x3(
@@ -1034,7 +1213,7 @@ bool sync_triangle_scene_resources(const rt_scene_build &build, command_timing* 
                 MTLPackedFloat3(0.0f, 0.0f, 1.0f),
                 MTLPackedFloat3(0.0f, 0.0f, 0.0f));
             instance_descriptor.options = MTLAccelerationStructureInstanceOptionOpaque;
-            instance_descriptor.mask = build.chunks[i].visible ? 0xFFu : 0x00u;
+            instance_descriptor.mask = build.triangle_chunks[i].visible ? 0xFFu : 0x00u;
             instance_descriptor.intersectionFunctionTableOffset = 0u;
             instance_descriptor.accelerationStructureIndex = static_cast<std::uint32_t>(i);
         }
@@ -1046,7 +1225,8 @@ bool sync_triangle_scene_resources(const rt_scene_build &build, command_timing* 
             return false;
         }
 
-        MTLInstanceAccelerationStructureDescriptor* tlas_descriptor = [MTLInstanceAccelerationStructureDescriptor descriptor];
+        MTLInstanceAccelerationStructureDescriptor* tlas_descriptor =
+            [MTLInstanceAccelerationStructureDescriptor descriptor];
         tlas_descriptor.instanceDescriptorBuffer = g_metal.tlas_instance_buffer;
         tlas_descriptor.instanceDescriptorBufferOffset = 0;
         tlas_descriptor.instanceCount = static_cast<NSUInteger>(instance_descriptors.size());
@@ -1067,27 +1247,27 @@ bool sync_triangle_scene_resources(const rt_scene_build &build, command_timing* 
         if (g_metal.tlas == nil || g_metal.tlas_scratch == nil) {
             return false;
         }
-        if (!build_acceleration_structure(g_metal.tlas, tlas_descriptor, g_metal.tlas_scratch, out_timing)) {
+        if (!submit_acceleration_structure_build(g_metal.tlas, tlas_descriptor, g_metal.tlas_scratch, out_timing)) {
             return false;
         }
     }
 
     g_metal.point_active = build.point_count > 0;
     if (g_metal.point_active) {
-        std::vector<procedural_group_metadata_gpu> point_groups(build.point_groups.size());
-        for (std::size_t i = 0; i < build.point_groups.size(); ++i) {
-            point_groups[i] = {
-                static_cast<std::uint32_t>(build.point_groups[i].first_primitive),
-                static_cast<std::uint32_t>(build.point_groups[i].primitive_count),
-                build.point_groups[i].visible ? 1u : 0u,
+        std::vector<procedural_chunk_metadata_gpu> point_chunks(build.point_chunks.size());
+        for (std::size_t i = 0; i < build.point_chunks.size(); ++i) {
+            point_chunks[i] = {
+                static_cast<std::uint32_t>(build.point_chunks[i].first_primitive),
+                static_cast<std::uint32_t>(build.point_chunks[i].primitive_count),
+                build.point_chunks[i].visible ? 1u : 0u,
                 0u};
         }
-        g_metal.point_group_metadata_buffer = point_groups.empty()
+        g_metal.point_group_metadata_buffer = point_chunks.empty()
             ? nil
             : new_shared_buffer(
-                point_groups.data(),
-                static_cast<NSUInteger>(point_groups.size() * sizeof(procedural_group_metadata_gpu)));
-        g_metal.point_group_count = static_cast<std::uint32_t>(point_groups.size());
+                point_chunks.data(),
+                static_cast<NSUInteger>(point_chunks.size() * sizeof(procedural_chunk_metadata_gpu)));
+        g_metal.point_chunk_count = static_cast<std::uint32_t>(point_chunks.size());
         const std::uint64_t fingerprint = point_fingerprint(build);
         if (g_metal.point_blas != nil && g_metal.point_fingerprint == fingerprint) {
             ++blas_reused_count;
@@ -1100,7 +1280,7 @@ bool sync_triangle_scene_resources(const rt_scene_build &build, command_timing* 
                 point_primitives[i].color = encode_srgb_color(build.points[i].color);
                 point_boxes[i] = make_point_aabb(point_primitives[i]);
             }
-            if (!build_bounding_box_acceleration_structure(
+            if (!build_procedural_blas(
                     point_primitives.data(),
                     sizeof(point_gpu),
                     static_cast<NSUInteger>(point_primitives.size()),
@@ -1117,25 +1297,25 @@ bool sync_triangle_scene_resources(const rt_scene_build &build, command_timing* 
         }
     } else {
         g_metal.point_group_metadata_buffer = nil;
-        g_metal.point_group_count = 0;
+        g_metal.point_chunk_count = 0;
     }
 
     g_metal.line_active = build.line_count > 0;
     if (g_metal.line_active) {
-        std::vector<procedural_group_metadata_gpu> line_groups(build.line_groups.size());
-        for (std::size_t i = 0; i < build.line_groups.size(); ++i) {
-            line_groups[i] = {
-                static_cast<std::uint32_t>(build.line_groups[i].first_primitive),
-                static_cast<std::uint32_t>(build.line_groups[i].primitive_count),
-                build.line_groups[i].visible ? 1u : 0u,
+        std::vector<procedural_chunk_metadata_gpu> line_chunks(build.line_chunks.size());
+        for (std::size_t i = 0; i < build.line_chunks.size(); ++i) {
+            line_chunks[i] = {
+                static_cast<std::uint32_t>(build.line_chunks[i].first_primitive),
+                static_cast<std::uint32_t>(build.line_chunks[i].primitive_count),
+                build.line_chunks[i].visible ? 1u : 0u,
                 0u};
         }
-        g_metal.line_group_metadata_buffer = line_groups.empty()
+        g_metal.line_group_metadata_buffer = line_chunks.empty()
             ? nil
             : new_shared_buffer(
-                line_groups.data(),
-                static_cast<NSUInteger>(line_groups.size() * sizeof(procedural_group_metadata_gpu)));
-        g_metal.line_group_count = static_cast<std::uint32_t>(line_groups.size());
+                line_chunks.data(),
+                static_cast<NSUInteger>(line_chunks.size() * sizeof(procedural_chunk_metadata_gpu)));
+        g_metal.line_chunk_count = static_cast<std::uint32_t>(line_chunks.size());
         const std::uint64_t fingerprint = line_fingerprint(build);
         if (g_metal.line_blas != nil && g_metal.line_fingerprint == fingerprint) {
             ++blas_reused_count;
@@ -1150,7 +1330,7 @@ bool sync_triangle_scene_resources(const rt_scene_build &build, command_timing* 
                 line_primitives[i].flags = static_cast<std::uint32_t>(build.lines[i].flags);
                 line_boxes[i] = make_line_aabb(line_primitives[i]);
             }
-            if (!build_bounding_box_acceleration_structure(
+            if (!build_procedural_blas(
                     line_primitives.data(),
                     sizeof(line_gpu),
                     static_cast<NSUInteger>(line_primitives.size()),
@@ -1167,14 +1347,14 @@ bool sync_triangle_scene_resources(const rt_scene_build &build, command_timing* 
         }
     } else {
         g_metal.line_group_metadata_buffer = nil;
-        g_metal.line_group_count = 0;
+        g_metal.line_chunk_count = 0;
     }
 
     g_metal.synced_revision = build.revision;
     g_metal.synced_blas_reused_count = blas_reused_count;
     g_metal.synced_blas_rebuilt_count = blas_rebuilt_count;
-    g_metal.synced_blas_reused_chunk_count = blas_reused_chunk_count;
-    g_metal.synced_blas_rebuilt_chunk_count = blas_rebuilt_chunk_count;
+    g_metal.synced_blas_reused_triangle_chunk_count = blas_reused_triangle_chunk_count;
+    g_metal.synced_blas_rebuilt_triangle_chunk_count = blas_rebuilt_triangle_chunk_count;
     return true;
 }
 
@@ -1185,11 +1365,58 @@ bool ensure_scene_resources(const rt_scene_build &build, bool* out_rebuilt, comm
     if (g_metal.synced_revision == build.revision) {
         return true;
     }
-    if (!sync_triangle_scene_resources(build, out_timing)) {
+    if (!sync_scene_resources(build, out_timing)) {
         return false;
     }
     if (out_rebuilt != nullptr) {
         *out_rebuilt = true;
+    }
+    return true;
+}
+
+// =============================================================================
+// Pipeline and binding state.
+// =============================================================================
+
+bool ensure_shader_pipeline() {
+    if (g_metal.library != nil && g_metal.trace_pipeline != nil && g_metal.pick_pipeline != nil) {
+        return true;
+    }
+
+    NSError* error = nil;
+    dispatch_data_t shader_data = dispatch_data_create(
+        kMetalRtMetallib,
+        kMetalRtMetallibSize,
+        dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0),
+        DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+    g_metal.library = [g_metal.device newLibraryWithData:shader_data error:&error];
+    if (g_metal.library == nil) {
+        log_metal_error(@"newLibraryWithData", error);
+        return false;
+    }
+
+    id<MTLFunction> kernel = [g_metal.library newFunctionWithName:@"rtvdb_trace_kernel"];
+    if (kernel == nil) {
+        NSLog(@"rtvdb metal_rt missing function rtvdb_trace_kernel");
+        return false;
+    }
+
+    g_metal.trace_pipeline = [g_metal.device newComputePipelineStateWithFunction:kernel error:&error];
+    if (g_metal.trace_pipeline == nil) {
+        log_metal_error(@"newComputePipelineStateWithFunction", error);
+        return false;
+    }
+
+    id<MTLFunction> pick_kernel = [g_metal.library newFunctionWithName:@"rtvdb_pick_kernel"];
+    if (pick_kernel == nil) {
+        NSLog(@"rtvdb metal_rt missing function rtvdb_pick_kernel");
+        return false;
+    }
+
+    g_metal.pick_pipeline = [g_metal.device newComputePipelineStateWithFunction:pick_kernel error:&error];
+    if (g_metal.pick_pipeline == nil) {
+        log_metal_error(@"newComputePipelineStateWithFunction(pick)", error);
+        return false;
     }
     return true;
 }
@@ -1279,13 +1506,17 @@ void bind_trace_resources(id<MTLComputeCommandEncoder> encoder, const camera_gpu
               atIndex:kTriangleInstanceMetadataBinding];
     [encoder setBuffer:g_metal.point_group_metadata_buffer offset:0 atIndex:kPointGroupMetadataBinding];
     [encoder setBuffer:g_metal.line_group_metadata_buffer offset:0 atIndex:kLineGroupMetadataBinding];
-    const procedural_group_count_gpu group_counts{
-        g_metal.point_group_count,
-        g_metal.line_group_count};
-    [encoder setBytes:&group_counts length:sizeof(group_counts) atIndex:kProceduralGroupCountBinding];
+    const procedural_chunk_count_gpu chunk_counts{
+        g_metal.point_chunk_count,
+        g_metal.line_chunk_count};
+    [encoder setBytes:&chunk_counts length:sizeof(chunk_counts) atIndex:kProceduralChunkCountBinding];
 }
 
-bool dispatch_triangle_trace(
+// =============================================================================
+// Command submission, native presentation, and trace dispatch.
+// =============================================================================
+
+bool dispatch_trace(
     int width,
     int height,
     const frame_scene &scene,
@@ -1302,6 +1533,10 @@ bool dispatch_triangle_trace(
     fill_camera_constants(scene, width, height, &camera);
     camera.accumulation_sample_index = sample_index;
     fill_accumulation_jitter(sample_index, camera.accumulation_jitter);
+    metal_command_slot* slot = nullptr;
+    if (!acquire_metal_command_slot(metal_submission_kind::trace, &slot)) {
+        return false;
+    }
     id<MTLCommandBuffer> command_buffer = [g_metal.command_queue commandBuffer];
     if (command_buffer == nil) {
         return false;
@@ -1317,28 +1552,18 @@ bool dispatch_triangle_trace(
     bind_trace_resources(encoder, camera);
 
     const NSUInteger thread_width = (std::max)(g_metal.trace_pipeline.threadExecutionWidth, NSUInteger{1});
-    const NSUInteger thread_height = (std::max)(g_metal.trace_pipeline.maxTotalThreadsPerThreadgroup / thread_width, NSUInteger{1});
+    const NSUInteger thread_height = (std::max)(
+        g_metal.trace_pipeline.maxTotalThreadsPerThreadgroup / thread_width,
+        NSUInteger{1});
     const MTLSize threads_per_group = MTLSizeMake(thread_width, thread_height, 1);
     const MTLSize threads_per_grid = MTLSizeMake(static_cast<NSUInteger>(width), static_cast<NSUInteger>(height), 1);
     [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
     [encoder endEncoding];
-    const auto submit_start = std::chrono::steady_clock::now();
-    [command_buffer commit];
-    const auto submit_end = std::chrono::steady_clock::now();
-    [command_buffer waitUntilCompleted];
-    const auto wait_end = std::chrono::steady_clock::now();
-    if (out_timing != nullptr) {
-        out_timing->submit_cpu_ms =
-            std::chrono::duration<double, std::milli>(submit_end - submit_start).count();
-        out_timing->gpu_wait_ms = std::chrono::duration<double, std::milli>(wait_end - submit_end).count();
-        if (command_buffer.GPUEndTime >= command_buffer.GPUStartTime) {
-            out_timing->gpu_ms = (command_buffer.GPUEndTime - command_buffer.GPUStartTime) * 1000.0;
-        }
+    if (!submit_metal_command(slot, command_buffer, out_timing)) {
+        return false;
     }
-    if (command_buffer.status != MTLCommandBufferStatusCompleted) {
-        log_metal_error(@"dispatch_triangle_trace", command_buffer.error);
-    }
-    return command_buffer.status == MTLCommandBufferStatusCompleted;
+    g_metal.trace_pending = true;
+    return true;
 }
 
 bool dispatch_pick_query(
@@ -1346,11 +1571,9 @@ bool dispatch_pick_query(
     int height,
     int pixel_x,
     int pixel_y,
-    const frame_scene &scene,
-    pick_result* out_result)
+    const frame_scene &scene)
 {
-    if (out_result == nullptr ||
-        width <= 0 || height <= 0 ||
+    if (width <= 0 || height <= 0 ||
         pixel_x < 0 || pixel_y < 0 ||
         g_metal.command_queue == nil ||
         g_metal.pick_pipeline == nil ||
@@ -1364,6 +1587,10 @@ bool dispatch_pick_query(
     request.pixel_x = static_cast<std::uint32_t>(pixel_x);
     request.pixel_y = static_cast<std::uint32_t>(pixel_y);
 
+    metal_command_slot* slot = nullptr;
+    if (!acquire_metal_command_slot(metal_submission_kind::pick, &slot)) {
+        return false;
+    }
     id<MTLCommandBuffer> command_buffer = [g_metal.command_queue commandBuffer];
     if (command_buffer == nil) {
         return false;
@@ -1382,21 +1609,10 @@ bool dispatch_pick_query(
     const MTLSize threads_per_grid = MTLSizeMake(1, 1, 1);
     [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
     [encoder endEncoding];
-    [command_buffer commit];
-    [command_buffer waitUntilCompleted];
-    if (command_buffer.status != MTLCommandBufferStatusCompleted) {
-        log_metal_error(@"dispatch_pick_query", command_buffer.error);
+    if (!submit_metal_command(slot, command_buffer, nullptr)) {
         return false;
     }
-
-    const pick_result_gpu* mapped = static_cast<const pick_result_gpu*>([g_metal.pick_buffer contents]);
-    if (mapped == nullptr) {
-        return false;
-    }
-
-    out_result->kind = static_cast<hover_highlight_kind>(mapped->primitive_kind);
-    out_result->primitive_index = mapped->primitive_index;
-    out_result->distance = mapped->distance;
+    g_metal.pick_pending = true;
     return true;
 }
 
@@ -1428,6 +1644,10 @@ void fill_output_buffer_black(int width, int height) {
     const std::size_t byte_count = static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4u;
     std::memset([g_metal.output_buffer contents], 0, byte_count);
 }
+
+// =============================================================================
+// Device lifecycle and operation entry points.
+// =============================================================================
 
 bool initialize_metal_backend(const backend_config &config) {
     std::scoped_lock lock(g_metal.mutex);
@@ -1464,6 +1684,7 @@ bool initialize_metal_backend(const backend_config &config) {
 
 void shutdown_metal_backend() {
     std::scoped_lock lock(g_metal.mutex);
+    wait_for_all_metal_commands();
     reset_metal_state_contents();
 }
 
@@ -1497,6 +1718,11 @@ bool copy_output_buffer_to_metal_pixel_buffer(int width, int height, void* pixel
         return false;
     }
 
+    metal_command_slot* slot = nullptr;
+    if (!acquire_metal_command_slot(metal_submission_kind::native_present, &slot)) {
+        CFRelease(cv_texture);
+        return false;
+    }
     id<MTLCommandBuffer> command_buffer = [g_metal.command_queue commandBuffer];
     if (command_buffer == nil) {
         CFRelease(cv_texture);
@@ -1516,15 +1742,15 @@ bool copy_output_buffer_to_metal_pixel_buffer(int width, int height, void* pixel
                   toTexture:texture
            destinationSlice:0
            destinationLevel:0
-          destinationOrigin:MTLOriginMake(0, 0, 0)];
+                  destinationOrigin:MTLOriginMake(0, 0, 0)];
     [encoder endEncoding];
-    [command_buffer commit];
-    [command_buffer waitUntilCompleted];
-    CFRelease(cv_texture);
-    if (command_buffer.status != MTLCommandBufferStatusCompleted) {
-        log_metal_error(@"copy_output_buffer_to_metal_pixel_buffer", command_buffer.error);
+    command_timing timing{};
+    if (!submit_metal_command(slot, command_buffer, &timing)) {
+        CFRelease(cv_texture);
         return false;
     }
+    slot->presentation_texture = cv_texture;
+    g_metal.build_info.dispatch_submit_cpu_ms += timing.submit_cpu_ms;
     return true;
 }
 
@@ -1539,6 +1765,8 @@ bool advance_accumulated_render(
     if (width <= 0 || height <= 0) {
         return false;
     }
+
+    collect_completed_metal_commands();
 
     const auto accel_start = std::chrono::steady_clock::now();
     rt_scene_build build{};
@@ -1556,6 +1784,17 @@ bool advance_accumulated_render(
     next_key.projection_blend_from = scene.projection_blend_from;
     next_key.projection_blend_to = scene.projection_blend_to;
     next_key.projection_blend_t = scene.projection_blend_t;
+
+    if (g_metal.trace_pending) {
+        g_metal.build_info.accumulation_in_progress = true;
+        if (out_accel_ms != nullptr) {
+            *out_accel_ms = g_metal.build_info.accel_build_ms;
+        }
+        if (out_dispatch_ms != nullptr) {
+            *out_dispatch_ms = g_metal.build_info.dispatch_ms;
+        }
+        return true;
+    }
 
     const bool accumulation_changed = !accumulation_key_equals(g_metal.accumulation, next_key);
     if (accumulation_changed) {
@@ -1576,13 +1815,19 @@ bool advance_accumulated_render(
         g_metal.accumulation_sample_count = 0;
         g_metal.accumulation_active = false;
         fill_output_buffer_black(width, height);
-    } else if (!ensure_scene_resources(build, &scene_rebuilt, &accel_timing) ||
+    } else {
+        if (g_metal.synced_revision != build.revision) {
+            g_metal.build_info.accel_gpu_ms = 0.0;
+            g_metal.build_info.accel_gpu_wait_ms = 0.0;
+        }
+        if (!ensure_scene_resources(build, &scene_rebuilt, &accel_timing) ||
                !ensure_output_buffer(width, height) ||
                !ensure_accumulation_buffer(width, height)) {
-        g_metal.accumulation_sample_count = 0;
-        g_metal.accumulation_active = false;
-        fill_output_buffer_black(width, height);
-        trace_ok = false;
+            g_metal.accumulation_sample_count = 0;
+            g_metal.accumulation_active = false;
+            fill_output_buffer_black(width, height);
+            trace_ok = false;
+        }
     }
     const auto accel_end = std::chrono::steady_clock::now();
 
@@ -1590,7 +1835,7 @@ bool advance_accumulated_render(
     command_timing dispatch_timing{};
     if (trace_ok && has_frame && (build.triangle_count > 0 || build.point_count > 0 || build.line_count > 0)) {
         if (g_metal.accumulation_sample_count < kMaxAccumulationSamples) {
-            trace_ok = dispatch_triangle_trace(
+            trace_ok = dispatch_trace(
                 width,
                 height,
                 scene,
@@ -1603,7 +1848,9 @@ bool advance_accumulated_render(
             }
         }
         g_metal.accumulation_active =
-            g_metal.config.continuous_render || g_metal.accumulation_sample_count < kMaxAccumulationSamples;
+            g_metal.trace_pending ||
+            g_metal.config.continuous_render ||
+            g_metal.accumulation_sample_count < kMaxAccumulationSamples;
     } else {
         g_metal.accumulation_sample_count = 0;
         g_metal.accumulation_active = false;
@@ -1612,7 +1859,7 @@ bool advance_accumulated_render(
     const auto dispatch_end = std::chrono::steady_clock::now();
 
     std::scoped_lock lock(g_metal.mutex);
-    const std::size_t blas_count = build.chunks.size() +
+    const std::size_t blas_count = build.triangle_chunks.size() +
         (build.point_count > 0 ? 1u : 0u) + (build.line_count > 0 ? 1u : 0u);
     g_metal.build_info.blas_reused_count = scene_rebuilt
         ? g_metal.synced_blas_reused_count
@@ -1620,19 +1867,25 @@ bool advance_accumulated_render(
     g_metal.build_info.blas_rebuilt_count = scene_rebuilt
         ? g_metal.synced_blas_rebuilt_count
         : 0u;
-    g_metal.build_info.blas_reused_chunk_count = scene_rebuilt
-        ? g_metal.synced_blas_reused_chunk_count
-        : build.chunks.size();
-    g_metal.build_info.blas_rebuilt_chunk_count = scene_rebuilt
-        ? g_metal.synced_blas_rebuilt_chunk_count
+    g_metal.build_info.blas_reused_triangle_chunk_count = scene_rebuilt
+        ? g_metal.synced_blas_reused_triangle_chunk_count
+        : build.triangle_chunks.size();
+    g_metal.build_info.blas_rebuilt_triangle_chunk_count = scene_rebuilt
+        ? g_metal.synced_blas_rebuilt_triangle_chunk_count
         : 0u;
     g_metal.build_info.tlas_rebuild_count = scene_rebuilt && build.triangle_count > 0 ? 1u : 0u;
     if (scene_rebuilt) {
         g_metal.build_info.accel_build_ms =
             std::chrono::duration<double, std::milli>(accel_end - accel_start).count();
+        g_metal.build_info.accel_host_prep_ms = (std::max)(
+            0.0,
+            g_metal.build_info.accel_build_ms -
+                accel_timing.command_record_cpu_ms -
+                accel_timing.submit_cpu_ms);
+        g_metal.build_info.accel_command_record_ms = accel_timing.command_record_cpu_ms;
+        g_metal.build_info.accel_build_call_record_ms = accel_timing.build_call_record_cpu_ms;
         g_metal.build_info.accel_submit_cpu_ms = accel_timing.submit_cpu_ms;
         g_metal.build_info.accel_gpu_wait_ms = accel_timing.gpu_wait_ms;
-        g_metal.build_info.accel_gpu_ms = accel_timing.gpu_ms;
     }
     if (dispatch_timing.submit_cpu_ms > 0.0 || dispatch_timing.gpu_wait_ms > 0.0) {
         g_metal.build_info.dispatch_ms =
@@ -1655,38 +1908,48 @@ bool advance_accumulated_render(
 }
 
 bool render_metal_to_native_metal_texture(
-    int width,
-    int height,
-    const frame_scene &scene,
-    bool has_frame,
+    const rt_render_request &request,
     void* pixel_buffer)
 {
-    if (width <= 0 || height <= 0 || pixel_buffer == nullptr) {
+    if (request.scene == nullptr || request.width <= 0 || request.height <= 0 || pixel_buffer == nullptr) {
         return false;
     }
-    if (!advance_accumulated_render(width, height, scene, has_frame, nullptr, nullptr)) {
+    if (!advance_accumulated_render(
+            request.width,
+            request.height,
+            *request.scene,
+            request.has_frame,
+            nullptr,
+            nullptr)) {
         return false;
     }
-    return copy_output_buffer_to_metal_pixel_buffer(width, height, pixel_buffer);
+    return copy_output_buffer_to_metal_pixel_buffer(request.width, request.height, pixel_buffer);
 }
 
 bool capture_metal_to_bgra(
-    int width,
-    int height,
-    const frame_scene &scene,
-    bool has_frame,
+    const rt_render_request &request,
     std::vector<std::uint8_t>* out_pixels,
     bool update_build_info)
 {
     (void)update_build_info;
-    if (out_pixels == nullptr || width <= 0 || height <= 0) {
+    if (request.scene == nullptr || out_pixels == nullptr || request.width <= 0 || request.height <= 0) {
         return false;
     }
     double accel_ms = 0.0;
     double dispatch_ms = 0.0;
-    const bool trace_ok = advance_accumulated_render(width, height, scene, has_frame, &accel_ms, &dispatch_ms);
+    const bool trace_ok = advance_accumulated_render(
+        request.width,
+        request.height,
+        *request.scene,
+        request.has_frame,
+        &accel_ms,
+        &dispatch_ms);
     const auto readback_start = std::chrono::steady_clock::now();
-    read_output_pixels(out_pixels, width, height);
+    command_timing readback_timing{};
+    if (!wait_for_metal_command_kind(metal_submission_kind::trace, &readback_timing)) {
+        return false;
+    }
+    read_output_pixels(out_pixels, request.width, request.height);
     const double readback_ms =
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - readback_start).count();
     std::scoped_lock lock(g_metal.mutex);
@@ -1696,37 +1959,62 @@ bool capture_metal_to_bgra(
     return trace_ok;
 }
 
-bool capture_metal_to_png(const wchar_t* path, int width, int height, const frame_scene &scene, bool has_frame) {
+bool capture_metal_to_png(const wchar_t* path, const rt_render_request &request) {
     if (path == nullptr) {
         return false;
     }
     std::vector<std::uint8_t> pixels;
-    if (!capture_metal_to_bgra(width, height, scene, has_frame, &pixels, false)) {
+    if (!capture_metal_to_bgra(request, &pixels, false)) {
         return false;
     }
-    return viewer_capture::write_png_bgra8(path, pixels.data(), width, height, width * 4);
+    return viewer_capture::write_png_bgra8(
+        path,
+        pixels.data(),
+        request.width,
+        request.height,
+        request.width * 4);
 }
 
 bool pick_metal(
-    int width,
-    int height,
-    int pixel_x,
-    int pixel_y,
-    const frame_scene &scene,
-    bool has_frame,
+    const rt_pick_request &request,
     pick_result* out_result)
 {
-    if (out_result == nullptr || width <= 0 || height <= 0 || pixel_x < 0 || pixel_y < 0) {
+    if (out_result == nullptr || request.render.scene == nullptr || request.render.width <= 0 ||
+        request.render.height <= 0 || request.pixel_x < 0 || request.pixel_y < 0) {
         return false;
     }
 
     *out_result = {};
-    if (!has_frame) {
+    if (!request.render.has_frame) {
         return true;
     }
 
     rt_scene_build build{};
     copy_present_render_rt_scene_build(&build);
+    const metal_pick_key current_pick{
+        build.revision,
+        request.render.width,
+        request.render.height,
+        request.pixel_x,
+        request.pixel_y,
+        request.render.scene->camera,
+        request.render.scene->projection_blend_from,
+        request.render.scene->projection_blend_to,
+        request.render.scene->projection_blend_t,
+    };
+    collect_completed_metal_commands();
+    if (g_metal.pick_result_ready) {
+        const pick_result completed_result = g_metal.completed_pick_result;
+        const bool matches = metal_pick_key_equals(g_metal.completed_pick, current_pick);
+        g_metal.pick_result_ready = false;
+        if (matches) {
+            *out_result = completed_result;
+            return true;
+        }
+    }
+    if (g_metal.pick_pending) {
+        return false;
+    }
     if (build.triangle_count == 0 && build.point_count == 0 && build.line_count == 0) {
         return false;
     }
@@ -1734,6 +2022,10 @@ bool pick_metal(
     const auto accel_start = std::chrono::steady_clock::now();
     bool scene_rebuilt = false;
     command_timing accel_timing{};
+    if (g_metal.synced_revision != build.revision) {
+        g_metal.build_info.accel_gpu_ms = 0.0;
+        g_metal.build_info.accel_gpu_wait_ms = 0.0;
+    }
     if (!ensure_scene_resources(build, &scene_rebuilt, &accel_timing) || !ensure_pick_buffer()) {
         return false;
     }
@@ -1742,12 +2034,24 @@ bool pick_metal(
         std::scoped_lock lock(g_metal.mutex);
         g_metal.build_info.accel_build_ms =
             std::chrono::duration<double, std::milli>(accel_end - accel_start).count();
+        g_metal.build_info.accel_host_prep_ms = (std::max)(
+            0.0,
+            g_metal.build_info.accel_build_ms -
+                accel_timing.command_record_cpu_ms -
+                accel_timing.submit_cpu_ms);
+        g_metal.build_info.accel_command_record_ms = accel_timing.command_record_cpu_ms;
+        g_metal.build_info.accel_build_call_record_ms = accel_timing.build_call_record_cpu_ms;
         g_metal.build_info.accel_submit_cpu_ms = accel_timing.submit_cpu_ms;
         g_metal.build_info.accel_gpu_wait_ms = accel_timing.gpu_wait_ms;
-        g_metal.build_info.accel_gpu_ms = accel_timing.gpu_ms;
     }
 
-    return dispatch_pick_query(width, height, pixel_x, pixel_y, scene, out_result);
+    g_metal.pending_pick = current_pick;
+    return dispatch_pick_query(
+        request.render.width,
+        request.render.height,
+        request.pixel_x,
+        request.pixel_y,
+        *request.render.scene);
 }
 
 void fill_metal_build_info(scene_build_info* out_info) {
@@ -1755,28 +2059,18 @@ void fill_metal_build_info(scene_build_info* out_info) {
         return;
     }
     std::scoped_lock lock(g_metal.mutex);
-    out_info->blas_reused_count = g_metal.build_info.blas_reused_count;
-    out_info->blas_rebuilt_count = g_metal.build_info.blas_rebuilt_count;
-    out_info->blas_reused_chunk_count = g_metal.build_info.blas_reused_chunk_count;
-    out_info->blas_rebuilt_chunk_count = g_metal.build_info.blas_rebuilt_chunk_count;
-    out_info->tlas_rebuild_count = g_metal.build_info.tlas_rebuild_count;
-    out_info->accel_build_ms = g_metal.build_info.accel_build_ms;
-    out_info->accel_submit_cpu_ms = g_metal.build_info.accel_submit_cpu_ms;
-    out_info->accel_gpu_wait_ms = g_metal.build_info.accel_gpu_wait_ms;
-    out_info->accel_gpu_ms = g_metal.build_info.accel_gpu_ms;
-    out_info->dispatch_ms = g_metal.build_info.dispatch_ms;
-    out_info->dispatch_submit_cpu_ms = g_metal.build_info.dispatch_submit_cpu_ms;
-    out_info->dispatch_gpu_wait_ms = g_metal.build_info.dispatch_gpu_wait_ms;
-    out_info->dispatch_gpu_ms = g_metal.build_info.dispatch_gpu_ms;
-    out_info->readback_ms = g_metal.build_info.readback_ms;
-    out_info->accumulation_sample_count = g_metal.build_info.accumulation_sample_count;
-    out_info->accumulation_target_sample_count = g_metal.build_info.accumulation_target_sample_count;
-    out_info->accumulation_in_progress = g_metal.build_info.accumulation_in_progress;
+    copy_rt_diagnostics(out_info, g_metal.build_info);
 }
 
 bool metal_accumulation_in_progress() {
+    collect_completed_metal_commands();
     std::scoped_lock lock(g_metal.mutex);
-    return g_metal.accumulation_active;
+    return g_metal.trace_pending || g_metal.accumulation_active;
+}
+
+bool metal_pick_query_pending() {
+    collect_completed_metal_commands();
+    return g_metal.pick_pending;
 }
 
 void metal_notify_shell_post_present() {
@@ -1790,9 +2084,11 @@ const backend_ops kMetalBackendOps{
     render_metal_to_native_metal_texture,
     nullptr,
     capture_metal_to_bgra,
+    nullptr,
     capture_metal_to_png,
     fill_metal_build_info,
     pick_metal,
+    metal_pick_query_pending,
     metal_accumulation_in_progress,
     nullptr,
     nullptr,

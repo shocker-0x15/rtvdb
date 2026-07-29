@@ -13,6 +13,7 @@ enum class log_event_kind {
     begin_frame,
     clear,
     set_camera,
+    set_reference_grid,
     triangle,
     triangle_batch,
     point,

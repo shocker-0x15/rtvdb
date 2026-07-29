@@ -67,6 +67,16 @@ bool line(
     std::uint32_t user_data = 0);
 bool flush();
 
+enum class reference_grid : std::uint32_t {
+  viewer_default = 0,
+  off = 1,
+  xy_grid = 2,
+  xz_grid = 3,
+  yz_grid = 4,
+};
+
+bool set_reference_grid(reference_grid value);
+
 // End: Basic APIs
 // ----------------------------------------------------------------
 
@@ -284,7 +294,7 @@ struct rgba {
 };
 
 constexpr std::uint32_t kMagic = 0x42565452u;
-constexpr std::uint16_t kProtocolVersion = 8;
+constexpr std::uint16_t kProtocolVersion = 9;
 constexpr std::size_t kLayerNameCapacity = 64;
 constexpr std::size_t kPrimitiveBatchFlushCount = 256;
 constexpr std::uint64_t kPrimitiveBatchFlushDelayMs = 100;
@@ -306,6 +316,7 @@ enum class message_kind : std::uint16_t {
     end_frame = 11,
     push_layer = 12,
     pop_layer = 13,
+    set_reference_grid = 14,
 };
 
 #pragma pack(push, 1)
@@ -324,6 +335,10 @@ struct handshake_payload {
 
 struct camera_payload {
     camera value;
+};
+
+struct reference_grid_payload {
+    reference_grid value;
 };
 
 struct layer_payload {
@@ -408,12 +423,14 @@ struct client_state {
     float current_line_radius = 0.025f;
     std::uint64_t last_primitive_enqueue_tick = 0;
     std::uint64_t next_implicit_connect_tick = 0;
+    bool explicit_frame_open = false;
     bool force_flush_next_triangle = true;
     bool force_flush_next_point = true;
     bool force_flush_next_line = true;
 };
 
 inline bool flush_pending_primitive_batches(client_state* c);
+inline void finalize_explicit_frame(client_state* c);
 
 inline bool ensure_network_started() {
 #if defined(_WIN32)
@@ -461,6 +478,7 @@ inline void reset_client_state(client_state* c) {
     c->current_line_radius = 0.025f;
     c->last_primitive_enqueue_tick = 0;
     c->next_implicit_connect_tick = 0;
+    c->explicit_frame_open = false;
     c->force_flush_next_triangle = true;
     c->force_flush_next_point = true;
     c->force_flush_next_line = true;
@@ -559,7 +577,7 @@ struct client_runtime {
 
     ~client_runtime() {
         if (state.socket != nullptr) {
-            (void)flush_pending_primitive_batches(&state);
+            finalize_explicit_frame(&state);
         }
         disconnect_client(&state);
     }
@@ -753,6 +771,23 @@ inline bool send_control_message(message_kind kind, const void* payload, std::ui
     return ok;
 }
 
+inline void finalize_explicit_frame(client_state* c) {
+    if (c == nullptr || c->socket == nullptr) {
+        return;
+    }
+    if (!flush_pending_primitive_batches(c)) {
+        return;
+    }
+    if (!c->explicit_frame_open) {
+        return;
+    }
+    if (send_message_raw(c, message_kind::end_frame, nullptr, 0)) {
+        c->explicit_frame_open = false;
+    } else {
+        disconnect_client(c);
+    }
+}
+
 } // namespace detail
 
 
@@ -765,9 +800,7 @@ inline bool connect(const config* cfg, const char* app_name) {
 
 inline void disconnect() {
     detail::client_state &c = detail::global_client();
-    if (c.socket != nullptr) {
-        (void)detail::flush_pending_primitive_batches(&c);
-    }
+    detail::finalize_explicit_frame(&c);
     detail::disconnect_client(&c);
 }
 
@@ -778,11 +811,27 @@ inline bool is_connected() {
 
 
 inline bool begin_frame() {
-    return detail::send_control_message(message_kind::begin_frame, nullptr, 0);
+    detail::client_state &c = detail::global_client();
+    if (c.explicit_frame_open) {
+        return false;
+    }
+    if (!detail::send_control_message(message_kind::begin_frame, nullptr, 0)) {
+        return false;
+    }
+    c.explicit_frame_open = true;
+    return true;
 }
 
 inline bool end_frame() {
-    return detail::send_control_message(message_kind::end_frame, nullptr, 0);
+    detail::client_state &c = detail::global_client();
+    if (!c.explicit_frame_open) {
+        return false;
+    }
+    if (!detail::send_control_message(message_kind::end_frame, nullptr, 0)) {
+        return false;
+    }
+    c.explicit_frame_open = false;
+    return true;
 }
 
 
@@ -849,6 +898,11 @@ inline bool set_orthographic_camera(
         }
     };
     return detail::send_control_message(message_kind::set_camera, &payload, sizeof(payload));
+}
+
+inline bool set_reference_grid(reference_grid value) {
+    const reference_grid_payload payload{value};
+    return detail::send_control_message(message_kind::set_reference_grid, &payload, sizeof(payload));
 }
 
 

@@ -33,6 +33,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <system_error>
@@ -60,7 +61,7 @@ constexpr float kKeyboardMoveSpeedMinimum = 0.25f;
 constexpr float kKeyboardTiltRadiansPerSecond = 1.5f;
 constexpr float kCameraSpeedLog10Min = -3.0f;
 constexpr float kCameraSpeedLog10Max = 3.0f;
-constexpr float kCameraSpeedLog10Step = 0.1f;
+constexpr float kCameraSpeedLog10Step = 0.03f;
 constexpr float kOrthographicHeightUiMin = 0.01f;
 constexpr float kOrthographicHeightUiMax = 1.0e6f;
 constexpr float kOverlayRightPadding = 20.0f;
@@ -79,10 +80,11 @@ constexpr float kLayerVisibilityIconStroke = 1.4f;
 constexpr float kLayerHoverHighlightAlpha = 0.18f;
 constexpr float kLayerHoverAncestorHighlightAlpha = 0.10f;
 constexpr std::size_t kMaxRecentViewerLogCount = 64;
-constexpr auto kManualCaptureRefreshDelay = std::chrono::milliseconds(150);
-constexpr std::uint64_t kAutoCaptureSessionQuietDelayMs = 500;
 constexpr int kManualPngSequenceDigits = 3;
 constexpr wchar_t kViewerWindowTitle[] = L"rtvdb viewer";
+constexpr wchar_t kViewerWindowTitleD3D[] = L"rtvdb viewer - D3D";
+constexpr wchar_t kViewerWindowTitleVulkan[] = L"rtvdb viewer - Vulkan";
+constexpr wchar_t kViewerWindowTitleMetal[] = L"rtvdb viewer - Metal";
 #if defined(_WIN32)
 constexpr wchar_t kViewerSingleInstanceMutexName[] = L"Local\\rtvdb_viewer_single_instance";
 #endif
@@ -184,6 +186,7 @@ struct drag_state {
 
 struct frame_pacing_state {
     double last_render_ms = 0.0;
+    double last_command_slot_reuse_wait_ms = 0.0;
     double average_render_ms = 0.0;
     std::uint64_t average_render_frame_count = 0;
     std::uint64_t average_render_frame_serial = 0;
@@ -239,7 +242,6 @@ struct render_diagnostics_snapshot {
     bool camera_update_pending = false;
     bool pending_post_present_capture = false;
     bool post_present_capture_display_ready = false;
-    bool pending_manual_capture_refresh = false;
     std::uint64_t last_render_capture_frame_serial = 0;
     std::uint64_t last_window_capture_frame_serial = 0;
     char last_repaint_reason[64]{};
@@ -258,12 +260,6 @@ struct helper_plane_option {
     const char* label;
 };
 
-struct status_overlay_line {
-    std::string label;
-    std::string value;
-    bool spacer = false;
-};
-
 constexpr display_mode_option kDisplayModes[] = {
     {rtvdb::viewer_backend::display_mode::client_color, "client_color", "[1] Client Color", rtvdb::viewer_shell::key_code::digit_1},
     {rtvdb::viewer_backend::display_mode::triangle_normal, "triangle_normal", "[2] Normal", rtvdb::viewer_shell::key_code::digit_2},
@@ -280,6 +276,8 @@ constexpr helper_plane_option kHelperPlaneOptions[] = {
 };
 
 hover_state g_hover{};
+bool g_hover_pick_pending = false;
+bool g_keyboard_camera_input_active = false;
 camera_override_state g_camera_override{};
 camera_focus_state g_camera_focus{};
 camera_animation_state g_camera_animation{};
@@ -317,14 +315,12 @@ std::uint64_t g_view_revision = 0;
 
 bool g_pending_present_update = false;
 bool g_pending_post_present_capture = false;
-bool g_pending_manual_capture_refresh = false;
-std::chrono::steady_clock::time_point g_manual_capture_refresh_due_time{};
+bool g_pending_completed_scene_capture = false;
 std::chrono::steady_clock::time_point g_last_keyboard_navigation_tick{};
 std::uint64_t g_pending_capture_frame_serial = 0;
 std::uint64_t g_last_submitted_frame_serial = 0;
 std::uint64_t g_last_render_capture_frame_serial = 0;
 std::uint64_t g_last_window_capture_frame_serial = 0;
-std::atomic_uint64_t g_manual_capture_refresh_generation = 0;
 std::vector<rtvdb::viewer_session::log_entry> g_recent_session_logs;
 bool g_log_tab_selected = false;
 struct viewer_log_entry {
@@ -344,7 +340,6 @@ std::condition_variable g_layer_rebuild_condition;
 std::thread g_layer_rebuild_thread;
 std::uint64_t g_layer_rebuild_generation = 0;
 bool g_layer_rebuild_stop = false;
-bool g_details_overlay_open = false;
 float g_viewer_window_height = 0.0f;
 float g_camera_speed_log10 = 0.0f;
 std::wstring g_last_manual_png_directory;
@@ -357,6 +352,7 @@ struct viewer_launch_config {
     std::uint16_t listen_port = rtvdb::kDefaultPort;
     bool auto_capture = false;
     bool continuous_render = false;
+    bool deterministic_benchmark = false;
     bool enable_render_diagnostics = false;
     bool enable_diagnostics_output = false;
     bool dev_display_modes = false;
@@ -374,6 +370,7 @@ constexpr const char* kViewerUsage =
     "  --backend <auto|dxr|vulkan|metal>    Rendering backend\n"
     "  --display-mode <name>                Initial display mode\n"
     "  --auto-capture                       Capture after accumulation completes\n"
+    "  --deterministic-benchmark            Suppress empty-scene builds for reproducible benchmarks\n"
     "  --enable-render-diagnostics          Enable render diagnostics\n"
     "  --enable-diagnostics-output          Write diagnostics files to diagnostics/\n"
     "  --dev-display-modes                  Expose development display modes\n"
@@ -401,17 +398,30 @@ bool render_diagnostics_enabled();
 std::uint64_t monotonic_time_ms();
 bool copy_effective_present_scene(rtvdb::viewer_backend::frame_scene* out_scene, bool* out_has_frame);
 bool copy_effective_present_render_scene(rtvdb::viewer_backend::frame_scene* out_scene, bool* out_has_frame);
+bool acquire_effective_present_render_scene(
+    std::shared_ptr<const rtvdb::viewer_backend::frame_scene>* out_scene,
+    bool* out_has_frame);
 void start_layer_rebuild_worker();
 void stop_layer_rebuild_worker();
 void append_render_stall_trace_line(const char* text);
 void record_repaint_request(const char* reason, std::uint64_t frame_serial);
 void record_paint_started();
 void record_post_present();
+const wchar_t* viewer_window_title(rtvdb::viewer_backend::backend_kind kind);
 #if defined(_WIN32)
 bool focus_existing_viewer_window() {
+    constexpr const wchar_t* kViewerWindowTitles[] = {
+        kViewerWindowTitle,
+        kViewerWindowTitleD3D,
+        kViewerWindowTitleVulkan,
+        kViewerWindowTitleMetal,
+    };
     for (int attempt = 0; attempt < 20; ++attempt) {
-        HWND hwnd = FindWindowW(nullptr, kViewerWindowTitle);
-        if (hwnd != nullptr) {
+        for (const wchar_t* title : kViewerWindowTitles) {
+            HWND hwnd = FindWindowW(nullptr, title);
+            if (hwnd == nullptr) {
+                continue;
+            }
             if (IsIconic(hwnd)) {
                 ShowWindow(hwnd, SW_RESTORE);
             } else {
@@ -450,6 +460,20 @@ void release_single_instance_guard() {
     g_viewer_single_instance_mutex = nullptr;
 }
 #endif
+
+const wchar_t* viewer_window_title(rtvdb::viewer_backend::backend_kind kind) {
+    switch (kind) {
+    case rtvdb::viewer_backend::backend_kind::d3d12_dxr:
+        return kViewerWindowTitleD3D;
+    case rtvdb::viewer_backend::backend_kind::vulkan_rt:
+        return kViewerWindowTitleVulkan;
+    case rtvdb::viewer_backend::backend_kind::metal_rt:
+        return kViewerWindowTitleMetal;
+    case rtvdb::viewer_backend::backend_kind::unsupported:
+    default:
+        return kViewerWindowTitle;
+    }
+}
 void record_render_submit(std::uint64_t frame_serial, int width, int height, bool used_native_frame);
 void record_camera_update(const char* reason);
 render_diagnostics_snapshot capture_render_diagnostics_snapshot();
@@ -471,7 +495,6 @@ void animate_camera_to(
     bool disable_auto_frame = true);
 void set_camera_control_mode(camera_control_mode mode);
 bool adjust_camera_speed_log10(float delta);
-void schedule_manual_capture_refresh(std::chrono::steady_clock::time_point due_time);
 void stop_camera_animation();
 bool update_keyboard_camera();
 float camera_speed_multiplier();
@@ -872,7 +895,6 @@ render_diagnostics_snapshot capture_render_diagnostics_snapshot() {
         std::scoped_lock present_lock(g_present_update_mutex);
         snapshot.pending_post_present_capture = g_pending_post_present_capture;
         snapshot.post_present_capture_display_ready = g_post_present_capture_display_ready;
-        snapshot.pending_manual_capture_refresh = g_pending_manual_capture_refresh;
         snapshot.last_render_capture_frame_serial = g_last_render_capture_frame_serial;
         snapshot.last_window_capture_frame_serial = g_last_window_capture_frame_serial;
     }
@@ -1074,37 +1096,10 @@ void append_manual_png_save_log(bool is_error, const std::wstring &path, const c
     });
 }
 
-bool capture_scene_to_bgra_converged(
-    int render_width,
-    int render_height,
-    const rtvdb::viewer_backend::frame_scene &scene,
-    bool has_frame,
-    std::vector<std::uint8_t>* out_pixels)
-{
-    if (out_pixels == nullptr) {
-        return false;
-    }
-    out_pixels->clear();
-
-    constexpr int kCaptureConvergenceMaxIterations = 64;
-    for (int iteration = 0; iteration < kCaptureConvergenceMaxIterations; ++iteration) {
-        if (!rtvdb::viewer_backend::capture_frame_to_bgra(
-                render_width,
-                render_height,
-                scene,
-                has_frame,
-                out_pixels,
-                false)) {
-            return false;
-        }
-        if (!rtvdb::viewer_backend::accumulation_in_progress()) {
-            return !out_pixels->empty();
-        }
-    }
-    return !out_pixels->empty();
-}
-
 bool g_manual_png_save_pending = false;
+bool g_manual_png_capture_pending = false;
+bool g_manual_png_capture_converged = false;
+std::wstring g_manual_png_capture_path;
 
 void complete_manual_png_save(bool accepted, const std::wstring &path, void*) {
     g_manual_png_save_pending = false;
@@ -1124,24 +1119,62 @@ void complete_manual_png_save(bool accepted, const std::wstring &path, void*) {
     rtvdb::viewer_shell::render_window_size(&render_width, &render_height);
     rtvdb::viewer_backend::set_capture_size(render_width, render_height);
 
+    g_manual_png_capture_path = path;
+    g_manual_png_capture_pending = true;
+    g_manual_png_capture_converged = false;
+    rtvdb::viewer_shell::request_repaint();
+}
+
+void process_pending_manual_png_capture(
+    const rtvdb::viewer_backend::frame_scene &scene,
+    bool has_frame)
+{
+    if (!g_manual_png_capture_pending || !has_frame) {
+        return;
+    }
+    int render_width = kDefaultCaptureWidth;
+    int render_height = kDefaultCaptureHeight;
+    rtvdb::viewer_shell::render_window_size(&render_width, &render_height);
     std::vector<std::uint8_t> pixels;
-    if (!capture_scene_to_bgra_converged(
+    if (!rtvdb::viewer_backend::capture_frame_to_bgra(
             render_width,
             render_height,
             scene,
             true,
-            &pixels) ||
-        pixels.empty()) {
-        append_manual_png_save_log(true, path, "render capture failed");
+            &pixels,
+            false)) {
+        append_manual_png_save_log(true, g_manual_png_capture_path, "render capture failed");
+        g_manual_png_capture_pending = false;
+        g_manual_png_capture_path.clear();
         return;
     }
-
-    if (!rtvdb::viewer_capture::write_png_bgra8(path.c_str(), pixels.data(), render_width, render_height, render_width * 4)) {
-        append_manual_png_save_log(true, path, "png write failed");
+    if (rtvdb::viewer_backend::accumulation_in_progress()) {
+        g_manual_png_capture_converged = false;
+        rtvdb::viewer_shell::request_repaint();
         return;
     }
-
-    append_manual_png_save_log(false, path);
+    if (!g_manual_png_capture_converged) {
+        g_manual_png_capture_converged = true;
+        rtvdb::viewer_shell::request_repaint();
+        return;
+    }
+    if (pixels.empty()) {
+        rtvdb::viewer_shell::request_repaint();
+        return;
+    }
+    if (!rtvdb::viewer_capture::write_png_bgra8(
+            g_manual_png_capture_path.c_str(),
+            pixels.data(),
+            render_width,
+            render_height,
+            render_width * 4)) {
+        append_manual_png_save_log(true, g_manual_png_capture_path, "png write failed");
+    } else {
+        append_manual_png_save_log(false, g_manual_png_capture_path);
+    }
+    g_manual_png_capture_pending = false;
+    g_manual_png_capture_converged = false;
+    g_manual_png_capture_path.clear();
 }
 
 bool begin_render_png_save_interactive() {
@@ -1229,6 +1262,11 @@ bool parse_viewer_launch_config(
 
         if (std::strcmp(arg, "--continuous-render") == 0) {
             config.continuous_render = true;
+            continue;
+        }
+
+        if (std::strcmp(arg, "--deterministic-benchmark") == 0) {
+            config.deterministic_benchmark = true;
             continue;
         }
 
@@ -1382,16 +1420,120 @@ bool is_finite(const rtvdb::camera &camera) {
         is_finite(camera.orthographic_height);
 }
 
-rtvdb::camera blend_camera(const rtvdb::camera &a, const rtvdb::camera &b, float t) {
-    rtvdb::camera blended = a;
-    blended.origin = lerp(a.origin, b.origin, t);
-    blended.target = lerp(a.target, b.target, t);
-    blended.up = lerp(a.up, b.up, t);
-    if (length_sq(blended.up) <= kMinLengthSq) {
-        blended.up = b.up;
-    } else {
-        blended.up = blended.up / std::sqrt(length_sq(blended.up));
+rtvdb::vec3 normalize_or(const rtvdb::vec3 &v, const rtvdb::vec3 &fallback) {
+    const float len_sq = dot(v, v);
+    if (len_sq <= kMinLengthSq) {
+        return fallback;
     }
+    const float inv_len = 1.0f / std::sqrt(len_sq);
+    return v * inv_len;
+}
+
+struct quaternion {
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+    float w = 1.0f;
+};
+
+float dot(const quaternion &a, const quaternion &b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+}
+
+quaternion normalize_or(const quaternion &value, const quaternion &fallback) {
+    const float length_sq = dot(value, value);
+    if (length_sq <= kMinLengthSq) {
+        return fallback;
+    }
+    const float inverse_length = 1.0f / std::sqrt(length_sq);
+    return {
+        value.x * inverse_length,
+        value.y * inverse_length,
+        value.z * inverse_length,
+        value.w * inverse_length,
+    };
+}
+
+quaternion camera_orientation(const rtvdb::camera &camera) {
+    const rtvdb::vec3 forward = normalize_or(camera.target - camera.origin, {0.0f, 0.0f, 1.0f});
+    const rtvdb::vec3 right = normalize_or(cross(forward, camera.up), {1.0f, 0.0f, 0.0f});
+    const rtvdb::vec3 up = normalize_or(cross(right, forward), {0.0f, 1.0f, 0.0f});
+    const float m00 = right.x;
+    const float m01 = up.x;
+    const float m02 = -forward.x;
+    const float m10 = right.y;
+    const float m11 = up.y;
+    const float m12 = -forward.y;
+    const float m20 = right.z;
+    const float m21 = up.z;
+    const float m22 = -forward.z;
+    const float trace = m00 + m11 + m22;
+    quaternion result{};
+    if (trace > 0.0f) {
+        const float scale = 2.0f * std::sqrt(trace + 1.0f);
+        result = {(m21 - m12) / scale, (m02 - m20) / scale, (m10 - m01) / scale, 0.25f * scale};
+    } else if (m00 > m11 && m00 > m22) {
+        const float scale = 2.0f * std::sqrt(1.0f + m00 - m11 - m22);
+        result = {0.25f * scale, (m01 + m10) / scale, (m02 + m20) / scale, (m21 - m12) / scale};
+    } else if (m11 > m22) {
+        const float scale = 2.0f * std::sqrt(1.0f + m11 - m00 - m22);
+        result = {(m01 + m10) / scale, 0.25f * scale, (m12 + m21) / scale, (m02 - m20) / scale};
+    } else {
+        const float scale = 2.0f * std::sqrt(1.0f + m22 - m00 - m11);
+        result = {(m02 + m20) / scale, (m12 + m21) / scale, 0.25f * scale, (m10 - m01) / scale};
+    }
+    return normalize_or(result, {});
+}
+
+quaternion slerp(const quaternion &a, const quaternion &b, float t) {
+    quaternion end = b;
+    float cosine = dot(a, end);
+    if (cosine < 0.0f) {
+        cosine = -cosine;
+        end = {-end.x, -end.y, -end.z, -end.w};
+    }
+    if (cosine > 0.9995f) {
+        return normalize_or(
+            {
+                lerp(a.x, end.x, t),
+                lerp(a.y, end.y, t),
+                lerp(a.z, end.z, t),
+                lerp(a.w, end.w, t),
+            },
+            a);
+    }
+    const float angle = std::acos((std::clamp)(cosine, -1.0f, 1.0f));
+    const float inverse_sine = 1.0f / std::sin(angle);
+    const float a_weight = std::sin((1.0f - t) * angle) * inverse_sine;
+    const float b_weight = std::sin(t * angle) * inverse_sine;
+    return {
+        a.x * a_weight + end.x * b_weight,
+        a.y * a_weight + end.y * b_weight,
+        a.z * a_weight + end.z * b_weight,
+        a.w * a_weight + end.w * b_weight,
+    };
+}
+
+rtvdb::vec3 rotate(const quaternion &rotation, const rtvdb::vec3 &value) {
+    const rtvdb::vec3 imaginary{rotation.x, rotation.y, rotation.z};
+    const rtvdb::vec3 twice_cross = cross(imaginary, value) * 2.0f;
+    return value + twice_cross * rotation.w + cross(imaginary, twice_cross);
+}
+
+rtvdb::camera blend_camera(const rtvdb::camera &a, const rtvdb::camera &b, float t) {
+    if (t <= 0.0f) {
+        return a;
+    }
+    if (t >= 1.0f) {
+        return b;
+    }
+
+    rtvdb::camera blended = a;
+    blended.target = lerp(a.target, b.target, t);
+    const quaternion orientation = slerp(camera_orientation(a), camera_orientation(b), t);
+    const rtvdb::vec3 forward = normalize_or(rotate(orientation, {0.0f, 0.0f, -1.0f}), {0.0f, 0.0f, 1.0f});
+    blended.up = normalize_or(rotate(orientation, {0.0f, 1.0f, 0.0f}), b.up);
+    blended.origin = blended.target - forward * lerp(length(a.target - a.origin), length(b.target - b.origin), t);
     blended.vertical_fov_degrees = lerp(a.vertical_fov_degrees, b.vertical_fov_degrees, t);
     blended.fisheye_theta_degrees = lerp(a.fisheye_theta_degrees, b.fisheye_theta_degrees, t);
     blended.fisheye_phi_degrees = lerp(a.fisheye_phi_degrees, b.fisheye_phi_degrees, t);
@@ -1429,15 +1571,6 @@ bool progress_camera_animation() {
         g_camera_animation.active = false;
     }
     return g_camera_animation.active;
-}
-
-rtvdb::vec3 normalize_or(const rtvdb::vec3 &v, const rtvdb::vec3 &fallback) {
-    const float len_sq = dot(v, v);
-    if (len_sq <= kMinLengthSq) {
-        return fallback;
-    }
-    const float inv_len = 1.0f / std::sqrt(len_sq);
-    return v * inv_len;
 }
 
 void camera_basis(
@@ -1818,14 +1951,12 @@ void show_scene_in_shell(
     int* out_render_width,
     int* out_render_height,
     std::vector<std::uint8_t>* out_pixels);
-bool capture_scene_to_files(const rtvdb::viewer_backend::frame_scene &scene, bool has_frame);
+bool poll_completed_debug_render_capture(
+    const rtvdb::viewer_backend::frame_scene &scene,
+    bool has_frame);
 void capture_window_to_files(std::uint64_t frame_serial);
 void capture_build_info_to_files(std::uint64_t frame_serial);
 void maybe_refresh_runtime_build_info_file(std::uint64_t frame_serial);
-void schedule_async_capture_retry(
-    rtvdb::viewer_backend::frame_scene scene,
-    bool has_frame,
-    std::uint64_t frame_serial);
 void cache_render_capture(
     std::uint64_t frame_serial,
     int render_width,
@@ -1840,7 +1971,7 @@ void schedule_post_present_capture(std::uint64_t frame_serial, bool has_frame);
 void process_pending_present_update();
 void process_pending_pre_present_capture();
 void update_present_timing();
-void refresh_present_captures();
+void request_present_refresh();
 std::size_t visible_display_mode_count();
 
 void current_render_size(int* out_width, int* out_height) {
@@ -2011,109 +2142,329 @@ void draw_hover_overlay() {
     }
 }
 
-std::vector<status_overlay_line> build_status_overlay_lines(
-    const rtvdb::viewer_backend::scene_build_info &build_info,
-    const char* backend_name)
-{
-    std::vector<status_overlay_line> lines;
+constexpr float kStatusDetailsValueColumn = 220.0f;
+constexpr float kStatusSummaryValueColumn = 130.0f;
 
-    auto append_ms_line = [&](const char* label, double value_ms) {
-        char buffer[256]{};
-        std::snprintf(buffer, sizeof(buffer), "%7.2f ms", value_ms);
-        lines.push_back({label, buffer, false});
-    };
-    auto append_count_line = [&](const char* label, std::size_t value) {
-        char buffer[256]{};
-        std::snprintf(buffer, sizeof(buffer), "%8llu", static_cast<unsigned long long>(value));
-        lines.push_back({label, buffer, false});
-    };
-
-    append_ms_line("AS GPU busy:", build_info.accel_gpu_ms);
-    append_ms_line("Render GPU busy:", build_info.dispatch_gpu_ms);
-    append_ms_line("Frame CPU:", g_frame_pacing.last_render_ms);
-    append_ms_line("Frame avg:", g_frame_pacing.average_render_ms);
-    if (g_details_overlay_open) {
-        lines.push_back({"", "", true});
-        lines.push_back({"Backend:", backend_name != nullptr ? backend_name : "unknown", false});
-        append_ms_line("AS CPU total:", build_info.accel_build_ms);
-        append_ms_line("AS CPU enqueue:", build_info.accel_submit_cpu_ms);
-        append_ms_line("AS CPU wait:", build_info.accel_gpu_wait_ms);
-        append_ms_line("Render CPU total:", build_info.dispatch_ms);
-        append_ms_line("Render CPU enqueue:", build_info.dispatch_submit_cpu_ms);
-        append_ms_line("Render CPU wait:", build_info.dispatch_gpu_wait_ms);
-        append_ms_line("Readback CPU:", build_info.readback_ms);
-        append_count_line("Build tris:", build_info.triangle_count);
-        append_count_line("Build points:", build_info.point_count);
-        append_count_line("Build lines:", build_info.line_count);
-        append_count_line("Chunks:", build_info.chunk_count);
-    }
-    return lines;
+float draw_status_leaf_label(const char* label) {
+    const float tree_label_spacing = ImGui::GetTreeNodeToLabelSpacing();
+    ImGui::Indent(tree_label_spacing);
+    ImGui::TextUnformatted(label);
+    return tree_label_spacing;
 }
 
-void draw_status_overlay(const rtvdb::viewer_backend::scene_build_info &build_info, const char* backend_name) {
-    const std::vector<status_overlay_line> lines = build_status_overlay_lines(build_info, backend_name);
-    if (lines.empty()) {
+void show_status_tooltip(const char* tooltip, bool item_hovered) {
+    if (tooltip == nullptr || !item_hovered) {
+        return;
+    }
+    ImGui::BeginTooltip();
+    ImGui::PushTextWrapPos(360.0f);
+    ImGui::TextUnformatted(tooltip);
+    ImGui::PopTextWrapPos();
+    ImGui::EndTooltip();
+}
+
+void draw_status_value(const char* label, double value_ms, float value_column, const char* tooltip) {
+    const float tree_label_spacing = draw_status_leaf_label(label);
+    const bool label_hovered = ImGui::IsItemHovered();
+    ImGui::SameLine(value_column);
+    ImGui::Text("%7.2f ms", value_ms);
+    const bool value_hovered = ImGui::IsItemHovered();
+    ImGui::Unindent(tree_label_spacing);
+    show_status_tooltip(tooltip, label_hovered || value_hovered);
+}
+
+void draw_status_detail_value(const char* label, double value_ms, const char* tooltip) {
+    draw_status_value(label, value_ms, kStatusDetailsValueColumn, tooltip);
+}
+
+void draw_status_summary_value(
+    const char* label,
+    double value_ms,
+    float value_column,
+    const char* tooltip)
+{
+    draw_status_value(label, value_ms, value_column, tooltip);
+}
+
+void draw_status_summary_rate(
+    const char* label,
+    double frames_per_second,
+    float value_column,
+    const char* tooltip)
+{
+    const float tree_label_spacing = draw_status_leaf_label(label);
+    const bool label_hovered = ImGui::IsItemHovered();
+    ImGui::SameLine(value_column);
+    ImGui::Text("%7.1f fps", frames_per_second);
+    const bool value_hovered = ImGui::IsItemHovered();
+    ImGui::Unindent(tree_label_spacing);
+    show_status_tooltip(tooltip, label_hovered || value_hovered);
+}
+
+void draw_status_detail_rate(const char* label, double frames_per_second, const char* tooltip) {
+    const float tree_label_spacing = draw_status_leaf_label(label);
+    const bool label_hovered = ImGui::IsItemHovered();
+    ImGui::SameLine(kStatusDetailsValueColumn);
+    ImGui::Text("%7.1f fps", frames_per_second);
+    const bool value_hovered = ImGui::IsItemHovered();
+    ImGui::Unindent(tree_label_spacing);
+    show_status_tooltip(tooltip, label_hovered || value_hovered);
+}
+
+void draw_status_summary_count(
+    const char* label,
+    std::uint32_t count,
+    std::uint32_t target_count,
+    float value_column,
+    const char* tooltip)
+{
+    const float tree_label_spacing = draw_status_leaf_label(label);
+    const bool label_hovered = ImGui::IsItemHovered();
+    char value[32]{};
+    std::snprintf(value, sizeof(value), "%u / %u", static_cast<unsigned>(count), static_cast<unsigned>(target_count));
+    const float timing_value_right_edge =
+        value_column + ImGui::CalcTextSize("0000.00 ms").x;
+    ImGui::SameLine();
+    ImGui::SetCursorPosX(timing_value_right_edge - ImGui::CalcTextSize(value).x);
+    ImGui::TextUnformatted(value);
+    const bool value_hovered = ImGui::IsItemHovered();
+    ImGui::Unindent(tree_label_spacing);
+    show_status_tooltip(tooltip, label_hovered || value_hovered);
+}
+
+void draw_status_detail_count(const char* label, std::size_t value, const char* tooltip) {
+    const float tree_label_spacing = draw_status_leaf_label(label);
+    const bool label_hovered = ImGui::IsItemHovered();
+    ImGui::SameLine(kStatusDetailsValueColumn);
+    ImGui::Text("%8llu", static_cast<unsigned long long>(value));
+    const bool value_hovered = ImGui::IsItemHovered();
+    ImGui::Unindent(tree_label_spacing);
+    show_status_tooltip(tooltip, label_hovered || value_hovered);
+}
+
+bool begin_status_detail_group(
+    const char* id,
+    const char* label,
+    double value_ms,
+    float value_column,
+    const char* tooltip)
+{
+    const bool open = ImGui::TreeNodeEx(id, 0, "%s", label);
+    const bool label_hovered = ImGui::IsItemHovered();
+    ImGui::SameLine(value_column);
+    ImGui::Text("%7.2f ms", value_ms);
+    const bool value_hovered = ImGui::IsItemHovered();
+    show_status_tooltip(tooltip, label_hovered || value_hovered);
+    return open;
+}
+
+bool status_tree_group_is_open(const char* label) {
+    ImGuiStorage* const state_storage = ImGui::GetStateStorage();
+    return state_storage != nullptr && state_storage->GetInt(ImGui::GetID(label), 0) != 0;
+}
+
+void draw_status_overlay(const rtvdb::viewer_backend::scene_build_info &build_info) {
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    if (viewport == nullptr) {
         return;
     }
 
-    ImDrawList* draw_list = ImGui::GetForegroundDrawList();
-    const ImGuiViewport* viewport = ImGui::GetMainViewport();
-    const float line_height = ImGui::GetTextLineHeightWithSpacing();
-    const float total_height = static_cast<float>(lines.size()) * line_height;
-    constexpr float kStatusOverlayColumnGap = 8.0f;
-    float max_label_width = 0.0f;
-    float max_value_width = 0.0f;
-    for (std::size_t index = 0; index < lines.size(); ++index) {
-        if (lines[index].spacer) {
-            continue;
-        }
-        max_label_width = (std::max)(max_label_width, ImGui::CalcTextSize(lines[index].label.c_str()).x);
-        max_value_width = (std::max)(max_value_width, ImGui::CalcTextSize(lines[index].value.c_str()).x);
-    }
-    const ImVec2 button_size(18.0f, 18.0f);
-    const float overlay_width = max_label_width + kStatusOverlayColumnGap + max_value_width;
-    const float overlay_right =
-        viewport->WorkPos.x + viewport->WorkSize.x - kStatusOverlayRightPadding;
-    const ImVec2 position(
-        overlay_right - overlay_width,
-        viewport->WorkPos.y + viewport->WorkSize.y - kStatusOverlayBottomPadding - total_height
-    );
-    const ImU32 shadow_color = IM_COL32(0, 0, 0, 200);
-    const ImU32 text_color = IM_COL32(255, 255, 255, 255);
-    for (std::size_t index = 0; index < lines.size(); ++index) {
-        if (lines[index].spacer) {
-            continue;
-        }
-        const float y = position.y + static_cast<float>(index) * line_height;
-        const float label_x = overlay_right - max_value_width - kStatusOverlayColumnGap - max_label_width;
-        const float value_x = overlay_right - ImGui::CalcTextSize(lines[index].value.c_str()).x;
-        const ImVec2 label_position(label_x, y);
-        const ImVec2 value_position(value_x, y);
-        draw_list->AddText(
-            ImVec2(label_position.x + 1.0f, label_position.y + 1.0f),
-            shadow_color,
-            lines[index].label.c_str());
-        draw_list->AddText(label_position, text_color, lines[index].label.c_str());
-        draw_list->AddText(
-            ImVec2(value_position.x + 1.0f, value_position.y + 1.0f),
-            shadow_color,
-            lines[index].value.c_str());
-        draw_list->AddText(value_position, text_color, lines[index].value.c_str());
-    }
-
     ImGui::SetNextWindowPos(
-        ImVec2(position.x - button_size.x - 6.0f, position.y),
-        ImGuiCond_Always);
-    ImGui::SetNextWindowSize(button_size, ImGuiCond_Always);
-    ImGui::SetNextWindowBgAlpha(0.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+        ImVec2(
+            viewport->WorkPos.x + viewport->WorkSize.x - kStatusOverlayRightPadding,
+            viewport->WorkPos.y + viewport->WorkSize.y - kStatusOverlayBottomPadding),
+        ImGuiCond_Always,
+        ImVec2(1.0f, 1.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
     if (ImGui::Begin(
-            "status_overlay_controls",
+            "Frame timing details",
             nullptr,
-            ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
-                ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoBringToFrontOnFocus)) {
-        if (ImGui::Button(g_details_overlay_open ? "-" : "+", button_size)) {
-            g_details_overlay_open = !g_details_overlay_open;
+            ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoMove |
+                ImGuiWindowFlags_NoResize |
+                ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoBackground |
+                ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_AlwaysAutoResize)) {
+        const double render_cpu_total_ms =
+            build_info.dispatch_submit_cpu_ms +
+            build_info.dispatch_gpu_wait_ms;
+        rtvdb::viewer_shell::frame_timing shell_timing{};
+        rtvdb::viewer_shell::copy_frame_timing(&shell_timing);
+        const double frames_per_second = shell_timing.frame_interval_ms > 0.0
+            ? 1000.0 / shell_timing.frame_interval_ms
+            : 0.0;
+        const double other_pre_composition_ms = (std::max)(
+            0.0,
+            shell_timing.pre_composition_ms -
+                g_frame_pacing.last_render_ms -
+                shell_timing.idle_sleep_ms);
+        const bool details_open =
+            status_tree_group_is_open("Display cadence") ||
+            status_tree_group_is_open("CPU work") ||
+            status_tree_group_is_open("Last AS build") ||
+            status_tree_group_is_open("Scene build");
+        const float summary_value_column =
+            details_open ? kStatusDetailsValueColumn : kStatusSummaryValueColumn;
+
+        draw_status_summary_rate(
+            "Display rate",
+            frames_per_second,
+            summary_value_column,
+            "Displayed frames per second, calculated from the completed-present interval.");
+        draw_status_summary_value(
+            "Frame interval",
+            shell_timing.frame_interval_ms,
+            summary_value_column,
+            "Wall-clock interval between completed SDL presents. This is the displayed frame cadence.");
+        draw_status_summary_value(
+            "Viewer CPU",
+            g_frame_pacing.last_render_ms,
+            summary_value_column,
+            "Viewer paint callback wall-clock time, including RT submit work and command-slot reuse waits.");
+        draw_status_summary_value(
+            "RT GPU busy",
+            build_info.dispatch_gpu_ms,
+            summary_value_column,
+            "GPU timestamp duration of the latest completed ray-tracing dispatch. "
+            "It is reported asynchronously and does not include SDL composition or present.");
+        draw_status_summary_count(
+            "Accum. Count",
+            build_info.accumulation_sample_count,
+            build_info.accumulation_target_sample_count,
+            summary_value_column,
+            "Number of accumulated ray-tracing samples for the current frame. "
+            "Accumulation stops when it reaches the target count.");
+        const bool frame_pacing_open = begin_status_detail_group(
+            "Display cadence",
+            "Display cadence",
+            shell_timing.frame_interval_ms,
+            summary_value_column,
+            "The completed-present interval. Its children explain where the frame time is spent.");
+        if (frame_pacing_open) {
+            draw_status_detail_rate(
+                "Display rate",
+                shell_timing.frame_interval_ms > 0.0 ? 1000.0 / shell_timing.frame_interval_ms : 0.0,
+                "Displayed frames per second, calculated from the completed-present interval.");
+            draw_status_detail_value(
+                "Before composition",
+                shell_timing.pre_composition_ms,
+                "Time before SDL/ImGui composition. It includes paint, event/post-present work, and idle sleep.");
+            draw_status_detail_value(
+                "Idle sleep",
+                shell_timing.idle_sleep_ms,
+                "Intentional SDL_Delay when no input event or repaint is pending.");
+            draw_status_detail_value(
+                "Event/post-present",
+                other_pre_composition_ms,
+                "Remaining pre-composition time after paint and idle sleep; mainly event dispatch and post-present callbacks.");
+            draw_status_detail_value(
+                "SDL/ImGui composition",
+                shell_timing.composition_cpu_ms,
+                "CPU time building the SDL/ImGui composition before SDL_RenderPresent.");
+            draw_status_detail_value(
+                "SDL present",
+                shell_timing.present_cpu_ms,
+                "CPU time spent inside SDL_RenderPresent, including display pacing waits.");
+            ImGui::TreePop();
+        }
+        const bool cpu_work_open = begin_status_detail_group(
+            "CPU work",
+            "CPU work",
+            g_frame_pacing.last_render_ms,
+            summary_value_column,
+            "CPU work performed by the viewer paint callback. This excludes SDL/ImGui composition and present.");
+        if (cpu_work_open) {
+            draw_status_detail_value(
+                "Paint callback average",
+                g_frame_pacing.average_render_ms,
+                "Running average of Viewer CPU for the current displayed scene frame.");
+            draw_status_detail_value(
+                "RT submit + explicit wait",
+                render_cpu_total_ms,
+                "CPU time submitting RT work and explicitly waiting in the render path.");
+            draw_status_detail_value(
+                "Command-slot wait",
+                g_frame_pacing.last_command_slot_reuse_wait_ms,
+                "Time spent waiting to reuse a command slot whose prior GPU submission is unfinished.");
+            if (begin_status_detail_group(
+                    "render_cpu",
+                    "RT submit detail",
+                    render_cpu_total_ms,
+                    kStatusDetailsValueColumn,
+                    "Breakdown of RT submit + explicit wait.")) {
+                draw_status_detail_value(
+                    "Submit",
+                    build_info.dispatch_submit_cpu_ms,
+                    "CPU time spent submitting render and native texture publish work.");
+                draw_status_detail_value(
+                    "Explicit wait",
+                    build_info.dispatch_gpu_wait_ms,
+                    "CPU time spent in an explicit render-path GPU wait. Normally zero for asynchronous rendering.");
+                ImGui::TreePop();
+            }
+            draw_status_detail_value(
+                "Readback",
+                build_info.readback_ms,
+                "CPU time spent copying render output into a CPU-readable buffer. "
+                "Nonzero when a capture or readback is requested.");
+            ImGui::TreePop();
+        }
+        const bool last_as_build_open = ImGui::TreeNodeEx("Last AS build", 0);
+        show_status_tooltip(
+            "Timing from the most recent acceleration-structure build. "
+            "It is retained after the build and is not a per-frame render metric.",
+            ImGui::IsItemHovered());
+        if (last_as_build_open) {
+            draw_status_detail_value(
+                "CPU build",
+                build_info.accel_build_ms,
+                "CPU time spent preparing and recording the most recent acceleration-structure build. "
+                "Command-slot reuse waiting is reported separately.");
+            draw_status_detail_value(
+                "CPU submit",
+                build_info.accel_submit_cpu_ms,
+                "CPU time spent submitting the most recent acceleration-structure build.");
+            draw_status_detail_value(
+                "CPU explicit wait",
+                build_info.accel_gpu_wait_ms,
+                "CPU time spent in an explicit wait for the most recent acceleration-structure build.");
+            draw_status_detail_value(
+                "GPU busy",
+                build_info.accel_gpu_ms,
+                "GPU timestamp duration of the most recent acceleration-structure build.");
+            ImGui::TreePop();
+        }
+        const bool scene_build_open = ImGui::TreeNodeEx("Scene build", 0);
+        show_status_tooltip(
+            "Primitive counts of the scene used by the current build.",
+            ImGui::IsItemHovered());
+        if (scene_build_open) {
+            draw_status_detail_count("Triangles", build_info.triangle_count, "Number of triangle primitives.");
+            draw_status_detail_count(
+                "Triangle chunks",
+                build_info.triangle_chunk_count,
+                "Number of triangle chunks. Each chunk contains triangles with matching layer and visibility.");
+            draw_status_detail_count(
+                "Triangle BLAS chunk sets",
+                build_info.triangle_blas_chunk_set_count,
+                "Number of BLAS chunk sets created from triangle primitive chunks.");
+            draw_status_detail_count("Points", build_info.point_count, "Number of point primitives.");
+            draw_status_detail_count(
+                "Point chunks",
+                build_info.point_chunk_count,
+                "Number of point chunks. Each chunk contains points with matching layer and visibility.");
+            draw_status_detail_count(
+                "Point BLAS chunk sets",
+                build_info.point_blas_chunk_set_count,
+                "Number of BLAS chunk sets created from point primitive chunks.");
+            draw_status_detail_count("Lines", build_info.line_count, "Number of line primitives.");
+            draw_status_detail_count(
+                "Line chunks",
+                build_info.line_chunk_count,
+                "Number of line chunks. Each chunk contains lines with matching layer and visibility.");
+            draw_status_detail_count(
+                "Line BLAS chunk sets",
+                build_info.line_blas_chunk_set_count,
+                "Number of BLAS chunk sets created from line primitive chunks.");
+            ImGui::TreePop();
         }
     }
     ImGui::End();
@@ -2126,9 +2477,9 @@ void draw_capture_overlay() {
         return;
     }
 
-    rtvdb::viewer_backend::frame_scene scene{};
+    std::shared_ptr<const rtvdb::viewer_backend::frame_scene> scene;
     bool has_frame = false;
-    copy_effective_present_render_scene(&scene, &has_frame);
+    acquire_effective_present_render_scene(&scene, &has_frame);
     const ImVec2 button_size(124.0f, 32.0f);
     const ImVec2 panel_pos(
         viewport->WorkPos.x + kCaptureOverlayLeftPadding,
@@ -2279,6 +2630,53 @@ bool copy_effective_present_render_scene(rtvdb::viewer_backend::frame_scene* out
     return has_frame;
 }
 
+bool acquire_effective_present_render_scene(
+    std::shared_ptr<const rtvdb::viewer_backend::frame_scene>* out_scene,
+    bool* out_has_frame)
+{
+    progress_camera_animation();
+    return rtvdb::viewer_backend::acquire_present_render_scene(out_scene, out_has_frame);
+}
+
+void copy_render_scene_metadata(
+    const rtvdb::viewer_backend::frame_scene &source,
+    rtvdb::viewer_backend::frame_scene* out_scene)
+{
+    if (out_scene == nullptr) {
+        return;
+    }
+    *out_scene = {};
+    out_scene->frame_serial = source.frame_serial;
+    out_scene->connection_serial = source.connection_serial;
+    out_scene->view_revision = source.view_revision;
+    out_scene->app_name = source.app_name;
+    out_scene->camera = source.camera;
+    out_scene->camera_set_by_client = source.camera_set_by_client;
+    out_scene->projection_blend_from = source.projection_blend_from;
+    out_scene->projection_blend_to = source.projection_blend_to;
+    out_scene->projection_blend_t = source.projection_blend_t;
+}
+
+void apply_effective_camera_to_render_scene(
+    const rtvdb::viewer_backend::frame_scene &source,
+    rtvdb::viewer_backend::frame_scene* out_scene)
+{
+    copy_render_scene_metadata(source, out_scene);
+    if (out_scene == nullptr) {
+        return;
+    }
+    out_scene->projection_blend_from = out_scene->camera.projection;
+    out_scene->projection_blend_to = out_scene->camera.projection;
+    out_scene->projection_blend_t = 1.0f;
+    if (g_camera_override.active) {
+        out_scene->camera = g_camera_override.camera;
+        out_scene->projection_blend_from = g_camera_override.projection_blend_from;
+        out_scene->projection_blend_to = g_camera_override.projection_blend_to;
+        out_scene->projection_blend_t = g_camera_override.projection_blend_t;
+    }
+    out_scene->view_revision = g_camera_override.active ? g_camera_override.revision : g_view_revision;
+}
+
 void request_present_rebuild_for_auto_frame() {
     rtvdb::viewer_backend::frame_scene scene{};
     bool has_frame = false;
@@ -2286,59 +2684,6 @@ void request_present_rebuild_for_auto_frame() {
     if (has_frame) {
         rtvdb::viewer_backend::submit_scene_build(scene, true);
     }
-}
-
-void schedule_manual_capture_refresh(std::chrono::steady_clock::time_point due_time) {
-    if (!auto_capture_on_accumulation_complete_enabled()) {
-        std::scoped_lock lock(g_present_update_mutex);
-        g_pending_manual_capture_refresh = false;
-        return;
-    }
-    {
-        std::scoped_lock lock(g_present_update_mutex);
-        g_pending_manual_capture_refresh = true;
-        g_manual_capture_refresh_due_time = due_time;
-    }
-    const std::uint64_t generation = g_manual_capture_refresh_generation.fetch_add(1, std::memory_order_relaxed) + 1;
-    std::thread([generation, due_time]() {
-        std::this_thread::sleep_until(due_time);
-        if (g_manual_capture_refresh_generation.load(std::memory_order_relaxed) != generation) {
-            return;
-        }
-        bool pending_manual_capture_refresh = false;
-        {
-            std::scoped_lock lock(g_present_update_mutex);
-            pending_manual_capture_refresh = g_pending_manual_capture_refresh;
-        }
-        if (!pending_manual_capture_refresh) {
-            return;
-        }
-        request_repaint_traced("manual_capture_refresh_due", 0);
-    }).detach();
-}
-
-void schedule_async_capture_retry(
-    rtvdb::viewer_backend::frame_scene scene,
-    bool has_frame,
-    std::uint64_t frame_serial)
-{
-    if (!has_frame || !auto_capture_on_accumulation_complete_enabled()) {
-        return;
-    }
-
-    std::thread([scene = std::move(scene), has_frame, frame_serial]() mutable {
-        constexpr int kRetryCount = 6;
-        constexpr auto kRetryDelay = std::chrono::milliseconds(250);
-        for (int attempt = 0; attempt < kRetryCount; ++attempt) {
-            std::this_thread::sleep_for(kRetryDelay);
-            if (capture_scene_to_files(scene, has_frame)) {
-                capture_build_info_to_files(frame_serial);
-                schedule_post_present_capture(frame_serial, has_frame);
-                return;
-            }
-        }
-        capture_build_info_to_files(frame_serial);
-    }).detach();
 }
 
 const char* primitive_kind_label(hover_primitive_kind kind) {
@@ -2363,6 +2708,8 @@ const char* log_event_label(rtvdb::viewer_session::log_event_kind kind) {
         return "clear";
     case rtvdb::viewer_session::log_event_kind::set_camera:
         return "set_camera";
+    case rtvdb::viewer_session::log_event_kind::set_reference_grid:
+        return "set_reference_grid";
     case rtvdb::viewer_session::log_event_kind::triangle:
         return "triangle";
     case rtvdb::viewer_session::log_event_kind::triangle_batch:
@@ -2547,11 +2894,13 @@ bool try_compute_scene_fit(
     return true;
 }
 
-float keyboard_navigation_reference_scale(const rtvdb::viewer_backend::frame_scene &scene, const rtvdb::camera &camera) {
+float keyboard_navigation_reference_scale(const rtvdb::camera &camera) {
     if (rtvdb::viewer_backend::auto_frame_enabled()) {
-        primitive_focus_fit fit{};
-        if (try_compute_scene_fit(scene, &fit)) {
-            return fit.radius;
+        rtvdb::vec3 bounds_min{};
+        rtvdb::vec3 bounds_max{};
+        if (rtvdb::viewer_backend::copy_present_client_scene_bounds(&bounds_min, &bounds_max)) {
+            const rtvdb::vec3 center = (bounds_min + bounds_max) * 0.5f;
+            return (std::max)(length(bounds_max - center), 0.01f);
         }
     }
     if (g_camera_focus.active && g_camera_focus.focus_radius > 0.0f) {
@@ -2581,26 +2930,27 @@ bool adjust_camera_speed_log10(float delta) {
     return true;
 }
 
-float auto_camera_speed_multiplier(const rtvdb::viewer_backend::frame_scene &scene, const rtvdb::camera &camera) {
-    const float reference_scale = keyboard_navigation_reference_scale(scene, camera);
+float auto_camera_speed_multiplier(const rtvdb::camera &camera) {
+    const float reference_scale = keyboard_navigation_reference_scale(camera);
     const float scaled_speed = reference_scale * kKeyboardMoveSpeedDistanceScale;
     return (std::max)(scaled_speed / kKeyboardMoveSpeedMinimum, 1.0f);
 }
 
-float current_keyboard_move_speed(const rtvdb::viewer_backend::frame_scene &scene, const rtvdb::camera &camera) {
-    return kKeyboardMoveSpeedMinimum * auto_camera_speed_multiplier(scene, camera) * camera_speed_multiplier();
+float current_keyboard_move_speed(const rtvdb::camera &camera) {
+    return kKeyboardMoveSpeedMinimum * auto_camera_speed_multiplier(camera) * camera_speed_multiplier();
 }
+
+bool try_copy_effective_camera(rtvdb::camera* out_camera);
 
 bool try_compute_current_keyboard_move_speed(float* out_speed) {
     if (out_speed == nullptr) {
         return false;
     }
-    rtvdb::viewer_backend::frame_scene scene{};
-    bool has_frame = false;
-    if (!copy_effective_present_render_scene(&scene, &has_frame) || !has_frame) {
+    rtvdb::camera camera{};
+    if (!try_copy_effective_camera(&camera)) {
         return false;
     }
-    *out_speed = current_keyboard_move_speed(scene, scene.camera);
+    *out_speed = current_keyboard_move_speed(camera);
     return true;
 }
 
@@ -2608,12 +2958,12 @@ bool try_copy_effective_camera(rtvdb::camera* out_camera) {
     if (out_camera == nullptr) {
         return false;
     }
-    rtvdb::viewer_backend::frame_scene scene{};
+    std::shared_ptr<const rtvdb::viewer_backend::frame_scene> scene;
     bool has_frame = false;
-    if (!copy_effective_present_render_scene(&scene, &has_frame) || !has_frame) {
+    if (!acquire_effective_present_render_scene(&scene, &has_frame) || !has_frame || scene == nullptr) {
         return false;
     }
-    *out_camera = scene.camera;
+    *out_camera = g_camera_override.active ? g_camera_override.camera : scene->camera;
     return true;
 }
 
@@ -3109,15 +3459,31 @@ bool intersect_line(
 }
 
 void update_hover_state() {
-    if (g_camera_animation.active) {
+    if (g_camera_animation.active ||
+        g_drag.orbiting ||
+        g_drag.panning ||
+        g_keyboard_camera_input_active) {
         g_hover.has_hit = false;
         g_hover.has_normal = false;
+        g_hover_pick_pending = false;
         rtvdb::viewer_backend::set_hover_highlight({});
         return;
     }
-    rtvdb::viewer_backend::frame_scene scene{};
+    std::shared_ptr<const rtvdb::viewer_backend::frame_scene> scene_snapshot;
+    rtvdb::viewer_backend::frame_scene copied_scene{};
+    rtvdb::viewer_backend::frame_scene render_scene{};
+    const rtvdb::viewer_backend::frame_scene* scene = nullptr;
+    const rtvdb::viewer_backend::frame_scene* render_input = nullptr;
     bool has_frame = false;
-    copy_effective_present_render_scene(&scene, &has_frame);
+    if (acquire_effective_present_render_scene(&scene_snapshot, &has_frame)) {
+        scene = scene_snapshot.get();
+        apply_effective_camera_to_render_scene(*scene, &render_scene);
+        render_input = &render_scene;
+    } else {
+        copy_effective_present_render_scene(&copied_scene, &has_frame);
+        scene = &copied_scene;
+        render_input = scene;
+    }
     g_hover.has_frame = has_frame;
     if (!has_frame || !g_hover.mouse_valid) {
         g_hover.has_hit = false;
@@ -3142,34 +3508,42 @@ void update_hover_state() {
         return;
     }
 
-    rtvdb::vec3 ray_origin{};
-    rtvdb::vec3 ray_dir{};
-    if (!build_camera_ray(
-            scene,
-            width,
-            height,
-            static_cast<float>(mouse_pixel_x) + 0.5f,
-            static_cast<float>(mouse_pixel_y) + 0.5f,
-            &ray_origin,
-            &ray_dir)) {
-        return;
-    }
-
     rtvdb::viewer_backend::pick_result pick{};
-    if (!rtvdb::viewer_backend::pick(
+    const bool current_pick = rtvdb::viewer_backend::pick(
             width,
             height,
             mouse_pixel_x,
             mouse_pixel_y,
-            scene,
+            *render_input,
             has_frame,
-            &pick)) {
+            &pick);
+    if (!current_pick && !pick.completed) {
+        g_hover_pick_pending = rtvdb::viewer_backend::pick_query_pending();
+        if (g_hover_pick_pending) {
+            rtvdb::viewer_shell::request_repaint();
+        }
+        return;
+    }
+    g_hover_pick_pending = rtvdb::viewer_backend::pick_query_pending();
+    rtvdb::vec3 ray_origin{};
+    rtvdb::vec3 ray_dir{};
+    const int pick_pixel_x = pick.completed ? pick.pixel_x : mouse_pixel_x;
+    const int pick_pixel_y = pick.completed ? pick.pixel_y : mouse_pixel_y;
+    if (!build_camera_ray(
+            *render_input,
+            width,
+            height,
+            static_cast<float>(pick_pixel_x) + 0.5f,
+            static_cast<float>(pick_pixel_y) + 0.5f,
+            &ray_origin,
+            &ray_dir)) {
         return;
     }
     if (pick.kind == rtvdb::viewer_backend::hover_highlight_kind::none) {
         g_hover.has_hit = false;
         g_hover.has_normal = false;
         rtvdb::viewer_backend::set_hover_highlight({});
+        rtvdb::viewer_shell::request_repaint();
         return;
     }
 
@@ -3179,30 +3553,30 @@ void update_hover_state() {
     g_hover.hit_position = ray_origin + ray_dir * pick.distance;
     switch (pick.kind) {
     case rtvdb::viewer_backend::hover_highlight_kind::triangle:
-        if (pick.primitive_index >= scene.triangles.size()) {
+        if (pick.primitive_index >= scene->triangles.size()) {
             g_hover.has_hit = false;
             break;
         }
         g_hover.primitive_kind = hover_primitive_kind::triangle;
-        g_hover.triangle = scene.triangles[pick.primitive_index];
+        g_hover.triangle = scene->triangles[pick.primitive_index];
         g_hover.has_normal = try_compute_triangle_normal(g_hover.triangle, &g_hover.normal);
         break;
     case rtvdb::viewer_backend::hover_highlight_kind::point:
-        if (pick.primitive_index >= scene.points.size()) {
+        if (pick.primitive_index >= scene->points.size()) {
             g_hover.has_hit = false;
             break;
         }
         g_hover.primitive_kind = hover_primitive_kind::point;
-        g_hover.point = scene.points[pick.primitive_index];
+        g_hover.point = scene->points[pick.primitive_index];
         g_hover.has_normal = try_compute_point_normal(g_hover.point, g_hover.hit_position, &g_hover.normal);
         break;
     case rtvdb::viewer_backend::hover_highlight_kind::line:
-        if (pick.primitive_index >= scene.lines.size()) {
+        if (pick.primitive_index >= scene->lines.size()) {
             g_hover.has_hit = false;
             break;
         }
         g_hover.primitive_kind = hover_primitive_kind::line;
-        g_hover.line = scene.lines[pick.primitive_index];
+        g_hover.line = scene->lines[pick.primitive_index];
         g_hover.has_normal = try_compute_line_normal(g_hover.line, g_hover.hit_position, &g_hover.normal);
         break;
     case rtvdb::viewer_backend::hover_highlight_kind::none:
@@ -3211,6 +3585,7 @@ void update_hover_state() {
         break;
     }
     rtvdb::viewer_backend::set_hover_highlight(hover_backend_highlight());
+    rtvdb::viewer_shell::request_repaint();
 }
 
 void draw_scene_to_paint_context(void*) {
@@ -3218,88 +3593,70 @@ void draw_scene_to_paint_context(void*) {
         record_paint_started();
         const bool camera_animation_active = progress_camera_animation();
         const auto start = std::chrono::steady_clock::now();
+        rtvdb::viewer_backend::scene_build_info before_build_info{};
+        rtvdb::viewer_backend::copy_present_build_info(&before_build_info);
         process_pending_present_update();
-        rtvdb::viewer_backend::frame_scene scene{};
+        std::shared_ptr<const rtvdb::viewer_backend::frame_scene> scene_snapshot;
+        rtvdb::viewer_backend::frame_scene copied_scene{};
+        rtvdb::viewer_backend::frame_scene render_scene{};
+        const rtvdb::viewer_backend::frame_scene* scene = nullptr;
+        const rtvdb::viewer_backend::frame_scene* render_input = nullptr;
         bool has_frame = false;
-        copy_effective_present_render_scene(&scene, &has_frame);
+        if (acquire_effective_present_render_scene(&scene_snapshot, &has_frame)) {
+            scene = scene_snapshot.get();
+            apply_effective_camera_to_render_scene(*scene, &render_scene);
+            render_input = &render_scene;
+        } else {
+            copy_effective_present_render_scene(&copied_scene, &has_frame);
+            scene = &copied_scene;
+            render_input = scene;
+        }
         const bool auto_capture_enabled = auto_capture_on_accumulation_complete_enabled();
-        if (!auto_capture_enabled) {
-            std::scoped_lock lock(g_present_update_mutex);
-            if (g_pending_manual_capture_refresh) {
-                g_pending_manual_capture_refresh = false;
-            }
-        }
         const bool accumulation_was_in_progress = has_frame && rtvdb::viewer_backend::accumulation_in_progress();
-        bool pending_manual_capture_refresh = false;
-        {
-            std::scoped_lock lock(g_present_update_mutex);
-            pending_manual_capture_refresh = g_pending_manual_capture_refresh;
+        if (g_hover_pick_pending) {
+            update_hover_state();
         }
-        const std::uint64_t session_quiet_ms = rtvdb::viewer_session::milliseconds_since_last_change();
-        const bool session_quiet_for_auto_capture = session_quiet_ms >= kAutoCaptureSessionQuietDelayMs;
-        const bool manual_capture_refresh_due =
-            pending_manual_capture_refresh && session_quiet_for_auto_capture;
-        if (auto_capture_enabled && has_frame && pending_manual_capture_refresh && !session_quiet_for_auto_capture) {
-            schedule_manual_capture_refresh(
-                std::chrono::steady_clock::now() +
-                std::chrono::milliseconds(kAutoCaptureSessionQuietDelayMs - session_quiet_ms));
-            return;
-        }
-        const bool capture_render_pixels = manual_capture_refresh_due;
-        int displayed_render_width = 0;
-        int displayed_render_height = 0;
-        std::vector<std::uint8_t> displayed_pixels;
         show_scene_in_shell(
-            scene,
+            *render_input,
             has_frame,
-            capture_render_pixels ? &displayed_render_width : nullptr,
-            capture_render_pixels ? &displayed_render_height : nullptr,
-            capture_render_pixels ? &displayed_pixels : nullptr);
+            nullptr,
+            nullptr,
+            nullptr);
+        process_pending_manual_png_capture(*render_input, has_frame);
         if (has_frame) {
-            maybe_refresh_runtime_build_info_file(scene.frame_serial);
+            maybe_refresh_runtime_build_info_file(scene->frame_serial);
         }
         const bool accumulation_is_in_progress = has_frame && rtvdb::viewer_backend::accumulation_in_progress();
-        if (has_frame &&
-            accumulation_was_in_progress &&
-            !accumulation_is_in_progress &&
-            auto_capture_enabled) {
-            capture_scene_to_files(scene, true);
-            capture_build_info_to_files(scene.frame_serial);
-            schedule_post_present_capture(scene.frame_serial, true);
+        if (has_frame && accumulation_was_in_progress && !accumulation_is_in_progress) {
+            g_pending_completed_scene_capture = auto_capture_enabled;
         }
-        if (auto_capture_enabled && has_frame && manual_capture_refresh_due) {
-            if (displayed_render_width > 0 &&
-                displayed_render_height > 0 &&
-                !displayed_pixels.empty()) {
-                cache_render_capture(scene.frame_serial, displayed_render_width, displayed_render_height, displayed_pixels);
-                write_render_capture_files(scene.frame_serial, displayed_render_width, displayed_render_height, displayed_pixels);
+        if (has_frame && g_pending_completed_scene_capture && auto_capture_enabled) {
+            if (poll_completed_debug_render_capture(*render_input, true)) {
+                g_pending_completed_scene_capture = false;
+                schedule_post_present_capture(scene->frame_serial, true);
             } else {
-                capture_scene_to_files(scene, true);
+                request_repaint_traced("completed_scene_capture_readback", scene->frame_serial);
             }
-            capture_build_info_to_files(scene.frame_serial);
-            schedule_post_present_capture(scene.frame_serial, true);
-            {
-                std::scoped_lock lock(g_present_update_mutex);
-                g_pending_manual_capture_refresh = false;
-            }
-        } else if (has_frame && pending_manual_capture_refresh) {
-            request_repaint_traced("manual_capture_refresh_wait", scene.frame_serial);
-        } else if (!has_frame && pending_manual_capture_refresh) {
-            std::scoped_lock lock(g_present_update_mutex);
-            g_pending_manual_capture_refresh = false;
-        } else if (has_frame && continuous_render_enabled()) {
-            request_repaint_traced("continuous_render", scene.frame_serial);
+        }
+        if (has_frame && continuous_render_enabled()) {
+            request_repaint_traced("continuous_render", scene->frame_serial);
         } else if (camera_animation_active) {
-            request_repaint_traced("camera_animation", scene.frame_serial);
+            request_repaint_traced("camera_animation", scene->frame_serial);
         }
         const auto end = std::chrono::steady_clock::now();
+        rtvdb::viewer_backend::scene_build_info after_build_info{};
+        rtvdb::viewer_backend::copy_present_build_info(&after_build_info);
+        const double command_slot_reuse_wait_ms = (std::max)(
+            0.0,
+            after_build_info.command_slot_reuse_wait_ms - before_build_info.command_slot_reuse_wait_ms);
         const double elapsed_ms = std::chrono::duration<double, std::milli>(end - start).count();
-        if (g_frame_pacing.average_render_frame_serial != scene.frame_serial) {
-            g_frame_pacing.average_render_frame_serial = scene.frame_serial;
+        if (g_frame_pacing.average_render_frame_serial != scene->frame_serial) {
+            g_frame_pacing.average_render_frame_serial = scene->frame_serial;
             g_frame_pacing.average_render_frame_count = 0;
             g_frame_pacing.average_render_ms = 0.0;
         }
         g_frame_pacing.last_render_ms = elapsed_ms;
+        g_frame_pacing.last_command_slot_reuse_wait_ms = command_slot_reuse_wait_ms;
         ++g_frame_pacing.average_render_frame_count;
         if (g_frame_pacing.average_render_frame_count == 1) {
             g_frame_pacing.average_render_ms = elapsed_ms;
@@ -3309,18 +3666,10 @@ void draw_scene_to_paint_context(void*) {
                 (elapsed_ms - g_frame_pacing.average_render_ms) / frame_count;
         }
     } catch (const std::exception &exception) {
-        {
-            std::scoped_lock lock(g_present_update_mutex);
-            g_pending_manual_capture_refresh = false;
-        }
 #if defined(_WIN32)
         append_runtime_exception_line("draw_scene_to_paint_context", exception.what());
 #endif
     } catch (...) {
-        {
-            std::scoped_lock lock(g_present_update_mutex);
-            g_pending_manual_capture_refresh = false;
-        }
 #if defined(_WIN32)
         append_runtime_exception_line("draw_scene_to_paint_context", "unknown");
 #endif
@@ -3432,7 +3781,10 @@ void on_shell_shutdown(void*) {
     rtvdb::viewer_backend::shutdown_backend();
 }
 
-bool capture_scene_to_files(const rtvdb::viewer_backend::frame_scene &scene, bool has_frame) {
+bool poll_completed_debug_render_capture(
+    const rtvdb::viewer_backend::frame_scene &scene,
+    bool has_frame)
+{
     if (!has_frame) {
         return false;
     }
@@ -3440,20 +3792,17 @@ bool capture_scene_to_files(const rtvdb::viewer_backend::frame_scene &scene, boo
     int render_width = 0;
     int render_height = 0;
     current_render_size(&render_width, &render_height);
-    rtvdb::viewer_backend::set_capture_size(render_width, render_height);
 
     std::vector<std::uint8_t> pixels;
-    if (!capture_scene_to_bgra_converged(
-            render_width, render_height,
-            scene,
-            true,
+    if (!rtvdb::viewer_backend::readback_current_frame_to_bgra(
+            render_width,
+            render_height,
             &pixels) ||
         pixels.empty()) {
         return false;
     }
 
     cache_render_capture(scene.frame_serial, render_width, render_height, pixels);
-    write_render_capture_files(scene.frame_serial, render_width, render_height, pixels);
     return true;
 }
 
@@ -3520,12 +3869,6 @@ void ensure_render_capture_files_for_frame(std::uint64_t frame_serial) {
         return;
     }
 
-    rtvdb::viewer_backend::frame_scene scene{};
-    bool has_frame = false;
-    if (!copy_effective_present_render_scene(&scene, &has_frame) || !has_frame || scene.frame_serial != frame_serial) {
-        return;
-    }
-    capture_scene_to_files(scene, true);
 }
 
 void capture_window_to_files(std::uint64_t frame_serial) {
@@ -3684,6 +4027,11 @@ void capture_build_info_to_files(std::uint64_t frame_serial) {
         build_info.accel_resource_alloc_ms != 0.0 ||
         build_info.accel_build_call_record_ms != 0.0 ||
         build_info.accel_prebuild_info_ms != 0.0 ||
+        build_info.accel_chunk_blas_prebuild_info_ms != 0.0 ||
+        build_info.accel_group_blas_prebuild_info_ms != 0.0 ||
+        build_info.accel_point_blas_prebuild_info_ms != 0.0 ||
+        build_info.accel_line_blas_prebuild_info_ms != 0.0 ||
+        build_info.accel_tlas_prebuild_info_ms != 0.0 ||
         build_info.accel_tlas_instance_upload_ms != 0.0 ||
         build_info.accel_submit_cpu_ms != 0.0 ||
         build_info.accel_gpu_wait_ms != 0.0 ||
@@ -3693,7 +4041,7 @@ void capture_build_info_to_files(std::uint64_t frame_serial) {
         build_info.triangle_count != 0 ||
         build_info.point_count != 0 ||
         build_info.line_count != 0 ||
-        build_info.chunk_count != 0 ||
+        build_info.triangle_chunk_count != 0 ||
         build_info.vertex_count != 0 ||
         build_info.index_count != 0;
     {
@@ -3709,6 +4057,16 @@ void capture_build_info_to_files(std::uint64_t frame_serial) {
             build_info.accel_resource_alloc_ms = g_last_nonzero_build_info.accel_resource_alloc_ms;
             build_info.accel_build_call_record_ms = g_last_nonzero_build_info.accel_build_call_record_ms;
             build_info.accel_prebuild_info_ms = g_last_nonzero_build_info.accel_prebuild_info_ms;
+            build_info.accel_chunk_blas_prebuild_info_ms = g_last_nonzero_build_info.accel_chunk_blas_prebuild_info_ms;
+            build_info.accel_chunk_blas_prebuild_info_count = g_last_nonzero_build_info.accel_chunk_blas_prebuild_info_count;
+            build_info.accel_group_blas_prebuild_info_ms = g_last_nonzero_build_info.accel_group_blas_prebuild_info_ms;
+            build_info.accel_group_blas_prebuild_info_count = g_last_nonzero_build_info.accel_group_blas_prebuild_info_count;
+            build_info.accel_point_blas_prebuild_info_ms = g_last_nonzero_build_info.accel_point_blas_prebuild_info_ms;
+            build_info.accel_point_blas_prebuild_info_count = g_last_nonzero_build_info.accel_point_blas_prebuild_info_count;
+            build_info.accel_line_blas_prebuild_info_ms = g_last_nonzero_build_info.accel_line_blas_prebuild_info_ms;
+            build_info.accel_line_blas_prebuild_info_count = g_last_nonzero_build_info.accel_line_blas_prebuild_info_count;
+            build_info.accel_tlas_prebuild_info_ms = g_last_nonzero_build_info.accel_tlas_prebuild_info_ms;
+            build_info.accel_tlas_prebuild_info_count = g_last_nonzero_build_info.accel_tlas_prebuild_info_count;
             build_info.accel_tlas_instance_upload_ms = g_last_nonzero_build_info.accel_tlas_instance_upload_ms;
             build_info.accel_submit_cpu_ms = g_last_nonzero_build_info.accel_submit_cpu_ms;
             build_info.accel_gpu_wait_ms = g_last_nonzero_build_info.accel_gpu_wait_ms;
@@ -3727,19 +4085,27 @@ void capture_build_info_to_files(std::uint64_t frame_serial) {
     const render_diagnostics_snapshot diagnostics = capture_render_diagnostics_snapshot();
 
     auto write_one = [&](const std::wstring &path) {
-        char buffer[2048]{};
+        char buffer[3072]{};
         const int length = std::snprintf(
             buffer,
             sizeof(buffer),
             "backend_name=%s\nrevision=%llu\ntriangle_count=%llu\npoint_count=%llu\nline_count=%llu\n"
-            "chunk_count=%llu\nreused_chunk_count=%llu\nrebuilt_chunk_count=%llu\n"
+            "triangle_chunk_count=%llu\nreused_triangle_chunk_count=%llu\nrebuilt_triangle_chunk_count=%llu\n"
+            "point_chunk_count=%llu\nline_chunk_count=%llu\n"
+            "triangle_blas_group_count=%llu\npoint_blas_group_count=%llu\nline_blas_group_count=%llu\n"
             "blas_reused_count=%llu\nblas_rebuilt_count=%llu\n"
-            "blas_reused_chunk_count=%llu\nblas_rebuilt_chunk_count=%llu\n"
+            "blas_reused_triangle_chunk_count=%llu\nblas_rebuilt_triangle_chunk_count=%llu\n"
             "tlas_rebuild_count=%llu\naccel_cpu_total_ms=%.3f\n"
             "accel_host_prep_ms=%.3f\naccel_instance_build_ms=%.3f\n"
             "accel_procedural_aabb_ms=%.3f\naccel_command_record_ms=%.3f\n"
             "accel_resource_alloc_ms=%.3f\naccel_build_call_record_ms=%.3f\n"
-            "accel_prebuild_info_ms=%.3f\naccel_tlas_instance_upload_ms=%.3f\n"
+            "accel_prebuild_info_ms=%.3f\n"
+            "accel_chunk_blas_prebuild_info_ms=%.3f\naccel_chunk_blas_prebuild_info_count=%u\n"
+            "accel_group_blas_prebuild_info_ms=%.3f\naccel_group_blas_prebuild_info_count=%u\n"
+            "accel_point_blas_prebuild_info_ms=%.3f\naccel_point_blas_prebuild_info_count=%u\n"
+            "accel_line_blas_prebuild_info_ms=%.3f\naccel_line_blas_prebuild_info_count=%u\n"
+            "accel_tlas_prebuild_info_ms=%.3f\naccel_tlas_prebuild_info_count=%u\n"
+            "accel_startup_prebuild_warmup_ms=%.3f\naccel_tlas_instance_upload_ms=%.3f\n"
             "render_cpu_total_ms=%.3f\naccel_cpu_enqueue_ms=%.3f\naccel_cpu_wait_ms=%.3f\n"
             "accel_gpu_busy_ms=%.3f\n"
             "render_cpu_enqueue_ms=%.3f\nrender_cpu_wait_ms=%.3f\n"
@@ -3747,11 +4113,11 @@ void capture_build_info_to_files(std::uint64_t frame_serial) {
             "readback_ms=%.3f\naccumulation_sample_count=%u\n"
             "accumulation_target_sample_count=%u\naccumulation_in_progress=%u\n"
             "continuous_render=%u\n"
-            "render_cpu_ms=%.3f\nrender_cpu_avg_ms=%.3f\nrender_cpu_avg_frame_count=%llu\n"
+            "render_cpu_ms=%.3f\nrender_slot_reuse_wait_ms=%.3f\n"
+            "render_cpu_avg_ms=%.3f\nrender_cpu_avg_frame_count=%llu\n"
             "vertex_count=%llu\nindex_count=%llu\n"
             "render_stall_suspected=%u\nrepaint_pending=%u\ncamera_update_pending=%u\n"
             "pending_post_present_capture=%u\npost_present_capture_display_ready=%u\n"
-            "pending_manual_capture_refresh=%u\n"
             "last_render_capture_frame_serial=%llu\nlast_window_capture_frame_serial=%llu\n"
             "repaint_request_count=%llu\npaint_count=%llu\npost_present_count=%llu\nrender_submit_count=%llu\n"
             "camera_update_count=%llu\nrepaint_request_age_ms=%llu\npaint_age_ms=%llu\n"
@@ -3764,13 +4130,18 @@ void capture_build_info_to_files(std::uint64_t frame_serial) {
             static_cast<unsigned long long>(build_info.triangle_count),
             static_cast<unsigned long long>(build_info.point_count),
             static_cast<unsigned long long>(build_info.line_count),
-            static_cast<unsigned long long>(build_info.chunk_count),
-            static_cast<unsigned long long>(build_info.reused_chunk_count),
-            static_cast<unsigned long long>(build_info.rebuilt_chunk_count),
+            static_cast<unsigned long long>(build_info.triangle_chunk_count),
+            static_cast<unsigned long long>(build_info.reused_triangle_chunk_count),
+            static_cast<unsigned long long>(build_info.rebuilt_triangle_chunk_count),
+            static_cast<unsigned long long>(build_info.point_chunk_count),
+            static_cast<unsigned long long>(build_info.line_chunk_count),
+            static_cast<unsigned long long>(build_info.triangle_blas_chunk_set_count),
+            static_cast<unsigned long long>(build_info.point_blas_chunk_set_count),
+            static_cast<unsigned long long>(build_info.line_blas_chunk_set_count),
             static_cast<unsigned long long>(build_info.blas_reused_count),
             static_cast<unsigned long long>(build_info.blas_rebuilt_count),
-            static_cast<unsigned long long>(build_info.blas_reused_chunk_count),
-            static_cast<unsigned long long>(build_info.blas_rebuilt_chunk_count),
+            static_cast<unsigned long long>(build_info.blas_reused_triangle_chunk_count),
+            static_cast<unsigned long long>(build_info.blas_rebuilt_triangle_chunk_count),
             static_cast<unsigned long long>(build_info.tlas_rebuild_count),
             build_info.accel_build_ms,
             build_info.accel_host_prep_ms,
@@ -3780,6 +4151,17 @@ void capture_build_info_to_files(std::uint64_t frame_serial) {
             build_info.accel_resource_alloc_ms,
             build_info.accel_build_call_record_ms,
             build_info.accel_prebuild_info_ms,
+            build_info.accel_chunk_blas_prebuild_info_ms,
+            static_cast<unsigned>(build_info.accel_chunk_blas_prebuild_info_count),
+            build_info.accel_group_blas_prebuild_info_ms,
+            static_cast<unsigned>(build_info.accel_group_blas_prebuild_info_count),
+            build_info.accel_point_blas_prebuild_info_ms,
+            static_cast<unsigned>(build_info.accel_point_blas_prebuild_info_count),
+            build_info.accel_line_blas_prebuild_info_ms,
+            static_cast<unsigned>(build_info.accel_line_blas_prebuild_info_count),
+            build_info.accel_tlas_prebuild_info_ms,
+            static_cast<unsigned>(build_info.accel_tlas_prebuild_info_count),
+            build_info.accel_startup_prebuild_warmup_ms,
             build_info.accel_tlas_instance_upload_ms,
             build_info.dispatch_ms,
             build_info.accel_submit_cpu_ms,
@@ -3794,6 +4176,7 @@ void capture_build_info_to_files(std::uint64_t frame_serial) {
             build_info.accumulation_in_progress ? 1u : 0u,
             continuous_render_enabled() ? 1u : 0u,
             g_frame_pacing.last_render_ms,
+            g_frame_pacing.last_command_slot_reuse_wait_ms,
             g_frame_pacing.average_render_ms,
             static_cast<unsigned long long>(g_frame_pacing.average_render_frame_count),
             static_cast<unsigned long long>(build_info.vertex_count),
@@ -3803,7 +4186,6 @@ void capture_build_info_to_files(std::uint64_t frame_serial) {
             diagnostics.camera_update_pending ? 1u : 0u,
             diagnostics.pending_post_present_capture ? 1u : 0u,
             diagnostics.post_present_capture_display_ready ? 1u : 0u,
-            diagnostics.pending_manual_capture_refresh ? 1u : 0u,
             static_cast<unsigned long long>(diagnostics.last_render_capture_frame_serial),
             static_cast<unsigned long long>(diagnostics.last_window_capture_frame_serial),
             static_cast<unsigned long long>(diagnostics.repaint_request_count),
@@ -3883,13 +4265,7 @@ void process_pending_present_update() {
         if (!should_process) {
             return;
         }
-        rtvdb::viewer_backend::frame_scene scene{};
-        bool has_frame = false;
-        copy_effective_present_render_scene(&scene, &has_frame);
         update_hover_state();
-        if (auto_capture_on_accumulation_complete_enabled() && has_frame) {
-            schedule_manual_capture_refresh(std::chrono::steady_clock::now() + kManualCaptureRefreshDelay);
-        }
     } catch (const std::exception &exception) {
 #if defined(_WIN32)
         append_runtime_exception_line("process_pending_present_update", exception.what());
@@ -3960,15 +4336,13 @@ void update_present_timing() {
         request_repaint_traced("update_present_timing", 0);
     }
 }
-void refresh_present_captures() {
-    rtvdb::viewer_backend::frame_scene scene{};
+void request_present_refresh() {
+    std::shared_ptr<const rtvdb::viewer_backend::frame_scene> scene;
     bool has_frame = false;
-    copy_effective_present_render_scene(&scene, &has_frame);
-    if (!has_frame) {
+    if (!acquire_effective_present_render_scene(&scene, &has_frame) || !has_frame || scene == nullptr) {
         return;
     }
-    schedule_manual_capture_refresh(std::chrono::steady_clock::now() + kManualCaptureRefreshDelay);
-    request_repaint_traced("refresh_present_captures", scene.frame_serial);
+    request_repaint_traced("present_refresh", scene->frame_serial);
 }
 
 void request_camera_repaint() {
@@ -4086,13 +4460,6 @@ void zoom_camera(float wheel_delta) {
 }
 
 bool update_keyboard_camera() {
-    rtvdb::viewer_backend::frame_scene scene{};
-    bool has_frame = false;
-    if (!copy_effective_present_render_scene(&scene, &has_frame) || !has_frame) {
-        g_last_keyboard_navigation_tick = {};
-        return false;
-    }
-
     const bool move_forward = rtvdb::viewer_shell::key_pressed(rtvdb::viewer_shell::key_code::w);
     const bool move_backward = rtvdb::viewer_shell::key_pressed(rtvdb::viewer_shell::key_code::s);
     const bool move_left = rtvdb::viewer_shell::key_pressed(rtvdb::viewer_shell::key_code::a);
@@ -4101,7 +4468,21 @@ bool update_keyboard_camera() {
     const bool move_down = rtvdb::viewer_shell::key_pressed(rtvdb::viewer_shell::key_code::f);
     const bool tilt_left = rtvdb::viewer_shell::key_pressed(rtvdb::viewer_shell::key_code::q);
     const bool tilt_right = rtvdb::viewer_shell::key_pressed(rtvdb::viewer_shell::key_code::e);
-    if (!(move_forward || move_backward || move_left || move_right || move_down || move_up || tilt_left || tilt_right)) {
+    g_keyboard_camera_input_active =
+        move_forward || move_backward || move_left || move_right || move_down || move_up || tilt_left || tilt_right;
+    if (!g_keyboard_camera_input_active) {
+        g_last_keyboard_navigation_tick = {};
+        return false;
+    }
+
+    g_hover.has_hit = false;
+    g_hover.has_normal = false;
+    g_hover_pick_pending = false;
+    rtvdb::viewer_backend::set_hover_highlight({});
+
+    std::shared_ptr<const rtvdb::viewer_backend::frame_scene> scene;
+    bool has_frame = false;
+    if (!acquire_effective_present_render_scene(&scene, &has_frame) || !has_frame || scene == nullptr) {
         g_last_keyboard_navigation_tick = {};
         return false;
     }
@@ -4131,7 +4512,7 @@ bool update_keyboard_camera() {
     const rtvdb::vec3 right = normalize_or(cross(forward, camera.up), {1.0f, 0.0f, 0.0f});
     const rtvdb::vec3 up = normalize_or(cross(right, forward), {0.0f, 1.0f, 0.0f});
 
-    const float adjusted_move_speed = current_keyboard_move_speed(scene, camera);
+    const float adjusted_move_speed = current_keyboard_move_speed(camera);
     rtvdb::vec3 translation{};
     if (move_forward) {
         translation = translation + forward;
@@ -4559,6 +4940,9 @@ void on_frame_ready(const rtvdb::viewer_backend::frame_scene* scene, void*) {
     }
     const bool has_primitives =
         !scene->triangles.empty() || !scene->points.empty() || !scene->lines.empty();
+    if (g_launch_config.deterministic_benchmark && !has_primitives) {
+        return;
+    }
     bool force_connection_auto_frame = false;
     {
         std::scoped_lock lock(g_layer_visibility_mutex);
@@ -4592,7 +4976,7 @@ void on_frame_ready(const rtvdb::viewer_backend::frame_scene* scene, void*) {
 
 void select_display_mode(rtvdb::viewer_backend::display_mode mode) {
     rtvdb::viewer_backend::set_display_mode(mode);
-    refresh_present_captures();
+    request_present_refresh();
 }
 
 const display_mode_option* find_display_mode_option(rtvdb::viewer_backend::display_mode mode) {
@@ -4663,7 +5047,7 @@ void on_key_down(rtvdb::viewer_shell::key_code key, bool shift_pressed, void*) {
         return;
     case rtvdb::viewer_shell::key_code::keypad_3:
         if (shift_pressed) {
-            align_camera_to_axis({0.0f, 0.0f, 1.0f}, {0.0f, -1.0f, 0.0f}, "align_bottom");
+            align_camera_to_axis({0.0f, 0.0f, 1.0f}, {0.0f, 1.0f, 0.0f}, "align_bottom");
         } else {
             align_camera_to_axis({0.0f, 0.0f, -1.0f}, {0.0f, 1.0f, 0.0f}, "align_top");
         }
@@ -4698,6 +5082,10 @@ void on_mouse_move(int x, int y, void*) {
         if (std::abs(x - g_drag.press_x) >= kClickSelectionDragThresholdPixels ||
             std::abs(y - g_drag.press_y) >= kClickSelectionDragThresholdPixels) {
             g_drag.orbiting = true;
+            g_hover.has_hit = false;
+            g_hover.has_normal = false;
+            g_hover_pick_pending = false;
+            rtvdb::viewer_backend::set_hover_highlight({});
         }
     }
 
@@ -4732,6 +5120,10 @@ void on_mouse_button_down(rtvdb::viewer_shell::mouse_button button, int x, int y
     case rtvdb::viewer_shell::mouse_button::middle:
     case rtvdb::viewer_shell::mouse_button::right:
         g_drag.panning = true;
+        g_hover.has_hit = false;
+        g_hover.has_normal = false;
+        g_hover_pick_pending = false;
+        rtvdb::viewer_backend::set_hover_highlight({});
         break;
     default:
         break;
@@ -4760,7 +5152,8 @@ void on_mouse_button_up(rtvdb::viewer_shell::mouse_button button, int, int, void
         break;
     }
     if (changed) {
-        refresh_present_captures();
+        update_hover_state();
+        request_present_refresh();
     }
 }
 
@@ -4769,6 +5162,10 @@ void on_mouse_wheel(float delta, void*) {
         return;
     }
     zoom_camera(delta);
+    g_hover.has_hit = false;
+    g_hover.has_normal = false;
+    g_hover_pick_pending = false;
+    rtvdb::viewer_backend::set_hover_highlight({});
     request_camera_repaint();
 }
 
@@ -4793,17 +5190,18 @@ void on_ui(void*) {
     const bool auto_frame = rtvdb::viewer_backend::auto_frame_enabled();
 
     draw_hover_overlay();
-    draw_status_overlay(build_info, active_backend.name);
+    draw_status_overlay(build_info);
     draw_capture_overlay();
 
     rtvdb::camera effective_camera{};
-    rtvdb::viewer_backend::frame_scene effective_scene{};
+    std::shared_ptr<const rtvdb::viewer_backend::frame_scene> effective_scene;
     bool effective_scene_has_frame = false;
     const bool has_effective_camera =
-        copy_effective_present_render_scene(&effective_scene, &effective_scene_has_frame) &&
-        effective_scene_has_frame;
+        acquire_effective_present_render_scene(&effective_scene, &effective_scene_has_frame) &&
+        effective_scene_has_frame &&
+        effective_scene != nullptr;
     if (has_effective_camera) {
-        effective_camera = effective_scene.camera;
+        effective_camera = g_camera_override.active ? g_camera_override.camera : effective_scene->camera;
     }
 
     if (g_camera_control_mode == camera_control_mode::fly) {
@@ -4812,7 +5210,11 @@ void on_ui(void*) {
         ImGui::TextWrapped("Orbit: L-drag orbit, R/M-drag pan");
     }
     ImGui::Text("Wheel zoom, WASD move, R/F up/down, Q/E tilt");
-    ImGui::Text("T/G speed");
+    float keyboard_move_speed = kKeyboardMoveSpeedMinimum * camera_speed_multiplier();
+    if (has_effective_camera) {
+        keyboard_move_speed = current_keyboard_move_speed(effective_camera);
+    }
+    ImGui::Text("T/G speed (%.3f)", keyboard_move_speed);
     ImGui::Text("Double-click: focus");
     ImGui::Separator();
 
@@ -5004,7 +5406,7 @@ void on_ui(void*) {
             }
             ImGui::SameLine();
             if (ImGui::Button("-Z", ImVec2(axis_button_width, 0.0f))) {
-                align_camera_to_axis({0.0f, 0.0f, 1.0f}, {0.0f, -1.0f, 0.0f}, "align_bottom");
+                align_camera_to_axis({0.0f, 0.0f, 1.0f}, {0.0f, 1.0f, 0.0f}, "align_bottom");
                 request_camera_repaint();
             }
             const auto draw_axis_hotkey_label = [&](const char* label, int pair_index) {
@@ -5270,6 +5672,8 @@ int viewer_main(rtvdb::viewer_shell::platform_app_instance instance, int show_co
             }
         }
     }
+    rtvdb::viewer_shell::set_window_title(
+        viewer_window_title(rtvdb::viewer_backend::current_backend().kind));
     if (!launch_config.display_mode.empty()) {
         apply_initial_display_mode_from_launch_config();
     }

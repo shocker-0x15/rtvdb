@@ -95,6 +95,8 @@ bool g_imgui_sdl_initialized = false;
 bool g_imgui_renderer_initialized = false;
 std::string g_imgui_ini_path;
 std::wstring g_imgui_ini_requested_path;
+frame_timing g_frame_timing{};
+std::chrono::steady_clock::time_point g_last_present_end{};
 
 constexpr auto kResizeSettleDelay = std::chrono::milliseconds(150);
 
@@ -575,6 +577,60 @@ bool create_default_renderer(const renderer_config &config) {
     return g_renderer != nullptr;
 }
 
+void log_renderer_swapchain_configuration() {
+    if (g_renderer == nullptr) {
+        return;
+    }
+    const SDL_PropertiesID props = SDL_GetRendererProperties(g_renderer);
+    const char* renderer_name = SDL_GetRendererName(g_renderer);
+    if (props == 0 || renderer_name == nullptr) {
+        return;
+    }
+
+    if (std::strcmp(renderer_name, "vulkan") == 0) {
+        const Sint64 image_count = SDL_GetNumberProperty(
+            props,
+            SDL_PROP_RENDERER_VULKAN_SWAPCHAIN_IMAGE_COUNT_NUMBER,
+            0);
+        char line[256]{};
+        std::snprintf(
+            line,
+            sizeof(line),
+            "Shell Vulkan renderer swapchain: image_count=%lld",
+            static_cast<long long>(image_count));
+        append_startup_log(line);
+        return;
+    }
+
+#if defined(_WIN32)
+    if (std::strcmp(renderer_name, "direct3d12") == 0) {
+        IDXGISwapChain1* const swapchain = static_cast<IDXGISwapChain1*>(
+            SDL_GetPointerProperty(props, SDL_PROP_RENDERER_D3D12_SWAPCHAIN_POINTER, nullptr));
+        if (swapchain == nullptr) {
+            append_startup_log("Shell D3D12 renderer swapchain: unavailable");
+            return;
+        }
+        DXGI_SWAP_CHAIN_DESC1 desc{};
+        const HRESULT result = swapchain->GetDesc1(&desc);
+        char line[256]{};
+        if (SUCCEEDED(result)) {
+            std::snprintf(
+                line,
+                sizeof(line),
+                "Shell D3D12 renderer swapchain: buffer_count=%u",
+                static_cast<unsigned>(desc.BufferCount));
+        } else {
+            std::snprintf(
+                line,
+                sizeof(line),
+                "Shell D3D12 renderer swapchain query failed: hr=0x%08lx",
+                static_cast<unsigned long>(result));
+        }
+        append_startup_log(line);
+    }
+#endif
+}
+
 void cache_renderer_interop() {
     g_d3d12_renderer_interop = {};
     if (g_renderer == nullptr) {
@@ -675,6 +731,11 @@ void render_main_window() {
         return;
     }
 
+    const auto composition_start = std::chrono::steady_clock::now();
+    g_frame_timing.pre_composition_ms = g_last_present_end == std::chrono::steady_clock::time_point{}
+        ? 0.0
+        : std::chrono::duration<double, std::milli>(composition_start - g_last_present_end).count();
+
     ImGui_ImplSDLRenderer3_NewFrame();
     ImGui_ImplSDL3_NewFrame();
     ImGui::NewFrame();
@@ -694,7 +755,17 @@ void render_main_window() {
     if (g_callbacks.pre_present != nullptr) {
         g_callbacks.pre_present(g_callbacks.user_data);
     }
+    const auto present_start = std::chrono::steady_clock::now();
     SDL_RenderPresent(g_renderer);
+    const auto present_end = std::chrono::steady_clock::now();
+    g_frame_timing.composition_cpu_ms = std::chrono::duration<double, std::milli>(
+        present_start - composition_start).count();
+    g_frame_timing.present_cpu_ms = std::chrono::duration<double, std::milli>(
+        present_end - present_start).count();
+    g_frame_timing.frame_interval_ms = g_last_present_end == std::chrono::steady_clock::time_point{}
+        ? 0.0
+        : std::chrono::duration<double, std::milli>(present_end - g_last_present_end).count();
+    g_last_present_end = present_end;
 }
 
 void shutdown_shell() {
@@ -803,6 +874,7 @@ bool initialize_renderer(const renderer_config &config) {
 
     cache_renderer_interop();
     SDL_SetRenderVSync(g_renderer, 1);
+    log_renderer_swapchain_configuration();
     update_renderer_display_scale();
 
     if (!g_imgui_context_created) {
@@ -937,7 +1009,12 @@ void run_shell_loop() {
         }
 
         if (!handled_event && !g_dirty.load(std::memory_order_relaxed)) {
+            const auto idle_sleep_start = std::chrono::steady_clock::now();
             SDL_Delay(10);
+            g_frame_timing.idle_sleep_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - idle_sleep_start).count();
+        } else {
+            g_frame_timing.idle_sleep_ms = 0.0;
         }
     }
 
@@ -946,6 +1023,12 @@ void run_shell_loop() {
 
 void request_repaint() {
     g_dirty.store(true, std::memory_order_relaxed);
+}
+
+void set_window_title(const wchar_t* title) {
+    if (g_window != nullptr && title != nullptr) {
+        SDL_SetWindowTitle(g_window, narrow_utf8(title).c_str());
+    }
 }
 
 native_window_handle native_window() {
@@ -998,6 +1081,12 @@ bool render_coordinate_to_pixel(int x, int y, int* out_pixel_x, int* out_pixel_y
     *out_pixel_x = static_cast<int>(std::lround(static_cast<float>(x) * render_scale_x));
     *out_pixel_y = static_cast<int>(std::lround(static_cast<float>(y) * render_scale_y));
     return true;
+}
+
+void copy_frame_timing(frame_timing* out_timing) {
+    if (out_timing != nullptr) {
+        *out_timing = g_frame_timing;
+    }
 }
 
 bool key_pressed(key_code key) {

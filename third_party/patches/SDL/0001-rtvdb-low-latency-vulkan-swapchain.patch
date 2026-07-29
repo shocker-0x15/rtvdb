@@ -1,0 +1,25 @@
+From: rtvdb maintainers
+Subject: [rtvdb] Allow Vulkan renderer frame queue depth override
+
+rtvdb requests the surface minimum swapchain image count to avoid the
+additional two queued frames used by the SDL default. The build supplies
+SDL_VULKAN_FRAME_QUEUE_DEPTH=0 only for the rtvdb Vulkan RT target.
+
+---
+ src/render/vulkan/SDL_render_vulkan.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/src/render/vulkan/SDL_render_vulkan.c b/src/render/vulkan/SDL_render_vulkan.c
+index 692dea7db..b37a2de21 100644
+--- a/src/render/vulkan/SDL_render_vulkan.c
++++ b/src/render/vulkan/SDL_render_vulkan.c
+@@ -22,7 +22,9 @@
+ 
+ #ifdef SDL_VIDEO_RENDER_VULKAN
+ 
++#ifndef SDL_VULKAN_FRAME_QUEUE_DEPTH
+ #define SDL_VULKAN_FRAME_QUEUE_DEPTH            2
++#endif
+ #define SDL_VULKAN_NUM_VERTEX_BUFFERS           256
+ #define SDL_VULKAN_VERTEX_BUFFER_DEFAULT_SIZE   65536
+ #define SDL_VULKAN_CONSTANT_BUFFER_DEFAULT_SIZE 65536

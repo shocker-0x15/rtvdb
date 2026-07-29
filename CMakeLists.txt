@@ -13,7 +13,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 function(rtvdb_add_client target source)
-    add_executable(${target} "${source}")
+    add_executable(${target}
+        "${source}"
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/include/rtvdb/rtvdb.h
+    )
     set_target_properties(${target} PROPERTIES FOLDER clients)
     target_link_libraries(${target} PRIVATE rtvdb_header)
     if(WIN32)
@@ -51,6 +54,7 @@ set(RTVDB_SHADER_SHARED_HEADERS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/viewer_backend/shaders/rt_logic_shared_types.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/viewer_backend/shaders/rt_logic_shared_impl.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/viewer_backend/shaders/rt_logic_shared_core.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/viewer_backend/shaders/rt_shader_entrypoints.h
 )
 set(RTVDB_VIEWER_BACKEND_SHADER_OUTPUTS)
 
@@ -303,6 +307,10 @@ if(APPLE)
         VERBATIM
     )
     set(RTVDB_METAL_RT_GENERATED_HEADERS ${RTVDB_METAL_RT_SHADER_METALLIB_HEADER})
+    list(APPEND RTVDB_VIEWER_BACKEND_SHADER_OUTPUTS
+        ${RTVDB_METAL_RT_SHADER_AIR}
+        ${RTVDB_METAL_RT_SHADER_METALLIB}
+        ${RTVDB_METAL_RT_SHADER_METALLIB_HEADER})
 
     source_group("Shader Files" FILES ${RTVDB_METAL_RT_SHADER_MSL} ${RTVDB_METAL_SHADER_SHARED_HEADERS})
 endif()
@@ -316,7 +324,13 @@ source_group("CMake Files" FILES
 set(SDL_SHARED OFF CACHE BOOL "Build SDL shared library" FORCE)
 set(SDL_STATIC ON CACHE BOOL "Build SDL static library" FORCE)
 set(SDL_TEST_LIBRARY OFF CACHE BOOL "Build SDL test library" FORCE)
+if(RTVDB_ENABLE_VULKAN_RT)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/apply_sdl_patches.cmake)
+endif()
 add_subdirectory(third_party/SDL EXCLUDE_FROM_ALL)
+if(RTVDB_ENABLE_VULKAN_RT)
+    target_compile_definitions(SDL3-static PRIVATE SDL_VULKAN_FRAME_QUEUE_DEPTH=0)
+endif()
 if(WIN32 AND NOT RTVDB_ENABLE_D3D12_DXR AND NOT RTVDB_ENABLE_VULKAN_RT)
     message(FATAL_ERROR "rtvdb viewer now requires at least one Windows RT backend.")
 endif()
@@ -340,8 +354,22 @@ set(RTVDB_IMGUI_SOURCES
 set(RTVDB_VIEWER_BACKEND_SOURCES
     src/viewer_backend/backend.cpp
     src/viewer_backend/helper_overlay.cpp
+    src/viewer_backend/rt_backend.cpp
+    src/viewer_backend/rt_backend_common.cpp
+    src/viewer_backend/rt_device.cpp
     src/viewer_backend/rt_scene_builder.cpp
 )
+set(RTVDB_VIEWER_BACKEND_HEADERS
+    src/viewer_backend/backend.h
+    src/viewer_backend/backend_internal.h
+    src/viewer_backend/helper_overlay.h
+    src/viewer_backend/rt_backend_common.h
+    src/viewer_backend/rt_device.h
+    src/viewer_backend/rt_object_registry.h
+    src/viewer_backend/rt_rhi.h
+    src/viewer_backend/rt_scene_builder.h
+)
+list(APPEND RTVDB_VIEWER_BACKEND_SOURCES ${RTVDB_VIEWER_BACKEND_HEADERS})
 if(WIN32 AND RTVDB_ENABLE_D3D12_DXR)
     list(APPEND RTVDB_VIEWER_BACKEND_SOURCES
         src/viewer_backend/d3d12/d3d12_dxr.cpp
@@ -423,6 +451,10 @@ endif()
 set(RTVDB_VIEWER_CAPTURE_SOURCES
     src/viewer_capture/capture.cpp
 )
+set(RTVDB_VIEWER_CAPTURE_HEADERS
+    src/viewer_capture/capture.h
+    src/viewer_capture/png.h
+)
 
 set(RTVDB_VIEWER_MAIN_GROUP_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/viewer/main.cpp
@@ -430,11 +462,16 @@ set(RTVDB_VIEWER_MAIN_GROUP_FILES
 set(RTVDB_VIEWER_SOURCE_GROUP_FILES
     ${RTVDB_VIEWER_BACKEND_SOURCES}
     ${RTVDB_VIEWER_CAPTURE_SOURCES}
+    ${RTVDB_VIEWER_CAPTURE_HEADERS}
     src/viewer_capture/png.cpp
+    src/viewer_diagnostics/output.h
     src/viewer_session/session.cpp
+    src/viewer_session/session.h
     src/viewer_shell/shell_info.cpp
     src/viewer_shell/sdl3_shell.cpp
     src/viewer_shell/png_save_dialog.cpp
+    src/viewer_shell/shell_info.h
+    src/viewer_shell/shell.h
 )
 list(TRANSFORM RTVDB_VIEWER_SOURCE_GROUP_FILES PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/")
 set(RTVDB_IMGUI_GROUP_FILES ${RTVDB_IMGUI_SOURCES})
@@ -453,6 +490,18 @@ endif()
 
 source_group("Viewer" FILES ${RTVDB_VIEWER_MAIN_GROUP_FILES})
 source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR}/src PREFIX "Source Files" FILES ${RTVDB_VIEWER_SOURCE_GROUP_FILES})
+set(RTVDB_PROJECT_HEADERS
+    include/rtvdb/rtvdb.h
+    ${RTVDB_VIEWER_BACKEND_HEADERS}
+    ${RTVDB_VIEWER_CAPTURE_HEADERS}
+    src/viewer_diagnostics/output.h
+    src/viewer_session/session.h
+    src/viewer_shell/shell_info.h
+    src/viewer_shell/shell.h
+)
+list(TRANSFORM RTVDB_PROJECT_HEADERS PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/")
+source_group("Header Files" FILES ${RTVDB_PROJECT_HEADERS})
+source_group("Shader Files" FILES ${RTVDB_SHADER_SHARED_HEADERS})
 source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui PREFIX "External Libraries\\ImGui" FILES ${RTVDB_IMGUI_GROUP_FILES})
 source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/fpng PREFIX "External Libraries\\fpng" FILES ${RTVDB_FPNG_GROUP_FILES})
 if(APPLE)
@@ -461,6 +510,7 @@ endif()
 
 add_library(rtvdb_viewer_session
     src/viewer_session/session.cpp
+    src/viewer_session/session.h
 )
 target_include_directories(rtvdb_viewer_session PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(rtvdb_viewer_session PUBLIC rtvdb_viewer_backend)
@@ -472,6 +522,8 @@ add_library(rtvdb_viewer_shell
     src/viewer_shell/shell_info.cpp
     src/viewer_shell/sdl3_shell.cpp
     src/viewer_shell/png_save_dialog.cpp
+    src/viewer_shell/shell_info.h
+    src/viewer_shell/shell.h
 )
 if(APPLE)
     target_sources(rtvdb_viewer_shell PRIVATE src/viewer_shell/png_save_dialog_mac.mm)
@@ -515,6 +567,11 @@ else()
     )
 endif()
 target_sources(rtvdb_viewer PRIVATE ${RTVDB_VIEWER_CAPTURE_SOURCES})
+target_sources(rtvdb_viewer PRIVATE ${RTVDB_VIEWER_CAPTURE_HEADERS})
+target_sources(rtvdb_viewer PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/rtvdb/rtvdb.h
+    src/viewer_diagnostics/output.h
+)
 target_sources(rtvdb_viewer PRIVATE ${RTVDB_FPNG_SOURCES})
 target_sources(rtvdb_viewer PRIVATE ${RTVDB_IMGUI_SOURCES})
 target_include_directories(rtvdb_viewer PRIVATE
@@ -543,7 +600,6 @@ install(FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/LICENSE
     DESTINATION .
 )
-
 set(RTVDB_THIRD_PARTY_NOTICE_FILE
     ${CMAKE_CURRENT_BINARY_DIR}/THIRD_PARTY_NOTICES.txt
 )
@@ -596,7 +652,7 @@ install(FILES
 )
 
 install(DIRECTORY
-    ${CMAKE_CURRENT_SOURCE_DIR}/images
+    ${CMAKE_CURRENT_SOURCE_DIR}/media
     DESTINATION .
 )
 
