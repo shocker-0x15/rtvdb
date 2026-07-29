@@ -5022,13 +5022,17 @@ void on_key_down(rtvdb::viewer_shell::key_code key, bool shift_pressed, void*) {
         if (!is_display_mode_option_visible(option)) {
             continue;
         }
-        if (option.hotkey == key) {
+        if (option.hotkey != rtvdb::viewer_shell::key_code::none && option.hotkey == key) {
             select_display_mode(option.mode);
             return;
         }
     }
 
     switch (key) {
+    case rtvdb::viewer_shell::key_code::o:
+        frame_current_scene();
+        request_camera_repaint();
+        return;
     case rtvdb::viewer_shell::key_code::keypad_1:
         if (shift_pressed) {
             align_camera_to_axis({1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 1.0f}, "align_left");
@@ -5366,7 +5370,7 @@ void on_ui(void*) {
         if (ImGui::BeginTabItem("Camera")) {
             ImGui::TextUnformatted("Frame");
             ImGui::Text("Auto-frame: %s", auto_frame ? "on" : "off");
-            if (ImGui::Button("Frame Scene")) {
+            if (ImGui::Button("Frame Scene [O]")) {
                 frame_current_scene();
                 request_camera_repaint();
             }

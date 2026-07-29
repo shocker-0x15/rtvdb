@@ -457,7 +457,7 @@ set(RTVDB_VIEWER_CAPTURE_HEADERS
 )
 
 set(RTVDB_VIEWER_MAIN_GROUP_FILES
-    ${CMAKE_CURRENT_SOURCE_DIR}/viewer/main.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/viewer/main.cpp
 )
 set(RTVDB_VIEWER_SOURCE_GROUP_FILES
     ${RTVDB_VIEWER_BACKEND_SOURCES}
@@ -548,11 +548,11 @@ target_link_libraries(rtvdb_viewer_backend PRIVATE rtvdb_viewer_shell)
 
 if(WIN32)
     add_executable(rtvdb_viewer WIN32
-        viewer/main.cpp
+        src/viewer/main.cpp
     )
 elseif(APPLE)
     add_executable(rtvdb_viewer MACOSX_BUNDLE
-        viewer/main.cpp
+        src/viewer/main.cpp
     )
     set_target_properties(rtvdb_viewer PROPERTIES
         MACOSX_BUNDLE_GUI_IDENTIFIER "com.rtvdb.viewer"
@@ -563,7 +563,7 @@ elseif(APPLE)
     )
 else()
     add_executable(rtvdb_viewer
-        viewer/main.cpp
+        src/viewer/main.cpp
     )
 endif()
 target_sources(rtvdb_viewer PRIVATE ${RTVDB_VIEWER_CAPTURE_SOURCES})

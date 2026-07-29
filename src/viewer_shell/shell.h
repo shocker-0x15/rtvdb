@@ -23,6 +23,7 @@ enum class key_code {
     keypad_1,
     keypad_2,
     keypad_3,
+    o,
     t,
     g,
     p,

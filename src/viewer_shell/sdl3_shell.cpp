@@ -198,6 +198,8 @@ key_code translate_key(const SDL_Event &event) {
         return key_code::keypad_2;
     case SDLK_KP_3:
         return key_code::keypad_3;
+    case SDLK_O:
+        return key_code::o;
     case SDLK_T:
         return key_code::t;
     case SDLK_G:
