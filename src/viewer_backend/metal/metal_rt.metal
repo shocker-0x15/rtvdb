@@ -257,7 +257,9 @@ hit_info trace_triangles(
     }
 
     const uint instance_index = triangle_hit.instance_id;
-    const triangle_instance_metadata_gpu metadata = triangle_instance_metadata[instance_index];
+    const uint geometry_index = triangle_hit.geometry_id;
+    const triangle_instance_metadata_gpu metadata =
+        triangle_instance_metadata[instance_index * 4u + geometry_index];
     const uint primitive_index = metadata.first_triangle + triangle_hit.primitive_id;
     const uint index_base = metadata.index_offset + triangle_hit.primitive_id * 3u;
     const uint ia = indices[index_base + 0];
@@ -268,7 +270,7 @@ hit_info trace_triangles(
     const float3 c = float3(positions[ic]);
     result.hit = true;
     result.distance = triangle_hit.distance;
-    result.normal = normalize(cross(b - a, c - a));
+    result.normal = core::triangle_normal(a, b, c);
     result.color = triangle_colors[primitive_index];
     result.primitive_id = primitive_index;
     result.kind = 0u;

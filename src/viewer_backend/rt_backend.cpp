@@ -3,6 +3,7 @@
 #include "viewer_capture/png.h"
 #include "viewer_diagnostics/output.h"
 
+#include <chrono>
 #include <fstream>
 
 namespace rtvdb::viewer_backend {
@@ -101,16 +102,25 @@ bool execute_present(const rt_present_request &request, rt_present_result* out_r
         return false;
     }
 
+    const auto scene_snapshot_start = std::chrono::steady_clock::now();
     rt_scene_build build{};
     copy_present_render_rt_scene_build(&build);
+    const double scene_snapshot_cpu_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - scene_snapshot_start).count();
     rt_device_frame_result frame_result{};
+    rt_deferred_acceleration_submission deferred_acceleration{};
     rt_device_error error{};
     const rt_device_frame_request frame_request{&build, request.width, request.height, true, false};
-    if (!prepare_rt_device_frame(device, frame_request, &frame_result, &error)) {
+    if (!prepare_rt_device_frame(
+            device,
+            frame_request,
+            &frame_result,
+            &error,
+            &deferred_acceleration)) {
         append_rt_device_error_log("prepare_rt_device_frame", error);
         return false;
     }
-
+    const auto rt_output_prepare_start = std::chrono::steady_clock::now();
     display_mode mode = display_mode::triangle_normal;
     get_display_mode(&mode);
     const rt_accumulation_key next_key = make_rt_accumulation_key(
@@ -149,16 +159,34 @@ bool execute_present(const rt_present_request &request, rt_present_result* out_r
         !accumulation_changed &&
         !device->continuous_render &&
         device->accumulation_state.sample_count >= kRtMaxAccumulationSamples;
+    const double rt_output_prepare_cpu_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - rt_output_prepare_start).count();
 
-    if (!execute_rt_device_native_frame(device, native_request, destination, &error)) {
+    if (!execute_rt_device_native_frame(
+            device,
+            native_request,
+            destination,
+            &error,
+            &deferred_acceleration)) {
         append_rt_device_error_log("execute_rt_device_native_frame", error);
         return false;
     }
+    destination->scene_snapshot_cpu_ms = scene_snapshot_cpu_ms;
+    destination->frame_pre_acceleration_prepare_cpu_ms =
+        frame_result.pre_acceleration_prepare_cpu_ms;
+    destination->frame_post_acceleration_prepare_cpu_ms =
+        frame_result.post_acceleration_prepare_cpu_ms;
+    destination->rt_output_prepare_cpu_ms = rt_output_prepare_cpu_ms;
+    destination->acceleration_timing = frame_result.acceleration_timing;
+    const auto accumulation_finalize_start = std::chrono::steady_clock::now();
     if (native_request.dispatch == rt_dispatch_kind::render && !destination->reused_output) {
         complete_rt_device_accumulation(device, device->continuous_render);
     } else if (native_request.dispatch == rt_dispatch_kind::clear) {
         device->accumulation_state.active = false;
     }
+    destination->accumulation_finalize_cpu_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - accumulation_finalize_start).count();
+    device->last_present_result = *destination;
     return true;
 }
 

@@ -653,7 +653,8 @@ bool sync_rt_device_acceleration(
     rt_device* device,
     const rt_device_frame_request &request,
     rt_device_frame_result* out_result,
-    rt_device_error* out_error)
+    rt_device_error* out_error,
+    rt_deferred_acceleration_submission* deferred_acceleration)
 {
     if (device == nullptr || device->api == nullptr || request.acceleration_plan == nullptr ||
         request.blas_cache_plan == nullptr || request.resources == nullptr ||
@@ -685,7 +686,8 @@ bool sync_rt_device_acceleration(
             device,
             rt_queue_class::graphics,
             &encoder,
-            &stage_error)) {
+            &stage_error,
+            &out_result->acceleration_timing)) {
         if (out_error != nullptr) {
             *out_error = stage_error;
         }
@@ -697,6 +699,7 @@ bool sync_rt_device_acceleration(
         stage_error = {rt_device_operation::build_tlas, 0, {}};
         if (!device->api->create_tlas(&device->tlas, &stage_error) ||
             !device->tlas) {
+            discard_rt_commands(device, encoder);
             if (out_error != nullptr) {
                 *out_error = stage_error;
             }
@@ -807,22 +810,12 @@ bool sync_rt_device_acceleration(
     }
     summary.tlas_rebuild_count = tlas_instances.empty() ? 0 : 1;
 
-    rt_submission_token submission{};
-    stage_error = {rt_device_operation::submit_commands, 0, {}};
-    if (!submit_rt_commands(
-            device,
-            encoder,
-            &submission,
-            &out_result->acceleration_timing,
-            &stage_error)) {
-        return fail_build();
-    }
-
+    std::vector<rt_blas_handle> retired_accelerations;
     for (const std::vector<rt_blas_cache_slot> &pool : device->blas_cache_state.pools) {
         for (const rt_blas_cache_slot &slot : pool) {
             if (slot.acceleration &&
                 !rt_blas_cache_contains(cache_plan.next_state, slot.acceleration)) {
-                device->api->destroy_blas(slot.acceleration);
+                retired_accelerations.push_back(slot.acceleration);
             }
         }
     }
@@ -833,9 +826,65 @@ bool sync_rt_device_acceleration(
     out_result->tlas_rebuild_count = summary.tlas_rebuild_count;
     device->last_acceleration_revision = resources.revision;
     device->last_acceleration_summary = summary;
-    device->last_acceleration_cpu_ms = std::chrono::duration<double, std::milli>(
+    const double command_record_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - sync_start).count();
+    out_result->acceleration_timing.command_record_ms += command_record_ms;
+    device->last_acceleration_cpu_ms = command_record_ms;
+    if (deferred_acceleration != nullptr) {
+        deferred_acceleration->encoder = encoder;
+        deferred_acceleration->next_blas_cache_state = std::move(cache_plan.next_state);
+        deferred_acceleration->created_accelerations = std::move(created_accelerations);
+        deferred_acceleration->retired_accelerations = std::move(retired_accelerations);
+        deferred_acceleration->scene_revision = resources.revision;
+        return true;
+    }
+
+    rt_submission_token submission{};
+    stage_error = {rt_device_operation::submit_commands, 0, {}};
+    if (!submit_rt_commands(
+            device,
+            encoder,
+            &submission,
+            &out_result->acceleration_timing,
+            &stage_error)) {
+        return fail_build();
+    }
+    for (rt_blas_handle acceleration : retired_accelerations) {
+        device->api->destroy_blas(acceleration);
+    }
     return true;
+}
+
+void commit_deferred_acceleration_submission(
+    rt_device* device,
+    rt_deferred_acceleration_submission* deferred_acceleration)
+{
+    if (device == nullptr || device->api == nullptr || deferred_acceleration == nullptr ||
+        !deferred_acceleration->encoder) {
+        return;
+    }
+    device->blas_cache_state = std::move(deferred_acceleration->next_blas_cache_state);
+    for (rt_blas_handle acceleration : deferred_acceleration->retired_accelerations) {
+        device->api->destroy_blas(acceleration);
+    }
+    device->frame_state.scene_revision = deferred_acceleration->scene_revision;
+    device->frame_state.scene_valid = true;
+    *deferred_acceleration = {};
+}
+
+void discard_deferred_acceleration_submission(
+    rt_device* device,
+    rt_deferred_acceleration_submission* deferred_acceleration)
+{
+    if (device == nullptr || device->api == nullptr || deferred_acceleration == nullptr ||
+        !deferred_acceleration->encoder) {
+        return;
+    }
+    discard_rt_commands(device, deferred_acceleration->encoder);
+    for (rt_blas_handle acceleration : deferred_acceleration->created_accelerations) {
+        device->api->destroy_blas(acceleration);
+    }
+    *deferred_acceleration = {};
 }
 
 bool update_rt_device_bindings(
@@ -1048,7 +1097,8 @@ bool begin_rt_commands(
     rt_device* device,
     rt_queue_class queue,
     rt_command_encoder* out_encoder,
-    rt_device_error* out_error)
+    rt_device_error* out_error,
+    rt_device_timing* out_timing)
 {
     if (device == nullptr || device->api == nullptr) {
         set_missing_lifecycle_error(
@@ -1057,7 +1107,13 @@ bool begin_rt_commands(
             "RT command begin is unavailable");
         return false;
     }
-    return device->api->begin_commands(queue, out_encoder, out_error);
+    const auto begin_start = std::chrono::steady_clock::now();
+    const bool begun = device->api->begin_commands(queue, out_encoder, out_error);
+    if (out_timing != nullptr) {
+        out_timing->command_slot_wait_ms += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - begin_start).count();
+    }
+    return begun;
 }
 
 bool submit_rt_commands(
@@ -1396,13 +1452,15 @@ void end_rt_device_access(rt_device* device) {
 bool submit_rt_output_render(
     rt_device* device,
     const rt_native_frame_request &request,
+    rt_command_encoder encoder,
     rt_device_timing* out_timing,
     rt_device_error* out_error)
 {
-    rt_command_encoder encoder{};
-    if (!begin_rt_commands(device, rt_queue_class::graphics, &encoder, out_error)) {
+    if (!encoder &&
+        !begin_rt_commands(device, rt_queue_class::graphics, &encoder, out_error, out_timing)) {
         return false;
     }
+    const auto record_start = std::chrono::steady_clock::now();
     const bool recorded =
         write_rt_trace_constants(device, encoder, request.constants, out_error) &&
         transition_rt_texture(
@@ -1439,6 +1497,10 @@ bool submit_rt_output_render(
         discard_rt_commands(device, encoder);
         return false;
     }
+    if (out_timing != nullptr) {
+        out_timing->command_record_ms += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - record_start).count();
+    }
     rt_submission_token submission{};
     return submit_rt_commands(
         device,
@@ -1451,13 +1513,15 @@ bool submit_rt_output_render(
 bool submit_rt_output_clear(
     rt_device* device,
     const rt_native_frame_request &request,
+    rt_command_encoder encoder,
     rt_device_timing* out_timing,
     rt_device_error* out_error)
 {
-    rt_command_encoder encoder{};
-    if (!begin_rt_commands(device, rt_queue_class::graphics, &encoder, out_error)) {
+    if (!encoder &&
+        !begin_rt_commands(device, rt_queue_class::graphics, &encoder, out_error, out_timing)) {
         return false;
     }
+    const auto record_start = std::chrono::steady_clock::now();
     const bool recorded =
         transition_rt_texture(
             device,
@@ -1481,6 +1545,10 @@ bool submit_rt_output_clear(
         discard_rt_commands(device, encoder);
         return false;
     }
+    if (out_timing != nullptr) {
+        out_timing->command_record_ms += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - record_start).count();
+    }
     rt_submission_token submission{};
     return submit_rt_commands(
         device,
@@ -1492,13 +1560,15 @@ bool submit_rt_output_clear(
 
 bool submit_rt_reused_output(
     rt_device* device,
+    rt_command_encoder encoder,
     rt_device_timing* out_timing,
     rt_device_error* out_error)
 {
-    rt_command_encoder encoder{};
-    if (!begin_rt_commands(device, rt_queue_class::graphics, &encoder, out_error)) {
+    if (!encoder &&
+        !begin_rt_commands(device, rt_queue_class::graphics, &encoder, out_error, out_timing)) {
         return false;
     }
+    const auto record_start = std::chrono::steady_clock::now();
     if (!transition_rt_texture(
             device,
             encoder,
@@ -1507,6 +1577,10 @@ bool submit_rt_reused_output(
             out_error)) {
         discard_rt_commands(device, encoder);
         return false;
+    }
+    if (out_timing != nullptr) {
+        out_timing->command_record_ms += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - record_start).count();
     }
     rt_submission_token submission{};
     return submit_rt_commands(
@@ -1645,7 +1719,8 @@ bool execute_rt_device_native_frame(
     rt_device* device,
     const rt_native_frame_request &request,
     rt_present_result* out_result,
-    rt_device_error* out_error)
+    rt_device_error* out_error,
+    rt_deferred_acceleration_submission* deferred_acceleration)
 {
     if (out_result != nullptr) {
         *out_result = {};
@@ -1672,22 +1747,49 @@ bool execute_rt_device_native_frame(
     } else {
         if (request.build == nullptr || request.width <= 0 || request.height <= 0) {
             set_frame_error(out_error, rt_device_operation::trace_rays, "RT output dispatch request is invalid");
+            discard_deferred_acceleration_submission(device, deferred_acceleration);
             return false;
         }
         rt_device_timing dispatch_timing{};
+        const rt_command_encoder acceleration_encoder = deferred_acceleration != nullptr
+            ? deferred_acceleration->encoder
+            : rt_command_encoder{};
         if (request.reuse_output) {
-            succeeded = submit_rt_reused_output(device, &dispatch_timing, out_error);
+            succeeded = submit_rt_reused_output(
+                device,
+                acceleration_encoder,
+                &dispatch_timing,
+                out_error);
         } else if (request.dispatch == rt_dispatch_kind::render) {
-            succeeded = submit_rt_output_render(device, request, &dispatch_timing, out_error);
+            succeeded = submit_rt_output_render(
+                device,
+                request,
+                acceleration_encoder,
+                &dispatch_timing,
+                out_error);
         } else if (request.dispatch == rt_dispatch_kind::clear) {
-            succeeded = submit_rt_output_clear(device, request, &dispatch_timing, out_error);
+            succeeded = submit_rt_output_clear(
+                device,
+                request,
+                acceleration_encoder,
+                &dispatch_timing,
+                out_error);
         } else {
             set_frame_error(out_error, rt_device_operation::trace_rays, "RT output operation is invalid");
+            discard_deferred_acceleration_submission(device, deferred_acceleration);
             return false;
         }
         if (!succeeded) {
+            discard_deferred_acceleration_submission(device, deferred_acceleration);
             return false;
         }
+        if (deferred_acceleration != nullptr && deferred_acceleration->encoder) {
+            const auto acceleration_finalize_start = std::chrono::steady_clock::now();
+            commit_deferred_acceleration_submission(device, deferred_acceleration);
+            result.acceleration_finalize_cpu_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - acceleration_finalize_start).count();
+        }
+        result.output_timing = dispatch_timing;
         result.timing = dispatch_timing;
         result.reused_output = request.reuse_output;
 
@@ -1699,11 +1801,15 @@ bool execute_rt_device_native_frame(
             rt_native_texture_extension* const extension =
                 device->api->native_texture_extension();
             rt_device_timing delivery_timing{};
+            const auto native_publish_start = std::chrono::steady_clock::now();
             succeeded = extension != nullptr && extension->publish_texture(
                 device->output_texture,
                 native_desc,
                 &delivery_timing,
                 out_error);
+            result.native_publish_cpu_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - native_publish_start).count();
+            result.native_publish_timing = delivery_timing;
             result.timing.submit_cpu_ms += delivery_timing.submit_cpu_ms;
             result.timing.gpu_wait_ms += delivery_timing.gpu_wait_ms;
             result.timing.gpu_ms += delivery_timing.gpu_ms;
@@ -1926,6 +2032,28 @@ void copy_rt_device_diagnostics(scene_build_info* out_info, const rt_device &dev
         device.last_line_blas_prebuild_info_ms;
     out_info->accel_line_blas_prebuild_info_count =
         device.last_line_blas_prebuild_info_count;
+    out_info->paint_rt_scene_snapshot_ms =
+        device.last_present_result.scene_snapshot_cpu_ms;
+    out_info->paint_rt_pre_acceleration_prepare_ms =
+        device.last_present_result.frame_pre_acceleration_prepare_cpu_ms;
+    out_info->paint_as_command_slot_wait_ms =
+        device.last_present_result.acceleration_timing.command_slot_wait_ms;
+    out_info->paint_accel_command_record_ms =
+        device.last_present_result.acceleration_timing.command_record_ms;
+    out_info->paint_rt_post_acceleration_prepare_ms =
+        device.last_present_result.frame_post_acceleration_prepare_cpu_ms;
+    out_info->paint_rt_output_prepare_ms =
+        device.last_present_result.rt_output_prepare_cpu_ms;
+    out_info->paint_rt_output_command_slot_wait_ms =
+        device.last_present_result.output_timing.command_slot_wait_ms;
+    out_info->paint_rt_command_record_ms =
+        device.last_present_result.output_timing.command_record_ms;
+    out_info->paint_rt_submit_ms = device.last_present_result.output_timing.submit_cpu_ms;
+    out_info->paint_as_finalize_ms = device.last_present_result.acceleration_finalize_cpu_ms;
+    out_info->paint_native_target_publish_ms =
+        device.last_present_result.native_publish_cpu_ms;
+    out_info->paint_rt_accumulation_finalize_ms =
+        device.last_present_result.accumulation_finalize_cpu_ms;
     out_info->dispatch_submit_cpu_ms = device.last_present_result.timing.submit_cpu_ms;
     out_info->dispatch_gpu_wait_ms = device.last_present_result.timing.gpu_wait_ms;
     out_info->dispatch_gpu_ms = device.last_present_result.timing.gpu_ms;
@@ -2001,10 +2129,14 @@ bool prepare_rt_device_frame(
     rt_device* device,
     const rt_device_frame_request &request,
     rt_device_frame_result* out_result,
-    rt_device_error* out_error)
+    rt_device_error* out_error,
+    rt_deferred_acceleration_submission* deferred_acceleration)
 {
     if (out_result != nullptr) {
         *out_result = {};
+    }
+    if (deferred_acceleration != nullptr) {
+        *deferred_acceleration = {};
     }
     if (device == nullptr || device->api == nullptr) {
         set_frame_error(out_error, rt_device_operation::begin_frame, "RT device frame operations are unavailable");
@@ -2019,6 +2151,7 @@ bool prepare_rt_device_frame(
         return false;
     }
 
+    const auto preparation_start = std::chrono::steady_clock::now();
     device->frame_state.active = true;
     rt_device_frame_result result{};
     result.output_changed = request.require_output &&
@@ -2128,17 +2261,29 @@ bool prepare_rt_device_frame(
         }
     }
 
+    result.pre_acceleration_prepare_cpu_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - preparation_start).count();
+
     if (result.scene_changed &&
-        !sync_rt_device_acceleration(device, resolved_request, &result, out_error)) {
+        !sync_rt_device_acceleration(
+            device,
+            resolved_request,
+            &result,
+            out_error,
+            deferred_acceleration)) {
         device->frame_state.active = false;
         return false;
     }
     result.acceleration_changed = result.scene_changed;
-    if (result.scene_changed) {
+    if (result.scene_changed &&
+        (deferred_acceleration == nullptr || !deferred_acceleration->encoder)) {
         device->blas_cache_state = std::move(blas_cache_plan.next_state);
     }
 
+    const auto post_acceleration_prepare_start = std::chrono::steady_clock::now();
+
     if (!update_rt_device_bindings(device, resolved_request, result, out_error)) {
+        discard_deferred_acceleration_submission(device, deferred_acceleration);
         device->frame_state.active = false;
         return false;
     }
@@ -2146,6 +2291,7 @@ bool prepare_rt_device_frame(
     if (rt_scene_has_renderable_primitives(*request.build)) {
         stage_error = {rt_device_operation::create_shader_module, 0, {}};
         if (!ensure_viewer_rt_shader_modules(device, &stage_error)) {
+            discard_deferred_acceleration_submission(device, deferred_acceleration);
             device->frame_state.active = false;
             if (out_error != nullptr) {
                 *out_error = stage_error;
@@ -2164,6 +2310,7 @@ bool prepare_rt_device_frame(
                 shader_table_desc,
                 &result,
                 &stage_error)) {
+            discard_deferred_acceleration_submission(device, deferred_acceleration);
             device->frame_state.active = false;
             if (out_error != nullptr) {
                 *out_error = stage_error;
@@ -2172,8 +2319,10 @@ bool prepare_rt_device_frame(
         }
     }
 
-    device->frame_state.scene_revision = request.build->revision;
-    device->frame_state.scene_valid = true;
+    if (deferred_acceleration == nullptr || !deferred_acceleration->encoder) {
+        device->frame_state.scene_revision = request.build->revision;
+        device->frame_state.scene_valid = true;
+    }
     if (request.require_output) {
         device->frame_state.output_width = request.width;
         device->frame_state.output_height = request.height;
@@ -2181,6 +2330,8 @@ bool prepare_rt_device_frame(
     }
     ++device->frame_state.serial;
     device->frame_state.active = false;
+    result.post_acceleration_prepare_cpu_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - post_acceleration_prepare_start).count();
     if (out_result != nullptr) {
         *out_result = result;
     }

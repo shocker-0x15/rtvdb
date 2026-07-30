@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace rtvdb::viewer_backend {
 
@@ -126,6 +127,8 @@ struct rt_device_error {
 };
 
 struct rt_device_timing {
+    double command_slot_wait_ms = 0.0;
+    double command_record_ms = 0.0;
     double submit_cpu_ms = 0.0;
     double gpu_wait_ms = 0.0;
     double gpu_ms = 0.0;
@@ -135,7 +138,17 @@ struct rt_present_result {
     bool rendered = false;
     bool captured = false;
     bool reused_output = false;
+    double scene_snapshot_cpu_ms = 0.0;
+    double frame_pre_acceleration_prepare_cpu_ms = 0.0;
+    double frame_post_acceleration_prepare_cpu_ms = 0.0;
+    double rt_output_prepare_cpu_ms = 0.0;
+    double acceleration_finalize_cpu_ms = 0.0;
+    double accumulation_finalize_cpu_ms = 0.0;
+    rt_device_timing acceleration_timing{};
+    rt_device_timing output_timing{};
     rt_device_timing timing{};
+    rt_device_timing native_publish_timing{};
+    double native_publish_cpu_ms = 0.0;
     double readback_ms = 0.0;
 };
 
@@ -230,6 +243,8 @@ struct rt_device_frame_result {
     std::size_t blas_reused_triangle_chunk_count = 0;
     std::size_t blas_rebuilt_triangle_chunk_count = 0;
     std::size_t tlas_rebuild_count = 0;
+    double pre_acceleration_prepare_cpu_ms = 0.0;
+    double post_acceleration_prepare_cpu_ms = 0.0;
     rt_device_timing acceleration_timing{};
 };
 
@@ -386,6 +401,14 @@ struct rt_device_frame_state {
     bool active = false;
 };
 
+struct rt_deferred_acceleration_submission {
+    rt_command_encoder encoder{};
+    rt_blas_cache_state next_blas_cache_state{};
+    std::vector<rt_blas_handle> created_accelerations;
+    std::vector<rt_blas_handle> retired_accelerations;
+    std::uint64_t scene_revision = 0;
+};
+
 struct rt_device {
     rt_device_kind kind = rt_device_kind::d3d12_dxr;
     rt_device_capabilities capabilities{};
@@ -437,7 +460,8 @@ bool begin_rt_commands(
     rt_device* device,
     rt_queue_class queue,
     rt_command_encoder* out_encoder,
-    rt_device_error* out_error);
+    rt_device_error* out_error,
+    rt_device_timing* out_timing = nullptr);
 bool submit_rt_commands(
     rt_device* device,
     rt_command_encoder encoder,
@@ -524,7 +548,8 @@ bool execute_rt_device_native_frame(
     rt_device* device,
     const rt_native_frame_request &request,
     rt_present_result* out_result,
-    rt_device_error* out_error);
+    rt_device_error* out_error,
+    rt_deferred_acceleration_submission* deferred_acceleration = nullptr);
 bool dispatch_rt_device_pick(
     rt_device* device,
     const rt_pick_dispatch_request &request,
@@ -546,6 +571,7 @@ bool prepare_rt_device_frame(
     rt_device* device,
     const rt_device_frame_request &request,
     rt_device_frame_result* out_result,
-    rt_device_error* out_error);
+    rt_device_error* out_error,
+    rt_deferred_acceleration_submission* deferred_acceleration = nullptr);
 
 } // namespace rtvdb::viewer_backend

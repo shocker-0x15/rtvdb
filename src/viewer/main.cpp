@@ -185,8 +185,29 @@ struct drag_state {
 };
 
 struct frame_pacing_state {
+    struct paint_cpu_timing {
+        double viewer_pre_render_ms = 0.0;
+        double native_target_setup_ms = 0.0;
+        double rt_scene_snapshot_ms = 0.0;
+        double rt_pre_acceleration_prepare_ms = 0.0;
+        double as_command_slot_wait_ms = 0.0;
+        double acceleration_command_record_ms = 0.0;
+        double rt_post_acceleration_prepare_ms = 0.0;
+        double rt_output_prepare_ms = 0.0;
+        double rt_output_command_slot_wait_ms = 0.0;
+        double rt_output_command_record_ms = 0.0;
+        double rt_output_submit_ms = 0.0;
+        double as_finalize_ms = 0.0;
+        double native_target_publish_ms = 0.0;
+        double rt_accumulation_finalize_ms = 0.0;
+        double render_target_readback_ms = 0.0;
+        double viewer_post_render_ms = 0.0;
+    };
+
     double last_render_ms = 0.0;
     double last_command_slot_reuse_wait_ms = 0.0;
+    bool paint_callback_completed_since_ui = false;
+    paint_cpu_timing last_paint_cpu_timing{};
     double average_render_ms = 0.0;
     std::uint64_t average_render_frame_count = 0;
     std::uint64_t average_render_frame_serial = 0;
@@ -1125,9 +1146,7 @@ void complete_manual_png_save(bool accepted, const std::wstring &path, void*) {
     rtvdb::viewer_shell::request_repaint();
 }
 
-void process_pending_manual_png_capture(
-    const rtvdb::viewer_backend::frame_scene &scene,
-    bool has_frame)
+void process_pending_manual_png_capture(bool has_frame)
 {
     if (!g_manual_png_capture_pending || !has_frame) {
         return;
@@ -1136,13 +1155,10 @@ void process_pending_manual_png_capture(
     int render_height = kDefaultCaptureHeight;
     rtvdb::viewer_shell::render_window_size(&render_width, &render_height);
     std::vector<std::uint8_t> pixels;
-    if (!rtvdb::viewer_backend::capture_frame_to_bgra(
+    if (!rtvdb::viewer_backend::readback_current_frame_to_bgra(
             render_width,
             render_height,
-            scene,
-            true,
-            &pixels,
-            false)) {
+            &pixels)) {
         append_manual_png_save_log(true, g_manual_png_capture_path, "render capture failed");
         g_manual_png_capture_pending = false;
         g_manual_png_capture_path.clear();
@@ -1950,7 +1966,8 @@ void show_scene_in_shell(
     bool has_frame,
     int* out_render_width,
     int* out_render_height,
-    std::vector<std::uint8_t>* out_pixels);
+    std::vector<std::uint8_t>* out_pixels,
+    frame_pacing_state::paint_cpu_timing* out_timing);
 bool poll_completed_debug_render_capture(
     const rtvdb::viewer_backend::frame_scene &scene,
     bool has_frame);
@@ -2283,42 +2300,26 @@ void draw_status_overlay(const rtvdb::viewer_backend::scene_build_info &build_in
                 ImGuiWindowFlags_NoResize |
                 ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoBackground |
                 ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_AlwaysAutoResize)) {
-        const double render_cpu_total_ms =
-            build_info.dispatch_submit_cpu_ms +
-            build_info.dispatch_gpu_wait_ms;
+        const bool paint_callback_completed = g_frame_pacing.paint_callback_completed_since_ui;
+        const frame_pacing_state::paint_cpu_timing paint_timing = paint_callback_completed
+            ? g_frame_pacing.last_paint_cpu_timing
+            : frame_pacing_state::paint_cpu_timing{};
+        const double paint_cpu_work_ms = paint_callback_completed ? g_frame_pacing.last_render_ms : 0.0;
         rtvdb::viewer_shell::frame_timing shell_timing{};
         rtvdb::viewer_shell::copy_frame_timing(&shell_timing);
-        const double frames_per_second = shell_timing.frame_interval_ms > 0.0
-            ? 1000.0 / shell_timing.frame_interval_ms
-            : 0.0;
         const double other_pre_composition_ms = (std::max)(
             0.0,
             shell_timing.pre_composition_ms -
-                g_frame_pacing.last_render_ms -
+                paint_cpu_work_ms -
                 shell_timing.idle_sleep_ms);
         const bool details_open =
             status_tree_group_is_open("Display cadence") ||
-            status_tree_group_is_open("CPU work") ||
+            status_tree_group_is_open("Paint CPU Work") ||
             status_tree_group_is_open("Last AS build") ||
             status_tree_group_is_open("Scene build");
         const float summary_value_column =
             details_open ? kStatusDetailsValueColumn : kStatusSummaryValueColumn;
 
-        draw_status_summary_rate(
-            "Display rate",
-            frames_per_second,
-            summary_value_column,
-            "Displayed frames per second, calculated from the completed-present interval.");
-        draw_status_summary_value(
-            "Frame interval",
-            shell_timing.frame_interval_ms,
-            summary_value_column,
-            "Wall-clock interval between completed SDL presents. This is the displayed frame cadence.");
-        draw_status_summary_value(
-            "Viewer CPU",
-            g_frame_pacing.last_render_ms,
-            summary_value_column,
-            "Viewer paint callback wall-clock time, including RT submit work and command-slot reuse waits.");
         draw_status_summary_value(
             "RT GPU busy",
             build_info.dispatch_gpu_ms,
@@ -2366,45 +2367,103 @@ void draw_status_overlay(const rtvdb::viewer_backend::scene_build_info &build_in
             ImGui::TreePop();
         }
         const bool cpu_work_open = begin_status_detail_group(
-            "CPU work",
-            "CPU work",
-            g_frame_pacing.last_render_ms,
+            "Paint CPU Work",
+            "Paint CPU Work",
+            paint_cpu_work_ms,
             summary_value_column,
             "CPU work performed by the viewer paint callback. This excludes SDL/ImGui composition and present.");
         if (cpu_work_open) {
             draw_status_detail_value(
-                "Paint callback average",
-                g_frame_pacing.average_render_ms,
-                "Running average of Viewer CPU for the current displayed scene frame.");
+                "Viewer pre-render",
+                paint_timing.viewer_pre_render_ms,
+                "Scene selection, camera update, hover/pick processing, and other viewer work before native rendering.");
             draw_status_detail_value(
-                "RT submit + explicit wait",
-                render_cpu_total_ms,
-                "CPU time submitting RT work and explicitly waiting in the render path.");
+                "Native target setup",
+                paint_timing.native_target_setup_ms,
+                "Viewer-shell work that acquires or prepares the native texture used for this frame.");
+            const double rt_frame_preparation_ms =
+                paint_timing.rt_pre_acceleration_prepare_ms +
+                paint_timing.as_command_slot_wait_ms +
+                paint_timing.acceleration_command_record_ms +
+                paint_timing.rt_post_acceleration_prepare_ms;
+            const double rt_output_ms =
+                paint_timing.rt_output_command_slot_wait_ms +
+                paint_timing.rt_output_command_record_ms +
+                paint_timing.rt_output_submit_ms;
             draw_status_detail_value(
-                "Command-slot wait",
-                g_frame_pacing.last_command_slot_reuse_wait_ms,
-                "Time spent waiting to reuse a command slot whose prior GPU submission is unfinished.");
-            if (begin_status_detail_group(
-                    "render_cpu",
-                    "RT submit detail",
-                    render_cpu_total_ms,
-                    kStatusDetailsValueColumn,
-                    "Breakdown of RT submit + explicit wait.")) {
+                "RT scene snapshot",
+                paint_timing.rt_scene_snapshot_ms,
+                "Copies the current present scene into the RT backend build representation.");
+            const bool rt_frame_preparation_open = begin_status_detail_group(
+                "RT frame prep.",
+                "RT frame prep.",
+                rt_frame_preparation_ms,
+                kStatusDetailsValueColumn,
+                "Resource prep., optional AS work, and post-AS bindings/pipeline prep.");
+            if (rt_frame_preparation_open) {
                 draw_status_detail_value(
-                    "Submit",
-                    build_info.dispatch_submit_cpu_ms,
-                    "CPU time spent submitting render and native texture publish work.");
+                    "RT pre-AS prep.",
+                    paint_timing.rt_pre_acceleration_prepare_ms,
+                    "Resource allocation, scene-buffer upload, and acceleration-build planning before BLAS/TLAS work.");
                 draw_status_detail_value(
-                    "Explicit wait",
-                    build_info.dispatch_gpu_wait_ms,
-                    "CPU time spent in an explicit render-path GPU wait. Normally zero for asynchronous rendering.");
+                    "Command-slot wait",
+                    paint_timing.as_command_slot_wait_ms,
+                    "Waits for the shared graphics command slot before scene-change BLAS/TLAS work.");
+                draw_status_detail_value(
+                    "AS command record",
+                    paint_timing.acceleration_command_record_ms,
+                    "Scene-change BLAS/TLAS resource, prebuild, and build-command work recorded into the shared graphics encoder.");
+                draw_status_detail_value(
+                    "RT post-AS prep.",
+                    paint_timing.rt_post_acceleration_prepare_ms,
+                    "Descriptor/binding and RT pipeline preparation after acceleration-structure work.");
                 ImGui::TreePop();
             }
             draw_status_detail_value(
-                "Readback",
-                build_info.readback_ms,
-                "CPU time spent copying render output into a CPU-readable buffer. "
-                "Nonzero when a capture or readback is requested.");
+                "RT output prep.",
+                paint_timing.rt_output_prepare_ms,
+                "Per-output accumulation, display-mode, constants, and dispatch-plan setup.");
+            const bool rt_output_open = begin_status_detail_group(
+                "RT render output",
+                "RT render output",
+                rt_output_ms,
+                kStatusDetailsValueColumn,
+                "Output trace or reuse work recorded and submitted through the graphics encoder.");
+            if (rt_output_open) {
+                draw_status_detail_value(
+                    "Command-slot wait",
+                    paint_timing.rt_output_command_slot_wait_ms,
+                    "Waits for a graphics command slot when RT output has no preceding AS command encoder.");
+                draw_status_detail_value(
+                    "Command record",
+                    paint_timing.rt_output_command_record_ms,
+                    "CPU time recording the RT output operation into the graphics encoder.");
+                draw_status_detail_value(
+                    "Submit",
+                    paint_timing.rt_output_submit_ms,
+                    "CPU time submitting the shared graphics encoder that contains the AS and RT output commands.");
+                ImGui::TreePop();
+            }
+            draw_status_detail_value(
+                "AS state update",
+                paint_timing.as_finalize_ms,
+                "Commits the completed scene-change acceleration state after the shared output submission.");
+            draw_status_detail_value(
+                "Native target publish",
+                paint_timing.native_target_publish_ms,
+                "Publishes the completed RT output to the native target, including native copy/submit and shell handoff.");
+            draw_status_detail_value(
+                "RT accumulation update",
+                paint_timing.rt_accumulation_finalize_ms,
+                "Updates the RT accumulation state after the output operation completes.");
+            draw_status_detail_value(
+                "Render target readback",
+                paint_timing.render_target_readback_ms,
+                "CPU time spent reading the completed render target for a requested capture, including PNG encoding.");
+            draw_status_detail_value(
+                "Viewer post-render",
+                paint_timing.viewer_post_render_ms,
+                "Remaining paint-callback work after the timed render stages, such as capture bookkeeping and repaint scheduling.");
             ImGui::TreePop();
         }
         const bool last_as_build_open = ImGui::TreeNodeEx("Last AS build", 0);
@@ -3591,10 +3650,9 @@ void update_hover_state() {
 void draw_scene_to_paint_context(void*) {
     try {
         record_paint_started();
-        const bool camera_animation_active = progress_camera_animation();
         const auto start = std::chrono::steady_clock::now();
-        rtvdb::viewer_backend::scene_build_info before_build_info{};
-        rtvdb::viewer_backend::copy_present_build_info(&before_build_info);
+        frame_pacing_state::paint_cpu_timing paint_timing{};
+        const bool camera_animation_active = progress_camera_animation();
         process_pending_present_update();
         std::shared_ptr<const rtvdb::viewer_backend::frame_scene> scene_snapshot;
         rtvdb::viewer_backend::frame_scene copied_scene{};
@@ -3616,13 +3674,21 @@ void draw_scene_to_paint_context(void*) {
         if (g_hover_pick_pending) {
             update_hover_state();
         }
+        const auto render_start = std::chrono::steady_clock::now();
+        paint_timing.viewer_pre_render_ms = std::chrono::duration<double, std::milli>(
+            render_start - start).count();
         show_scene_in_shell(
             *render_input,
             has_frame,
             nullptr,
             nullptr,
-            nullptr);
-        process_pending_manual_png_capture(*render_input, has_frame);
+            nullptr,
+            &paint_timing);
+        const auto readback_start = std::chrono::steady_clock::now();
+        process_pending_manual_png_capture(has_frame);
+        paint_timing.render_target_readback_ms += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - readback_start).count();
+        auto viewer_post_render_start = std::chrono::steady_clock::now();
         if (has_frame) {
             maybe_refresh_runtime_build_info_file(scene->frame_serial);
         }
@@ -3631,24 +3697,27 @@ void draw_scene_to_paint_context(void*) {
             g_pending_completed_scene_capture = auto_capture_enabled;
         }
         if (has_frame && g_pending_completed_scene_capture && auto_capture_enabled) {
+            paint_timing.viewer_post_render_ms += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - viewer_post_render_start).count();
+            const auto debug_readback_start = std::chrono::steady_clock::now();
             if (poll_completed_debug_render_capture(*render_input, true)) {
                 g_pending_completed_scene_capture = false;
                 schedule_post_present_capture(scene->frame_serial, true);
             } else {
                 request_repaint_traced("completed_scene_capture_readback", scene->frame_serial);
             }
+            paint_timing.render_target_readback_ms += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - debug_readback_start).count();
+            viewer_post_render_start = std::chrono::steady_clock::now();
         }
         if (has_frame && continuous_render_enabled()) {
             request_repaint_traced("continuous_render", scene->frame_serial);
         } else if (camera_animation_active) {
             request_repaint_traced("camera_animation", scene->frame_serial);
         }
+        paint_timing.viewer_post_render_ms += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - viewer_post_render_start).count();
         const auto end = std::chrono::steady_clock::now();
-        rtvdb::viewer_backend::scene_build_info after_build_info{};
-        rtvdb::viewer_backend::copy_present_build_info(&after_build_info);
-        const double command_slot_reuse_wait_ms = (std::max)(
-            0.0,
-            after_build_info.command_slot_reuse_wait_ms - before_build_info.command_slot_reuse_wait_ms);
         const double elapsed_ms = std::chrono::duration<double, std::milli>(end - start).count();
         if (g_frame_pacing.average_render_frame_serial != scene->frame_serial) {
             g_frame_pacing.average_render_frame_serial = scene->frame_serial;
@@ -3656,7 +3725,10 @@ void draw_scene_to_paint_context(void*) {
             g_frame_pacing.average_render_ms = 0.0;
         }
         g_frame_pacing.last_render_ms = elapsed_ms;
-        g_frame_pacing.last_command_slot_reuse_wait_ms = command_slot_reuse_wait_ms;
+        g_frame_pacing.last_command_slot_reuse_wait_ms =
+            paint_timing.as_command_slot_wait_ms + paint_timing.rt_output_command_slot_wait_ms;
+        g_frame_pacing.paint_callback_completed_since_ui = true;
+        g_frame_pacing.last_paint_cpu_timing = paint_timing;
         ++g_frame_pacing.average_render_frame_count;
         if (g_frame_pacing.average_render_frame_count == 1) {
             g_frame_pacing.average_render_ms = elapsed_ms;
@@ -3681,13 +3753,20 @@ void show_scene_in_shell(
     bool has_frame,
     int* out_render_width,
     int* out_render_height,
-    std::vector<std::uint8_t>* out_pixels)
+    std::vector<std::uint8_t>* out_pixels,
+    frame_pacing_state::paint_cpu_timing* out_timing)
 {
     g_last_display_used_native_frame = false;
     if (!has_frame) {
+        const auto viewer_post_render_start = std::chrono::steady_clock::now();
         rtvdb::viewer_shell::upload_bgra_frame(0, 0, 0, nullptr);
+        if (out_timing != nullptr) {
+            out_timing->viewer_post_render_ms += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - viewer_post_render_start).count();
+        }
         return;
     }
+    auto native_target_setup_start = std::chrono::steady_clock::now();
     int render_width = 0;
     int render_height = 0;
     current_render_size(&render_width, &render_height);
@@ -3695,19 +3774,62 @@ void show_scene_in_shell(
     void* native_texture_resource = nullptr;
     bool native_target_ready = false;
     bool native_rendered = false;
+    const auto record_native_target_setup = [&]() {
+        if (out_timing != nullptr) {
+            out_timing->native_target_setup_ms += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - native_target_setup_start).count();
+        }
+        native_target_setup_start = std::chrono::steady_clock::now();
+    };
+    const auto render_native = [](const auto &render) {
+        return render();
+    };
+    const auto record_rt_timing = [out_timing]() {
+        if (out_timing == nullptr) {
+            return;
+        }
+        rtvdb::viewer_backend::scene_build_info after_build_info{};
+        rtvdb::viewer_backend::copy_present_build_info(&after_build_info);
+        out_timing->rt_scene_snapshot_ms += after_build_info.paint_rt_scene_snapshot_ms;
+        out_timing->rt_pre_acceleration_prepare_ms +=
+            after_build_info.paint_rt_pre_acceleration_prepare_ms;
+        out_timing->as_command_slot_wait_ms += after_build_info.paint_as_command_slot_wait_ms;
+        out_timing->acceleration_command_record_ms +=
+            after_build_info.paint_accel_command_record_ms;
+        out_timing->rt_post_acceleration_prepare_ms +=
+            after_build_info.paint_rt_post_acceleration_prepare_ms;
+        out_timing->rt_output_prepare_ms += after_build_info.paint_rt_output_prepare_ms;
+        out_timing->rt_output_command_slot_wait_ms +=
+            after_build_info.paint_rt_output_command_slot_wait_ms;
+        out_timing->rt_output_command_record_ms += after_build_info.paint_rt_command_record_ms;
+        out_timing->rt_output_submit_ms += after_build_info.paint_rt_submit_ms;
+        out_timing->as_finalize_ms += after_build_info.paint_as_finalize_ms;
+        out_timing->native_target_publish_ms +=
+            after_build_info.paint_native_target_publish_ms;
+        out_timing->rt_accumulation_finalize_ms +=
+            after_build_info.paint_rt_accumulation_finalize_ms;
+    };
     native_target_ready = rtvdb::viewer_shell::prepare_vulkan_frame_target(render_width, render_height);
     if (native_target_ready) {
-        native_rendered = rtvdb::viewer_backend::render_frame_to_native_vulkan_texture(
-            render_width,
-            render_height,
-            scene,
-            true,
-            &native_texture_resource);
+        record_native_target_setup();
+        native_rendered = render_native([&]() {
+            return rtvdb::viewer_backend::render_frame_to_native_vulkan_texture(
+                render_width,
+                render_height,
+                scene,
+                true,
+                &native_texture_resource);
+        });
         if (native_rendered) {
+            const auto native_publish_start = std::chrono::steady_clock::now();
             native_rendered = rtvdb::viewer_shell::set_vulkan_frame_target(
                 render_width,
                 render_height,
                 native_texture_resource);
+            if (out_timing != nullptr) {
+                out_timing->native_target_publish_ms += std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - native_publish_start).count();
+            }
         }
     }
     if (!native_rendered) {
@@ -3715,24 +3837,30 @@ void show_scene_in_shell(
         native_target_ready =
             rtvdb::viewer_shell::acquire_metal_frame_target(render_width, render_height, &native_texture_resource);
         if (native_target_ready && native_texture_resource != nullptr) {
-            native_rendered = rtvdb::viewer_backend::render_frame_to_native_metal_texture(
-                render_width,
-                render_height,
-                scene,
-                true,
-                native_texture_resource);
+            record_native_target_setup();
+            native_rendered = render_native([&]() {
+                return rtvdb::viewer_backend::render_frame_to_native_metal_texture(
+                    render_width,
+                    render_height,
+                    scene,
+                    true,
+                    native_texture_resource);
+            });
         }
 #else
         if (rtvdb::viewer_backend::native_d3d12_texture_present_supported()) {
             native_target_ready =
                 rtvdb::viewer_shell::acquire_d3d12_frame_target(render_width, render_height, &native_texture_resource);
             if (native_target_ready && native_texture_resource != nullptr) {
-                native_rendered = rtvdb::viewer_backend::render_frame_to_native_d3d12_texture(
-                    render_width,
-                    render_height,
-                    scene,
-                    true,
-                    native_texture_resource);
+                record_native_target_setup();
+                native_rendered = render_native([&]() {
+                    return rtvdb::viewer_backend::render_frame_to_native_d3d12_texture(
+                        render_width,
+                        render_height,
+                        scene,
+                        true,
+                        native_texture_resource);
+                });
             }
         }
 #endif
@@ -3740,6 +3868,8 @@ void show_scene_in_shell(
     if (native_target_ready &&
         native_texture_resource != nullptr &&
         native_rendered) {
+        const auto viewer_post_render_start = std::chrono::steady_clock::now();
+        record_rt_timing();
         g_last_display_used_native_frame = true;
         record_render_submit(scene.frame_serial, render_width, render_height, true);
         {
@@ -3770,9 +3900,21 @@ void show_scene_in_shell(
         if (rtvdb::viewer_backend::accumulation_in_progress()) {
             request_repaint_traced("native_accumulation", scene.frame_serial);
         }
+        if (out_timing != nullptr) {
+            out_timing->viewer_post_render_ms += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - viewer_post_render_start).count();
+        }
         return;
     }
+    if (out_timing != nullptr && !native_target_ready) {
+        record_native_target_setup();
+    }
+    const auto viewer_post_render_start = std::chrono::steady_clock::now();
     rtvdb::viewer_shell::upload_bgra_frame(0, 0, 0, nullptr);
+    if (out_timing != nullptr) {
+        out_timing->viewer_post_render_ms += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - viewer_post_render_start).count();
+    }
 }
 
 void on_shell_shutdown(void*) {
@@ -5195,6 +5337,7 @@ void on_ui(void*) {
 
     draw_hover_overlay();
     draw_status_overlay(build_info);
+    g_frame_pacing.paint_callback_completed_since_ui = false;
     draw_capture_overlay();
 
     rtvdb::camera effective_camera{};

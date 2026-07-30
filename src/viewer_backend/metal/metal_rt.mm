@@ -39,7 +39,6 @@ constexpr NSUInteger kTriangleInstanceMetadataBinding = 14;
 constexpr NSUInteger kPointGroupMetadataBinding = 15;
 constexpr NSUInteger kLineGroupMetadataBinding = 16;
 constexpr NSUInteger kProceduralChunkCountBinding = 17;
-constexpr std::uint32_t kBlasGroupChunkCount = 4;
 
 struct camera_gpu {
     float origin[4]{};
@@ -119,13 +118,22 @@ struct procedural_chunk_count_gpu {
     std::uint32_t line_chunk_count = 0;
 };
 
-struct triangle_chunk_blas_entry {
-    std::uint64_t fingerprint = 0;
-    std::size_t triangle_count = 0;
-    id<MTLBuffer> position_buffer = nil;
-    id<MTLBuffer> index_buffer = nil;
+struct triangle_blas_group_entry {
+    rt_blas_cache_key key{};
+    std::array<id<MTLBuffer>, kRtBlasChunkSetChunkCount> position_buffers{};
+    std::array<id<MTLBuffer>, kRtBlasChunkSetChunkCount> index_buffers{};
     id<MTLBuffer> scratch_buffer = nil;
     id<MTLAccelerationStructure> acceleration_structure = nil;
+};
+
+struct triangle_upload_chunk_key {
+    std::uint64_t fingerprint = 0;
+    std::size_t vertex_offset = 0;
+    std::size_t vertex_count = 0;
+    std::size_t index_offset = 0;
+    std::size_t index_count = 0;
+    std::size_t first_triangle = 0;
+    std::size_t triangle_count = 0;
 };
 
 struct accumulation_key {
@@ -141,11 +149,27 @@ struct accumulation_key {
 };
 
 struct command_timing {
+    double command_slot_wait_cpu_ms = 0.0;
     double command_record_cpu_ms = 0.0;
     double build_call_record_cpu_ms = 0.0;
     double submit_cpu_ms = 0.0;
     double gpu_wait_ms = 0.0;
     double gpu_ms = 0.0;
+};
+
+struct metal_paint_timing {
+    double scene_snapshot_cpu_ms = 0.0;
+    double pre_acceleration_prepare_cpu_ms = 0.0;
+    double as_command_slot_wait_cpu_ms = 0.0;
+    double accel_command_record_cpu_ms = 0.0;
+    double post_acceleration_prepare_cpu_ms = 0.0;
+    double rt_output_prepare_cpu_ms = 0.0;
+    double rt_output_command_slot_wait_cpu_ms = 0.0;
+    double rt_output_command_record_cpu_ms = 0.0;
+    double rt_submit_cpu_ms = 0.0;
+    double as_finalize_cpu_ms = 0.0;
+    double native_target_publish_cpu_ms = 0.0;
+    double accumulation_finalize_cpu_ms = 0.0;
 };
 
 enum class metal_submission_kind : std::uint8_t {
@@ -198,6 +222,12 @@ struct metal_state {
     id<MTLBuffer> triangle_geometry_index_buffer = nil;
     id<MTLBuffer> triangle_instance_index_buffer = nil;
     id<MTLBuffer> triangle_instance_metadata_buffer = nil;
+    NSUInteger position_buffer_capacity = 0;
+    NSUInteger index_buffer_capacity = 0;
+    NSUInteger triangle_color_buffer_capacity = 0;
+    NSUInteger triangle_geometry_index_buffer_capacity = 0;
+    NSUInteger triangle_instance_index_buffer_capacity = 0;
+    std::vector<triangle_upload_chunk_key> uploaded_triangle_chunks;
     id<MTLBuffer> point_buffer = nil;
     id<MTLBuffer> line_buffer = nil;
     id<MTLBuffer> point_aabb_buffer = nil;
@@ -206,7 +236,7 @@ struct metal_state {
     id<MTLBuffer> line_group_metadata_buffer = nil;
     std::uint32_t point_chunk_count = 0;
     std::uint32_t line_chunk_count = 0;
-    std::vector<triangle_chunk_blas_entry> triangle_blas_cache;
+    std::vector<triangle_blas_group_entry> triangle_blas_cache;
     std::vector<id<MTLAccelerationStructure>> triangle_scene_blas;
     id<MTLBuffer> point_blas_scratch = nil;
     id<MTLAccelerationStructure> point_blas = nil;
@@ -222,6 +252,7 @@ struct metal_state {
     std::array<metal_command_slot, kRtCommandSlotCount> command_slots{};
     std::uint64_t next_submission_serial = 1;
     bool trace_pending = false;
+    bool output_pending_present = false;
     bool pick_pending = false;
     bool pick_result_ready = false;
     metal_pick_key pending_pick{};
@@ -240,6 +271,22 @@ struct metal_state {
     NSUInteger synced_height = 0;
     std::mutex mutex;
 } g_metal;
+
+void store_metal_paint_timing(const metal_paint_timing &timing) {
+    std::scoped_lock lock(g_metal.mutex);
+    g_metal.build_info.paint_rt_scene_snapshot_ms = timing.scene_snapshot_cpu_ms;
+    g_metal.build_info.paint_rt_pre_acceleration_prepare_ms = timing.pre_acceleration_prepare_cpu_ms;
+    g_metal.build_info.paint_as_command_slot_wait_ms = timing.as_command_slot_wait_cpu_ms;
+    g_metal.build_info.paint_accel_command_record_ms = timing.accel_command_record_cpu_ms;
+    g_metal.build_info.paint_rt_post_acceleration_prepare_ms = timing.post_acceleration_prepare_cpu_ms;
+    g_metal.build_info.paint_rt_output_prepare_ms = timing.rt_output_prepare_cpu_ms;
+    g_metal.build_info.paint_rt_output_command_slot_wait_ms = timing.rt_output_command_slot_wait_cpu_ms;
+    g_metal.build_info.paint_rt_command_record_ms = timing.rt_output_command_record_cpu_ms;
+    g_metal.build_info.paint_rt_submit_ms = timing.rt_submit_cpu_ms;
+    g_metal.build_info.paint_as_finalize_ms = timing.as_finalize_cpu_ms;
+    g_metal.build_info.paint_native_target_publish_ms = timing.native_target_publish_cpu_ms;
+    g_metal.build_info.paint_rt_accumulation_finalize_ms = timing.accumulation_finalize_cpu_ms;
+}
 
 void reset_metal_state_contents() {
     g_metal.config = {};
@@ -265,6 +312,12 @@ void reset_metal_state_contents() {
     g_metal.triangle_geometry_index_buffer = nil;
     g_metal.triangle_instance_index_buffer = nil;
     g_metal.triangle_instance_metadata_buffer = nil;
+    g_metal.position_buffer_capacity = 0;
+    g_metal.index_buffer_capacity = 0;
+    g_metal.triangle_color_buffer_capacity = 0;
+    g_metal.triangle_geometry_index_buffer_capacity = 0;
+    g_metal.triangle_instance_index_buffer_capacity = 0;
+    g_metal.uploaded_triangle_chunks.clear();
     g_metal.point_buffer = nil;
     g_metal.line_buffer = nil;
     g_metal.point_aabb_buffer = nil;
@@ -296,6 +349,7 @@ void reset_metal_state_contents() {
         slot = {};
     }
     g_metal.trace_pending = false;
+    g_metal.output_pending_present = false;
     g_metal.pick_pending = false;
     g_metal.pick_result_ready = false;
     g_metal.pending_pick = {};
@@ -520,6 +574,37 @@ id<MTLBuffer> new_shared_buffer(NSUInteger length) {
     return [g_metal.device newBufferWithLength:length options:MTLResourceStorageModeShared];
 }
 
+bool ensure_shared_buffer_capacity(
+    id<MTLBuffer>* buffer,
+    NSUInteger* capacity,
+    NSUInteger required_length,
+    bool* out_reallocated)
+{
+    if (buffer == nullptr || capacity == nullptr || required_length == 0) {
+        return false;
+    }
+    if (out_reallocated != nullptr) {
+        *out_reallocated = false;
+    }
+    if (*buffer != nil && *capacity >= required_length) {
+        return true;
+    }
+    const NSUInteger grown_capacity = *capacity > 0
+        ? *capacity + *capacity / 2u
+        : required_length;
+    const NSUInteger new_capacity = (std::max)(required_length, grown_capacity);
+    id<MTLBuffer> new_buffer = new_shared_buffer(new_capacity);
+    if (new_buffer == nil) {
+        return false;
+    }
+    *buffer = new_buffer;
+    *capacity = new_capacity;
+    if (out_reallocated != nullptr) {
+        *out_reallocated = true;
+    }
+    return true;
+}
+
 bool ensure_output_buffer(int width, int height) {
     if (g_metal.device == nil || width <= 0 || height <= 0) {
         return false;
@@ -601,32 +686,6 @@ void fill_triangle_colors(const rt_scene_build &build, std::vector<rtvdb::rgba>*
                 encode_srgb_channel(va.color.b),
                 va.color.a,
             };
-        }
-    }
-}
-
-void fill_triangle_display_indices(
-    const rt_scene_build &build,
-    std::vector<std::uint32_t>* out_geometry_indices,
-    std::vector<std::uint32_t>* out_instance_indices)
-{
-    if (out_geometry_indices == nullptr || out_instance_indices == nullptr) {
-        return;
-    }
-
-    out_geometry_indices->assign(build.triangle_count, 0u);
-    out_instance_indices->assign(build.triangle_count, 0u);
-    for (std::size_t chunk_index = 0; chunk_index < build.triangle_chunks.size(); ++chunk_index) {
-        const rt_triangle_chunk &chunk = build.triangle_chunks[chunk_index];
-        const std::uint32_t geometry_index = static_cast<std::uint32_t>(chunk_index % kBlasGroupChunkCount);
-        const std::uint32_t instance_index = static_cast<std::uint32_t>(chunk_index / kBlasGroupChunkCount);
-        for (std::size_t local_triangle = 0; local_triangle < chunk.triangle_count; ++local_triangle) {
-            const std::size_t triangle_index = chunk.first_triangle + local_triangle;
-            if (triangle_index >= out_geometry_indices->size()) {
-                break;
-            }
-            (*out_geometry_indices)[triangle_index] = geometry_index;
-            (*out_instance_indices)[triangle_index] = instance_index;
         }
     }
 }
@@ -785,10 +844,10 @@ void collect_completed_metal_commands() {
             break;
         case metal_submission_kind::trace:
             g_metal.trace_pending = false;
-            g_metal.build_info.dispatch_gpu_ms += gpu_ms;
+            g_metal.output_pending_present = succeeded;
+            g_metal.build_info.dispatch_gpu_ms = gpu_ms;
             break;
         case metal_submission_kind::native_present:
-            g_metal.build_info.dispatch_gpu_ms += gpu_ms;
             break;
         case metal_submission_kind::pick:
             g_metal.pick_pending = false;
@@ -813,7 +872,11 @@ void collect_completed_metal_commands() {
     }
 }
 
-bool acquire_metal_command_slot(metal_submission_kind kind, metal_command_slot** out_slot) {
+bool acquire_metal_command_slot(
+    metal_submission_kind kind,
+    metal_command_slot** out_slot,
+    command_timing* out_timing)
+{
     if (out_slot == nullptr) {
         return false;
     }
@@ -838,8 +901,12 @@ bool acquire_metal_command_slot(metal_submission_kind kind, metal_command_slot**
     }
     const auto wait_start = std::chrono::steady_clock::now();
     [oldest->command_buffer waitUntilCompleted];
-    g_metal.build_info.command_slot_reuse_wait_ms +=
-        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wait_start).count();
+    const double wait_cpu_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - wait_start).count();
+    g_metal.build_info.command_slot_reuse_wait_ms += wait_cpu_ms;
+    if (out_timing != nullptr) {
+        out_timing->command_slot_wait_cpu_ms += wait_cpu_ms;
+    }
     collect_completed_metal_commands();
     for (metal_command_slot &slot : g_metal.command_slots) {
         if (!slot.pending) {
@@ -912,11 +979,11 @@ bool submit_acceleration_structure_build(
         return false;
     }
 
-    const auto record_start = std::chrono::steady_clock::now();
     metal_command_slot* slot = nullptr;
-    if (!acquire_metal_command_slot(metal_submission_kind::acceleration, &slot)) {
+    if (!acquire_metal_command_slot(metal_submission_kind::acceleration, &slot, out_timing)) {
         return false;
     }
+    const auto record_start = std::chrono::steady_clock::now();
     id<MTLCommandBuffer> command_buffer = [g_metal.command_queue commandBuffer];
     if (command_buffer == nil) {
         return false;
@@ -933,9 +1000,10 @@ bool submit_acceleration_structure_build(
                     scratchBufferOffset:0];
     const auto build_call_end = std::chrono::steady_clock::now();
     [encoder endEncoding];
+    const auto record_end = std::chrono::steady_clock::now();
     if (out_timing != nullptr) {
         out_timing->command_record_cpu_ms +=
-            std::chrono::duration<double, std::milli>(build_call_end - record_start).count();
+            std::chrono::duration<double, std::milli>(record_end - record_start).count();
         out_timing->build_call_record_cpu_ms +=
             std::chrono::duration<double, std::milli>(build_call_end - build_call_start).count();
     }
@@ -1059,52 +1127,166 @@ bool sync_scene_resources(const rt_scene_build &build, command_timing* out_timin
         g_metal.triangle_geometry_index_buffer = nil;
         g_metal.triangle_instance_index_buffer = nil;
         g_metal.triangle_instance_metadata_buffer = nil;
+        g_metal.position_buffer_capacity = 0;
+        g_metal.index_buffer_capacity = 0;
+        g_metal.triangle_color_buffer_capacity = 0;
+        g_metal.triangle_geometry_index_buffer_capacity = 0;
+        g_metal.triangle_instance_index_buffer_capacity = 0;
+        g_metal.uploaded_triangle_chunks.clear();
         g_metal.triangle_scene_blas.clear();
     } else {
-        std::vector<rtvdb::vec3> triangle_positions(build.vertex_count);
-        for (std::size_t i = 0; i < build.vertices.size(); ++i) {
-            triangle_positions[i] = build.vertices[i].position;
-        }
-        std::vector<rtvdb::rgba> triangle_colors;
-        std::vector<std::uint32_t> triangle_geometry_indices;
-        std::vector<std::uint32_t> triangle_instance_indices;
-        fill_triangle_colors(build, &triangle_colors);
-        fill_triangle_display_indices(build, &triangle_geometry_indices, &triangle_instance_indices);
-        g_metal.position_buffer = new_shared_buffer(
-            triangle_positions.data(),
-            static_cast<NSUInteger>(triangle_positions.size() * sizeof(rtvdb::vec3)));
-        g_metal.index_buffer = new_shared_buffer(
-            build.indices.data(),
-            static_cast<NSUInteger>(build.indices.size() * sizeof(std::uint32_t)));
-        g_metal.triangle_color_buffer = new_shared_buffer(
-            triangle_colors.data(),
-            static_cast<NSUInteger>(triangle_colors.size() * sizeof(rtvdb::rgba)));
-        g_metal.triangle_geometry_index_buffer = new_shared_buffer(
-            triangle_geometry_indices.data(),
-            static_cast<NSUInteger>(triangle_geometry_indices.size() * sizeof(std::uint32_t)));
-        g_metal.triangle_instance_index_buffer = new_shared_buffer(
-            triangle_instance_indices.data(),
-            static_cast<NSUInteger>(triangle_instance_indices.size() * sizeof(std::uint32_t)));
-        if (g_metal.position_buffer == nil ||
-            g_metal.index_buffer == nil ||
-            g_metal.triangle_color_buffer == nil ||
-            g_metal.triangle_geometry_index_buffer == nil ||
-            g_metal.triangle_instance_index_buffer == nil) {
+        rt_acceleration_build_plan acceleration_plan{};
+        if (!make_rt_acceleration_build_plan(build, &acceleration_plan)) {
             return false;
         }
+        std::vector<std::uint32_t> triangle_chunk_geometry_indices(build.triangle_chunks.size(), 0u);
+        std::vector<std::uint32_t> triangle_chunk_instance_indices(build.triangle_chunks.size(), 0u);
+        std::uint32_t triangle_instance_index = 0;
+        for (const rt_acceleration_build_item &item : acceleration_plan.items) {
+            if (item.kind != rt_acceleration_geometry_kind::triangle) {
+                continue;
+            }
+            for (std::size_t geometry_index = 0; geometry_index < item.group.chunk_count; ++geometry_index) {
+                const std::size_t chunk_index = item.group.chunk_indices[geometry_index];
+                if (chunk_index >= build.triangle_chunks.size()) {
+                    return false;
+                }
+                triangle_chunk_geometry_indices[chunk_index] = static_cast<std::uint32_t>(geometry_index);
+                triangle_chunk_instance_indices[chunk_index] = triangle_instance_index;
+            }
+            ++triangle_instance_index;
+        }
+        std::vector<triangle_upload_chunk_key> next_uploaded_chunks;
+        next_uploaded_chunks.reserve(build.triangle_chunks.size());
+        std::size_t first_changed_chunk = 0;
+        for (; first_changed_chunk < build.triangle_chunks.size() &&
+               first_changed_chunk < g_metal.uploaded_triangle_chunks.size();
+             ++first_changed_chunk) {
+            const rt_triangle_chunk &chunk = build.triangle_chunks[first_changed_chunk];
+            const triangle_upload_chunk_key &cached = g_metal.uploaded_triangle_chunks[first_changed_chunk];
+            if (cached.fingerprint != chunk.fingerprint ||
+                cached.vertex_offset != chunk.vertex_offset || cached.vertex_count != chunk.vertex_count ||
+                cached.index_offset != chunk.index_offset || cached.index_count != chunk.index_count ||
+                cached.first_triangle != chunk.first_triangle || cached.triangle_count != chunk.triangle_count) {
+                break;
+            }
+        }
+        if (first_changed_chunk == build.triangle_chunks.size() &&
+            first_changed_chunk != g_metal.uploaded_triangle_chunks.size()) {
+            first_changed_chunk = 0;
+        }
+        for (const rt_triangle_chunk &chunk : build.triangle_chunks) {
+            next_uploaded_chunks.push_back({
+                chunk.fingerprint,
+                chunk.vertex_offset,
+                chunk.vertex_count,
+                chunk.index_offset,
+                chunk.index_count,
+                chunk.first_triangle,
+                chunk.triangle_count});
+        }
+
+        bool position_reallocated = false;
+        bool index_reallocated = false;
+        bool color_reallocated = false;
+        bool geometry_index_reallocated = false;
+        bool instance_index_reallocated = false;
+        if (!ensure_shared_buffer_capacity(
+                &g_metal.position_buffer,
+                &g_metal.position_buffer_capacity,
+                static_cast<NSUInteger>(build.vertex_count * sizeof(rtvdb::vec3)),
+                &position_reallocated) ||
+            !ensure_shared_buffer_capacity(
+                &g_metal.index_buffer,
+                &g_metal.index_buffer_capacity,
+                static_cast<NSUInteger>(build.index_count * sizeof(std::uint32_t)),
+                &index_reallocated) ||
+            !ensure_shared_buffer_capacity(
+                &g_metal.triangle_color_buffer,
+                &g_metal.triangle_color_buffer_capacity,
+                static_cast<NSUInteger>(build.triangle_count * sizeof(rtvdb::rgba)),
+                &color_reallocated) ||
+            !ensure_shared_buffer_capacity(
+                &g_metal.triangle_geometry_index_buffer,
+                &g_metal.triangle_geometry_index_buffer_capacity,
+                static_cast<NSUInteger>(build.triangle_count * sizeof(std::uint32_t)),
+                &geometry_index_reallocated) ||
+            !ensure_shared_buffer_capacity(
+                &g_metal.triangle_instance_index_buffer,
+                &g_metal.triangle_instance_index_buffer_capacity,
+                static_cast<NSUInteger>(build.triangle_count * sizeof(std::uint32_t)),
+                &instance_index_reallocated)) {
+            return false;
+        }
+        if (position_reallocated || index_reallocated || color_reallocated ||
+            geometry_index_reallocated || instance_index_reallocated) {
+            first_changed_chunk = 0;
+        }
+        if (first_changed_chunk < build.triangle_chunks.size()) {
+            auto* positions = static_cast<rtvdb::vec3*>([g_metal.position_buffer contents]);
+            auto* indices = static_cast<std::uint32_t*>([g_metal.index_buffer contents]);
+            auto* colors = static_cast<rtvdb::rgba*>([g_metal.triangle_color_buffer contents]);
+            auto* geometry_indices = static_cast<std::uint32_t*>([g_metal.triangle_geometry_index_buffer contents]);
+            auto* instance_indices = static_cast<std::uint32_t*>([g_metal.triangle_instance_index_buffer contents]);
+            if (positions == nullptr || indices == nullptr || colors == nullptr ||
+                geometry_indices == nullptr || instance_indices == nullptr) {
+                return false;
+            }
+            for (std::size_t chunk_index = first_changed_chunk;
+                 chunk_index < build.triangle_chunks.size();
+                 ++chunk_index) {
+                const rt_triangle_chunk &chunk = build.triangle_chunks[chunk_index];
+                if (chunk.vertex_offset + chunk.vertex_count > build.vertices.size() ||
+                    chunk.index_offset + chunk.index_count > build.indices.size() ||
+                    chunk.first_triangle + chunk.triangle_count > build.triangle_count ||
+                    chunk.index_count != chunk.triangle_count * 3u) {
+                    return false;
+                }
+                for (std::size_t vertex_index = 0; vertex_index < chunk.vertex_count; ++vertex_index) {
+                    positions[chunk.vertex_offset + vertex_index] =
+                        build.vertices[chunk.vertex_offset + vertex_index].position;
+                }
+                std::memcpy(
+                    indices + chunk.index_offset,
+                    build.indices.data() + chunk.index_offset,
+                    chunk.index_count * sizeof(std::uint32_t));
+                const std::uint32_t geometry_index = triangle_chunk_geometry_indices[chunk_index];
+                const std::uint32_t instance_index = triangle_chunk_instance_indices[chunk_index];
+                for (std::size_t local_triangle = 0; local_triangle < chunk.triangle_count; ++local_triangle) {
+                    const std::size_t triangle_index = chunk.first_triangle + local_triangle;
+                    const std::uint32_t vertex_index = build.indices[chunk.index_offset + local_triangle * 3u];
+                    if (vertex_index >= build.vertices.size()) {
+                        return false;
+                    }
+                    const rtvdb::rgba &color = build.vertices[vertex_index].color;
+                    colors[triangle_index] = {
+                        encode_srgb_channel(color.r),
+                        encode_srgb_channel(color.g),
+                        encode_srgb_channel(color.b),
+                        color.a};
+                    geometry_indices[triangle_index] = geometry_index;
+                    instance_indices[triangle_index] = instance_index;
+                }
+            }
+        }
+        g_metal.uploaded_triangle_chunks = std::move(next_uploaded_chunks);
 
         std::vector<bool> claimed_entries(g_metal.triangle_blas_cache.size(), false);
         std::vector<triangle_instance_metadata_gpu> instance_metadata;
         g_metal.triangle_scene_blas.clear();
-        g_metal.triangle_scene_blas.reserve(build.triangle_chunks.size());
-        instance_metadata.reserve(build.triangle_chunks.size());
-        for (const rt_triangle_chunk &chunk : build.triangle_chunks) {
+        g_metal.triangle_scene_blas.reserve(acceleration_plan.triangle_item_count);
+        instance_metadata.reserve(acceleration_plan.triangle_item_count * kRtBlasChunkSetChunkCount);
+        for (const rt_acceleration_build_item &item : acceleration_plan.items) {
+            if (item.kind != rt_acceleration_geometry_kind::triangle ||
+                item.group.chunk_count == 0 || item.group.chunk_count > kRtBlasChunkSetChunkCount) {
+                continue;
+            }
+            const rt_blas_cache_key key = make_rt_blas_cache_key(item);
             std::size_t cache_index = g_metal.triangle_blas_cache.size();
             for (std::size_t i = 0; i < g_metal.triangle_blas_cache.size(); ++i) {
-                const triangle_chunk_blas_entry &candidate = g_metal.triangle_blas_cache[i];
+                const triangle_blas_group_entry &candidate = g_metal.triangle_blas_cache[i];
                 if (!claimed_entries[i] &&
-                    candidate.fingerprint == chunk.fingerprint &&
-                    candidate.triangle_count == chunk.triangle_count &&
+                    rt_blas_cache_key_equals(candidate.key, key) &&
                     candidate.acceleration_structure != nil) {
                     cache_index = i;
                     break;
@@ -1123,46 +1305,48 @@ bool sync_scene_resources(const rt_scene_build &build, command_timing* out_timin
                 claimed_entries.push_back(false);
             }
 
-            triangle_chunk_blas_entry &entry = g_metal.triangle_blas_cache[cache_index];
+            triangle_blas_group_entry &entry = g_metal.triangle_blas_cache[cache_index];
             const bool reusable =
-                entry.fingerprint == chunk.fingerprint &&
-                entry.triangle_count == chunk.triangle_count &&
+                rt_blas_cache_key_equals(entry.key, key) &&
                 entry.acceleration_structure != nil;
             if (!reusable) {
-                std::vector<rtvdb::vec3> local_positions(chunk.vertex_count);
-                for (std::size_t i = 0; i < chunk.vertex_count; ++i) {
-                    local_positions[i] = build.vertices[chunk.vertex_offset + i].position;
-                }
-                std::vector<std::uint32_t> local_indices(chunk.index_count);
-                for (std::size_t i = 0; i < chunk.index_count; ++i) {
-                    local_indices[i] = build.indices[chunk.index_offset + i] -
-                        static_cast<std::uint32_t>(chunk.vertex_offset);
-                }
-                entry.position_buffer = new_shared_buffer(
-                    local_positions.data(),
-                    static_cast<NSUInteger>(local_positions.size() * sizeof(rtvdb::vec3)));
-                entry.index_buffer = new_shared_buffer(
-                    local_indices.data(),
-                    static_cast<NSUInteger>(local_indices.size() * sizeof(std::uint32_t)));
-                if (entry.position_buffer == nil || entry.index_buffer == nil) {
-                    return false;
-                }
-
-                MTLAccelerationStructureTriangleGeometryDescriptor* triangle_geometry =
-                    [MTLAccelerationStructureTriangleGeometryDescriptor descriptor];
-                triangle_geometry.vertexBuffer = entry.position_buffer;
-                triangle_geometry.vertexStride = sizeof(rtvdb::vec3);
-                triangle_geometry.indexBuffer = entry.index_buffer;
-                triangle_geometry.indexType = MTLIndexTypeUInt32;
-                triangle_geometry.triangleCount = static_cast<NSUInteger>(chunk.triangle_count);
-                triangle_geometry.opaque = YES;
-                if (@available(macOS 13.0, *)) {
-                    triangle_geometry.vertexFormat = MTLAttributeFormatFloat3;
+                entry.position_buffers.fill(nil);
+                entry.index_buffers.fill(nil);
+                NSMutableArray<MTLAccelerationStructureTriangleGeometryDescriptor*>* geometries =
+                    [NSMutableArray arrayWithCapacity:item.group.chunk_count];
+                for (std::size_t geometry_index = 0; geometry_index < item.group.chunk_count; ++geometry_index) {
+                    const std::size_t chunk_index = item.group.chunk_indices[geometry_index];
+                    if (chunk_index >= build.triangle_chunks.size()) {
+                        return false;
+                    }
+                    const rt_triangle_chunk &chunk = build.triangle_chunks[chunk_index];
+                    if (chunk.vertex_offset + chunk.vertex_count > build.vertices.size() ||
+                        chunk.index_offset + chunk.index_count > build.indices.size() ||
+                        chunk.index_count != chunk.triangle_count * 3u) {
+                        return false;
+                    }
+                    entry.position_buffers[geometry_index] = g_metal.position_buffer;
+                    entry.index_buffers[geometry_index] = g_metal.index_buffer;
+                    MTLAccelerationStructureTriangleGeometryDescriptor* triangle_geometry =
+                        [MTLAccelerationStructureTriangleGeometryDescriptor descriptor];
+                    triangle_geometry.vertexBuffer = entry.position_buffers[geometry_index];
+                    triangle_geometry.vertexBufferOffset = 0;
+                    triangle_geometry.vertexStride = sizeof(rtvdb::vec3);
+                    triangle_geometry.indexBuffer = entry.index_buffers[geometry_index];
+                    triangle_geometry.indexBufferOffset =
+                        static_cast<NSUInteger>(chunk.index_offset * sizeof(std::uint32_t));
+                    triangle_geometry.indexType = MTLIndexTypeUInt32;
+                    triangle_geometry.triangleCount = static_cast<NSUInteger>(chunk.triangle_count);
+                    triangle_geometry.opaque = YES;
+                    if (@available(macOS 13.0, *)) {
+                        triangle_geometry.vertexFormat = MTLAttributeFormatFloat3;
+                    }
+                    [geometries addObject:triangle_geometry];
                 }
 
                 MTLPrimitiveAccelerationStructureDescriptor* blas_descriptor =
                     [MTLPrimitiveAccelerationStructureDescriptor descriptor];
-                blas_descriptor.geometryDescriptors = @[triangle_geometry];
+                blas_descriptor.geometryDescriptors = geometries;
                 blas_descriptor.usage = MTLAccelerationStructureUsageNone;
                 const MTLAccelerationStructureSizes blas_sizes =
                     [g_metal.device accelerationStructureSizesWithDescriptor:blas_descriptor];
@@ -1177,19 +1361,24 @@ bool sync_scene_resources(const rt_scene_build &build, command_timing* out_timin
                         out_timing)) {
                     return false;
                 }
-                entry.fingerprint = chunk.fingerprint;
-                entry.triangle_count = chunk.triangle_count;
+                entry.key = key;
                 ++blas_rebuilt_count;
-                ++blas_rebuilt_triangle_chunk_count;
+                blas_rebuilt_triangle_chunk_count += item.group.chunk_count;
             } else {
                 ++blas_reused_count;
-                ++blas_reused_triangle_chunk_count;
+                blas_reused_triangle_chunk_count += item.group.chunk_count;
             }
             claimed_entries[cache_index] = true;
             g_metal.triangle_scene_blas.push_back(entry.acceleration_structure);
-            instance_metadata.push_back({
-                static_cast<std::uint32_t>(chunk.first_triangle),
-                static_cast<std::uint32_t>(chunk.index_offset)});
+            for (std::size_t geometry_index = 0; geometry_index < kRtBlasChunkSetChunkCount; ++geometry_index) {
+                triangle_instance_metadata_gpu metadata{};
+                if (geometry_index < item.group.chunk_count) {
+                    const rt_triangle_chunk &chunk = build.triangle_chunks[item.group.chunk_indices[geometry_index]];
+                    metadata.first_triangle = static_cast<std::uint32_t>(chunk.first_triangle);
+                    metadata.index_offset = static_cast<std::uint32_t>(chunk.index_offset);
+                }
+                instance_metadata.push_back(metadata);
+            }
         }
         g_metal.triangle_instance_metadata_buffer = new_shared_buffer(
             instance_metadata.data(),
@@ -1204,7 +1393,7 @@ bool sync_scene_resources(const rt_scene_build &build, command_timing* out_timin
         g_metal.tlas_scratch = nil;
         g_metal.tlas = nil;
     } else {
-        std::vector<MTLAccelerationStructureInstanceDescriptor> instance_descriptors(build.triangle_chunks.size());
+        std::vector<MTLAccelerationStructureInstanceDescriptor> instance_descriptors(g_metal.triangle_scene_blas.size());
         for (std::size_t i = 0; i < instance_descriptors.size(); ++i) {
             MTLAccelerationStructureInstanceDescriptor &instance_descriptor = instance_descriptors[i];
             instance_descriptor.transformationMatrix = MTLPackedFloat4x3(
@@ -1213,7 +1402,7 @@ bool sync_scene_resources(const rt_scene_build &build, command_timing* out_timin
                 MTLPackedFloat3(0.0f, 0.0f, 1.0f),
                 MTLPackedFloat3(0.0f, 0.0f, 0.0f));
             instance_descriptor.options = MTLAccelerationStructureInstanceOptionOpaque;
-            instance_descriptor.mask = build.triangle_chunks[i].visible ? 0xFFu : 0x00u;
+            instance_descriptor.mask = 0xFFu;
             instance_descriptor.intersectionFunctionTableOffset = 0u;
             instance_descriptor.accelerationStructureIndex = static_cast<std::uint32_t>(i);
         }
@@ -1493,10 +1682,19 @@ void bind_trace_resources(id<MTLComputeCommandEncoder> encoder, const camera_gpu
     [encoder setBuffer:g_metal.index_buffer offset:0 atIndex:kIndexBinding];
     [encoder setBuffer:g_metal.triangle_color_buffer offset:0 atIndex:kTriangleColorBinding];
     [encoder setAccelerationStructure:g_metal.tlas atBufferIndex:kSceneAccelerationStructureBinding];
+    for (id<MTLAccelerationStructure> triangle_blas : g_metal.triangle_scene_blas) {
+        [encoder useResource:triangle_blas usage:MTLResourceUsageRead];
+    }
     [encoder setAccelerationStructure:g_metal.point_active ? g_metal.point_blas : nil
                         atBufferIndex:kPointAccelerationStructureBinding];
     [encoder setAccelerationStructure:g_metal.line_active ? g_metal.line_blas : nil
                         atBufferIndex:kLineAccelerationStructureBinding];
+    if (g_metal.point_active && g_metal.point_blas != nil) {
+        [encoder useResource:g_metal.point_blas usage:MTLResourceUsageRead];
+    }
+    if (g_metal.line_active && g_metal.line_blas != nil) {
+        [encoder useResource:g_metal.line_blas usage:MTLResourceUsageRead];
+    }
     [encoder setBuffer:g_metal.point_active ? g_metal.point_buffer : nil offset:0 atIndex:kPointBufferBinding];
     [encoder setBuffer:g_metal.line_active ? g_metal.line_buffer : nil offset:0 atIndex:kLineBufferBinding];
     [encoder setBuffer:g_metal.triangle_geometry_index_buffer offset:0 atIndex:kTriangleGeometryIndexBinding];
@@ -1534,9 +1732,10 @@ bool dispatch_trace(
     camera.accumulation_sample_index = sample_index;
     fill_accumulation_jitter(sample_index, camera.accumulation_jitter);
     metal_command_slot* slot = nullptr;
-    if (!acquire_metal_command_slot(metal_submission_kind::trace, &slot)) {
+    if (!acquire_metal_command_slot(metal_submission_kind::trace, &slot, out_timing)) {
         return false;
     }
+    const auto record_start = std::chrono::steady_clock::now();
     id<MTLCommandBuffer> command_buffer = [g_metal.command_queue commandBuffer];
     if (command_buffer == nil) {
         return false;
@@ -1559,6 +1758,10 @@ bool dispatch_trace(
     const MTLSize threads_per_grid = MTLSizeMake(static_cast<NSUInteger>(width), static_cast<NSUInteger>(height), 1);
     [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
     [encoder endEncoding];
+    if (out_timing != nullptr) {
+        out_timing->command_record_cpu_ms += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - record_start).count();
+    }
     if (!submit_metal_command(slot, command_buffer, out_timing)) {
         return false;
     }
@@ -1588,7 +1791,7 @@ bool dispatch_pick_query(
     request.pixel_y = static_cast<std::uint32_t>(pixel_y);
 
     metal_command_slot* slot = nullptr;
-    if (!acquire_metal_command_slot(metal_submission_kind::pick, &slot)) {
+    if (!acquire_metal_command_slot(metal_submission_kind::pick, &slot, nullptr)) {
         return false;
     }
     id<MTLCommandBuffer> command_buffer = [g_metal.command_queue commandBuffer];
@@ -1688,7 +1891,12 @@ void shutdown_metal_backend() {
     reset_metal_state_contents();
 }
 
-bool copy_output_buffer_to_metal_pixel_buffer(int width, int height, void* pixel_buffer) {
+bool copy_output_buffer_to_metal_pixel_buffer(
+    int width,
+    int height,
+    void* pixel_buffer,
+    metal_paint_timing* out_paint_timing)
+{
     if (width <= 0 || height <= 0 ||
         pixel_buffer == nullptr ||
         g_metal.texture_cache == nullptr ||
@@ -1697,6 +1905,7 @@ bool copy_output_buffer_to_metal_pixel_buffer(int width, int height, void* pixel
         return false;
     }
 
+    const auto publish_start = std::chrono::steady_clock::now();
     CVMetalTextureRef cv_texture = nullptr;
     const CVReturn create_result = CVMetalTextureCacheCreateTextureFromImage(
         kCFAllocatorDefault,
@@ -1719,7 +1928,7 @@ bool copy_output_buffer_to_metal_pixel_buffer(int width, int height, void* pixel
     }
 
     metal_command_slot* slot = nullptr;
-    if (!acquire_metal_command_slot(metal_submission_kind::native_present, &slot)) {
+    if (!acquire_metal_command_slot(metal_submission_kind::native_present, &slot, nullptr)) {
         CFRelease(cv_texture);
         return false;
     }
@@ -1751,6 +1960,10 @@ bool copy_output_buffer_to_metal_pixel_buffer(int width, int height, void* pixel
     }
     slot->presentation_texture = cv_texture;
     g_metal.build_info.dispatch_submit_cpu_ms += timing.submit_cpu_ms;
+    if (out_paint_timing != nullptr) {
+        out_paint_timing->native_target_publish_cpu_ms +=
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - publish_start).count();
+    }
     return true;
 }
 
@@ -1760,17 +1973,27 @@ bool advance_accumulated_render(
     const frame_scene &scene,
     bool has_frame,
     double* out_accel_ms,
-    double* out_dispatch_ms)
+    double* out_dispatch_ms,
+    metal_paint_timing* out_paint_timing)
 {
+    if (out_paint_timing != nullptr) {
+        *out_paint_timing = {};
+    }
     if (width <= 0 || height <= 0) {
         return false;
     }
 
+    const bool trace_was_pending = g_metal.trace_pending;
     collect_completed_metal_commands();
 
-    const auto accel_start = std::chrono::steady_clock::now();
+    const auto scene_snapshot_start = std::chrono::steady_clock::now();
     rt_scene_build build{};
     copy_present_render_rt_scene_build(&build);
+    if (out_paint_timing != nullptr) {
+        out_paint_timing->scene_snapshot_cpu_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - scene_snapshot_start).count();
+    }
+    const auto accel_start = std::chrono::steady_clock::now();
     bool scene_rebuilt = false;
     command_timing accel_timing{};
 
@@ -1784,6 +2007,17 @@ bool advance_accumulated_render(
     next_key.projection_blend_from = scene.projection_blend_from;
     next_key.projection_blend_to = scene.projection_blend_to;
     next_key.projection_blend_t = scene.projection_blend_t;
+
+    if (trace_was_pending && !g_metal.trace_pending) {
+        g_metal.build_info.accumulation_in_progress = true;
+        if (out_accel_ms != nullptr) {
+            *out_accel_ms = g_metal.build_info.accel_build_ms;
+        }
+        if (out_dispatch_ms != nullptr) {
+            *out_dispatch_ms = g_metal.build_info.dispatch_ms;
+        }
+        return true;
+    }
 
     if (g_metal.trace_pending) {
         g_metal.build_info.accumulation_in_progress = true;
@@ -1830,9 +2064,23 @@ bool advance_accumulated_render(
         }
     }
     const auto accel_end = std::chrono::steady_clock::now();
+    if (out_paint_timing != nullptr) {
+        const double acceleration_prepare_cpu_ms = std::chrono::duration<double, std::milli>(
+            accel_end - accel_start).count();
+        out_paint_timing->pre_acceleration_prepare_cpu_ms = (std::max)(
+            0.0,
+            acceleration_prepare_cpu_ms -
+                accel_timing.command_slot_wait_cpu_ms -
+                accel_timing.command_record_cpu_ms -
+                accel_timing.submit_cpu_ms);
+        out_paint_timing->as_command_slot_wait_cpu_ms = accel_timing.command_slot_wait_cpu_ms;
+        out_paint_timing->accel_command_record_cpu_ms = accel_timing.command_record_cpu_ms;
+        out_paint_timing->as_finalize_cpu_ms = accel_timing.submit_cpu_ms;
+    }
 
     const auto dispatch_start = std::chrono::steady_clock::now();
     command_timing dispatch_timing{};
+    double accumulation_finalize_cpu_ms = 0.0;
     if (trace_ok && has_frame && (build.triangle_count > 0 || build.point_count > 0 || build.line_count > 0)) {
         if (g_metal.accumulation_sample_count < kMaxAccumulationSamples) {
             trace_ok = dispatch_trace(
@@ -1847,16 +2095,37 @@ bool advance_accumulated_render(
                 g_metal.accumulation_sample_count = 0;
             }
         }
+        const auto accumulation_finalize_start = std::chrono::steady_clock::now();
         g_metal.accumulation_active =
             g_metal.trace_pending ||
             g_metal.config.continuous_render ||
             g_metal.accumulation_sample_count < kMaxAccumulationSamples;
+        accumulation_finalize_cpu_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - accumulation_finalize_start).count();
     } else {
+        const auto accumulation_finalize_start = std::chrono::steady_clock::now();
         g_metal.accumulation_sample_count = 0;
         g_metal.accumulation_active = false;
         fill_output_buffer_black(width, height);
+        accumulation_finalize_cpu_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - accumulation_finalize_start).count();
     }
     const auto dispatch_end = std::chrono::steady_clock::now();
+    if (out_paint_timing != nullptr) {
+        const double dispatch_cpu_ms = std::chrono::duration<double, std::milli>(
+            dispatch_end - dispatch_start).count();
+        out_paint_timing->rt_output_prepare_cpu_ms = (std::max)(
+            0.0,
+            dispatch_cpu_ms -
+                dispatch_timing.command_slot_wait_cpu_ms -
+                dispatch_timing.command_record_cpu_ms -
+                dispatch_timing.submit_cpu_ms -
+                accumulation_finalize_cpu_ms);
+        out_paint_timing->rt_output_command_slot_wait_cpu_ms = dispatch_timing.command_slot_wait_cpu_ms;
+        out_paint_timing->rt_output_command_record_cpu_ms = dispatch_timing.command_record_cpu_ms;
+        out_paint_timing->rt_submit_cpu_ms = dispatch_timing.submit_cpu_ms;
+        out_paint_timing->accumulation_finalize_cpu_ms = accumulation_finalize_cpu_ms;
+    }
 
     std::scoped_lock lock(g_metal.mutex);
     const std::size_t blas_count = build.triangle_chunks.size() +
@@ -1892,7 +2161,6 @@ bool advance_accumulated_render(
             std::chrono::duration<double, std::milli>(dispatch_end - dispatch_start).count();
         g_metal.build_info.dispatch_submit_cpu_ms = dispatch_timing.submit_cpu_ms;
         g_metal.build_info.dispatch_gpu_wait_ms = dispatch_timing.gpu_wait_ms;
-        g_metal.build_info.dispatch_gpu_ms = dispatch_timing.gpu_ms;
     }
     g_metal.build_info.readback_ms = 0.0;
     g_metal.build_info.accumulation_sample_count = g_metal.accumulation_sample_count;
@@ -1914,16 +2182,31 @@ bool render_metal_to_native_metal_texture(
     if (request.scene == nullptr || request.width <= 0 || request.height <= 0 || pixel_buffer == nullptr) {
         return false;
     }
+    metal_paint_timing paint_timing{};
     if (!advance_accumulated_render(
             request.width,
             request.height,
             *request.scene,
             request.has_frame,
             nullptr,
-            nullptr)) {
+            nullptr,
+            &paint_timing)) {
         return false;
     }
-    return copy_output_buffer_to_metal_pixel_buffer(request.width, request.height, pixel_buffer);
+    if (!g_metal.output_pending_present) {
+        store_metal_paint_timing(paint_timing);
+        return true;
+    }
+    if (!copy_output_buffer_to_metal_pixel_buffer(
+            request.width,
+            request.height,
+            pixel_buffer,
+            &paint_timing)) {
+        return false;
+    }
+    g_metal.output_pending_present = false;
+    store_metal_paint_timing(paint_timing);
+    return true;
 }
 
 bool capture_metal_to_bgra(
@@ -1943,7 +2226,8 @@ bool capture_metal_to_bgra(
         *request.scene,
         request.has_frame,
         &accel_ms,
-        &dispatch_ms);
+        &dispatch_ms,
+        nullptr);
     const auto readback_start = std::chrono::steady_clock::now();
     command_timing readback_timing{};
     if (!wait_for_metal_command_kind(metal_submission_kind::trace, &readback_timing)) {
