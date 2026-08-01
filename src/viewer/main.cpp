@@ -5317,6 +5317,12 @@ void on_mouse_wheel(float delta, void*) {
 
 void on_ui(void*) {
     rtvdb::viewer_session::copy_recent_logs(&g_recent_session_logs);
+    rtvdb::viewer_backend::scene_build_info build_info{};
+    rtvdb::viewer_backend::copy_present_build_info(&build_info);
+    draw_hover_overlay();
+    draw_status_overlay(build_info);
+    g_frame_pacing.paint_callback_completed_since_ui = false;
+
     const float window_height = g_viewer_window_height > 0.0f
         ? g_viewer_window_height
         : compute_viewer_window_height();
@@ -5329,15 +5335,10 @@ void on_ui(void*) {
     }
 
     const auto active_backend = rtvdb::viewer_backend::current_backend();
-    rtvdb::viewer_backend::scene_build_info build_info{};
-    rtvdb::viewer_backend::copy_present_build_info(&build_info);
     rtvdb::viewer_backend::display_mode mode = rtvdb::viewer_backend::display_mode::triangle_normal;
     rtvdb::viewer_backend::get_display_mode(&mode);
     const bool auto_frame = rtvdb::viewer_backend::auto_frame_enabled();
 
-    draw_hover_overlay();
-    draw_status_overlay(build_info);
-    g_frame_pacing.paint_callback_completed_since_ui = false;
     draw_capture_overlay();
 
     rtvdb::camera effective_camera{};
