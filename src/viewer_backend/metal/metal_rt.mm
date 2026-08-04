@@ -1840,6 +1840,34 @@ void read_output_pixels(std::vector<std::uint8_t>* out_pixels, int width, int he
         static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4u);
 }
 
+bool readback_metal_current_frame_to_bgra(
+    int width,
+    int height,
+    std::vector<std::uint8_t>* out_pixels)
+{
+    if (out_pixels == nullptr || width <= 0 || height <= 0 ||
+        g_metal.output_buffer == nil ||
+        g_metal.synced_width != static_cast<NSUInteger>(width) ||
+        g_metal.synced_height != static_cast<NSUInteger>(height) ||
+        [g_metal.output_buffer length] <
+            static_cast<NSUInteger>(width) * static_cast<NSUInteger>(height) * 4u) {
+        return false;
+    }
+
+    out_pixels->clear();
+    const auto readback_start = std::chrono::steady_clock::now();
+    command_timing readback_timing{};
+    if (!wait_for_metal_command_kind(metal_submission_kind::trace, &readback_timing)) {
+        return false;
+    }
+    read_output_pixels(out_pixels, width, height);
+    const double readback_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - readback_start).count();
+    std::scoped_lock lock(g_metal.mutex);
+    g_metal.build_info.readback_ms = readback_ms;
+    return !out_pixels->empty();
+}
+
 void fill_output_buffer_black(int width, int height) {
     if (g_metal.output_buffer == nil || width <= 0 || height <= 0) {
         return;
@@ -2368,7 +2396,7 @@ const backend_ops kMetalBackendOps{
     render_metal_to_native_metal_texture,
     nullptr,
     capture_metal_to_bgra,
-    nullptr,
+    readback_metal_current_frame_to_bgra,
     capture_metal_to_png,
     fill_metal_build_info,
     pick_metal,
