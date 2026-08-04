@@ -35,7 +35,8 @@ constexpr UINT kDescriptorBindingCapacity = 11;
 constexpr UINT kUavDescriptorBase = 0;
 constexpr UINT kSrvDescriptorBase = kUavDescriptorBase + kDescriptorBindingCapacity;
 constexpr UINT kScratchUavDescriptorIndex = kSrvDescriptorBase + kDescriptorBindingCapacity;
-constexpr UINT kDescriptorHeapCount = kScratchUavDescriptorIndex + 1;
+constexpr UINT kDescriptorSlotStride = kScratchUavDescriptorIndex + 1;
+constexpr UINT kDescriptorHeapCount = kDescriptorSlotStride * kRtCommandSlotCount;
 constexpr std::size_t kShaderRecordSize = D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES;
 constexpr std::size_t kInvalidCacheIndex = (std::numeric_limits<std::size_t>::max)();
 constexpr DXGI_FORMAT kOutputFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -83,6 +84,7 @@ struct dxr_acceleration_build_context {
 
 struct dxr_command_slot {
     ID3D12CommandAllocator* allocator = nullptr;
+    ID3D12Resource* tlas_instance_buffer = nullptr;
     std::uint64_t fence_value = 0;
     rt_submission_token submission{};
     rt_submission_token dispatch_timestamp_submission{};
@@ -106,8 +108,6 @@ struct dxr_backend_state {
     rt_rhi_diagnostics diagnostics{};
     rt_object_registry<dxr_buffer, rt_buffer_handle> buffer_registry;
     rt_object_registry<dxr_texture, rt_texture_handle> texture_registry;
-    ID3D12Resource* tlas_instance_buffer = nullptr;
-    ID3D12Resource* scratch_buffer = nullptr;
     rt_object_registry<dxr_acceleration_structure, rt_blas_handle> blas_registry;
     rt_object_registry<dxr_acceleration_structure, rt_tlas_handle> tlas_registry;
     rt_object_registry<std::vector<std::uint8_t>, rt_shader_module_handle> shader_module_registry;
@@ -127,6 +127,7 @@ struct dxr_backend_state {
     UINT command_slot_index = 0;
     UINT active_command_slot_index = 0;
     ID3D12GraphicsCommandList4* command_list = nullptr;
+    ID3D12Resource* scratch_buffer = nullptr;
     ID3D12Fence* fence = nullptr;
     std::uint64_t submitted_fence_value = 0;
     std::uint64_t next_submission_serial = 1;
@@ -138,6 +139,9 @@ struct dxr_backend_state {
     ID3D12QueryHeap* timestamp_query_heap = nullptr;
     ID3D12Resource* timestamp_query_readback = nullptr;
     std::uint64_t timestamp_frequency = 0;
+    std::vector<rt_binding_write> pending_binding_writes;
+    std::uint64_t binding_generation = 0;
+    std::array<std::uint64_t, kRtCommandSlotCount> command_slot_binding_generations{};
 
     ID3D12DescriptorHeap* srv_uav_cbv_heap = nullptr;
     UINT srv_uav_cbv_descriptor_size = 0;
@@ -1553,19 +1557,20 @@ bool build_top_level_as(dxr_backend_state &state, const rt_tlas_build_desc &requ
     }
 
     const auto alloc_start = std::chrono::steady_clock::now();
+    dxr_command_slot &slot = state.command_slots[state.active_command_slot_index];
     if (!ensure_buffer_capacity(
             state,
             D3D12_HEAP_TYPE_UPLOAD,
             instances.size() * sizeof(D3D12_RAYTRACING_INSTANCE_DESC),
             D3D12_RESOURCE_STATE_GENERIC_READ,
             D3D12_RESOURCE_FLAG_NONE,
-            &state.tlas_instance_buffer)) {
+            &slot.tlas_instance_buffer)) {
         return false;
     }
     const auto upload_start = std::chrono::steady_clock::now();
     if (!upload_buffer_data(
             state,
-            state.tlas_instance_buffer,
+            slot.tlas_instance_buffer,
             0,
             instances.data(),
             instances.size() * sizeof(D3D12_RAYTRACING_INSTANCE_DESC))) {
@@ -1578,7 +1583,7 @@ bool build_top_level_as(dxr_backend_state &state, const rt_tlas_build_desc &requ
     inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
     inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
     inputs.NumDescs = static_cast<UINT>(instance_count);
-    inputs.InstanceDescs = state.tlas_instance_buffer->GetGPUVirtualAddress();
+    inputs.InstanceDescs = slot.tlas_instance_buffer->GetGPUVirtualAddress();
     inputs.Flags = dxr_acceleration_build_flags(request.flags);
 
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO prebuild_info{};
@@ -1593,22 +1598,13 @@ bool build_top_level_as(dxr_backend_state &state, const rt_tlas_build_desc &requ
         return false;
     }
 
-    const bool can_update =
-        (request.flags & rt_acceleration_build_allow_update) != 0u &&
-        tlas->result != nullptr &&
-        tlas->instance_count == instance_count &&
-        tlas->result->GetDesc().Width >= prebuild_info.ResultDataMaxSizeInBytes;
-    const UINT64 required_scratch_size = can_update
-        ? prebuild_info.UpdateScratchDataSizeInBytes
-        : prebuild_info.ScratchDataSizeInBytes;
+    const UINT64 required_scratch_size = prebuild_info.ScratchDataSizeInBytes;
     dxr_acceleration_build_context &context = state.acceleration_build;
     context.max_scratch_size = (std::max)(context.max_scratch_size, required_scratch_size);
     if (!ensure_acceleration_scratch_buffer(state, context.max_scratch_size)) {
         return false;
     }
-    if (!can_update) {
-        safe_release(tlas->result);
-    }
+    defer_resource_release(state, tlas->result);
     if (tlas->result == nullptr && !create_native_buffer(
             state,
             D3D12_HEAP_TYPE_DEFAULT,
@@ -1627,11 +1623,8 @@ bool build_top_level_as(dxr_backend_state &state, const rt_tlas_build_desc &requ
 
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC build_desc{};
     build_desc.Inputs = inputs;
-    if (can_update) {
-        build_desc.Inputs.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
-        build_desc.SourceAccelerationStructureData = tlas->result->GetGPUVirtualAddress();
-    }
-    build_desc.ScratchAccelerationStructureData = state.scratch_buffer->GetGPUVirtualAddress();
+    build_desc.ScratchAccelerationStructureData =
+        state.scratch_buffer->GetGPUVirtualAddress();
     build_desc.DestAccelerationStructureData = tlas->result->GetGPUVirtualAddress();
     const auto build_record_start = std::chrono::steady_clock::now();
     state.command_list->BuildRaytracingAccelerationStructure(&build_desc, 0, nullptr);
@@ -1849,15 +1842,25 @@ void release_raytracing_runtime_state(dxr_backend_state &state) {
     state.diagnostics.dispatch_gpu_ms = 0.0;
 }
 
-D3D12_CPU_DESCRIPTOR_HANDLE descriptor_cpu_handle(dxr_backend_state &state, UINT index) {
+D3D12_CPU_DESCRIPTOR_HANDLE descriptor_cpu_handle(
+    dxr_backend_state &state,
+    UINT slot_index,
+    UINT index)
+{
     D3D12_CPU_DESCRIPTOR_HANDLE handle = state.srv_uav_cbv_heap->GetCPUDescriptorHandleForHeapStart();
-    handle.ptr += static_cast<SIZE_T>(index) * state.srv_uav_cbv_descriptor_size;
+    handle.ptr += static_cast<SIZE_T>(slot_index * kDescriptorSlotStride + index) *
+        state.srv_uav_cbv_descriptor_size;
     return handle;
 }
 
-D3D12_GPU_DESCRIPTOR_HANDLE descriptor_gpu_handle(dxr_backend_state &state, UINT index) {
+D3D12_GPU_DESCRIPTOR_HANDLE descriptor_gpu_handle(
+    dxr_backend_state &state,
+    UINT slot_index,
+    UINT index)
+{
     D3D12_GPU_DESCRIPTOR_HANDLE handle = state.srv_uav_cbv_heap->GetGPUDescriptorHandleForHeapStart();
-    handle.ptr += static_cast<UINT64>(index) * state.srv_uav_cbv_descriptor_size;
+    handle.ptr += static_cast<UINT64>(slot_index * kDescriptorSlotStride + index) *
+        state.srv_uav_cbv_descriptor_size;
     return handle;
 }
 
@@ -1881,6 +1884,7 @@ bool ensure_descriptor_heap(dxr_backend_state &state) {
 bool update_dxr_resource_bindings(
     dxr_backend_state &state,
     const rt_binding_update_request &request,
+    UINT slot_index,
     std::string* out_detail)
 {
     const auto fail = [out_detail](const rt_binding_write* write, std::string_view reason) {
@@ -1914,7 +1918,7 @@ bool update_dxr_resource_bindings(
             state.device->CreateShaderResourceView(
                 nullptr,
                 &srv,
-                descriptor_cpu_handle(state, kSrvDescriptorBase + write.location.binding));
+                descriptor_cpu_handle(state, slot_index, kSrvDescriptorBase + write.location.binding));
         } else if (write.type == rt_descriptor_type::structured_buffer) {
             ID3D12Resource* const resource = dxr_buffer_resource(state, write.resource);
             if ((resource == nullptr && write.element_count != 0) || write.element_stride == 0) {
@@ -1929,7 +1933,7 @@ bool update_dxr_resource_bindings(
             state.device->CreateShaderResourceView(
                 resource,
                 &srv,
-                descriptor_cpu_handle(state, kSrvDescriptorBase + write.location.binding));
+                descriptor_cpu_handle(state, slot_index, kSrvDescriptorBase + write.location.binding));
         } else if (write.type == rt_descriptor_type::storage_buffer) {
             ID3D12Resource* const resource = dxr_buffer_resource(state, write.resource);
             if (resource == nullptr || write.element_count == 0 || write.element_stride == 0) {
@@ -1944,7 +1948,7 @@ bool update_dxr_resource_bindings(
                 resource,
                 nullptr,
                 &uav,
-                descriptor_cpu_handle(state, kUavDescriptorBase + write.location.binding));
+                descriptor_cpu_handle(state, slot_index, kUavDescriptorBase + write.location.binding));
         } else if (write.type == rt_descriptor_type::storage_texture) {
             dxr_texture* const texture = state.texture_registry.get(write.texture);
             if (texture == nullptr || texture->resource == nullptr) {
@@ -1957,7 +1961,7 @@ bool update_dxr_resource_bindings(
                 texture->resource,
                 nullptr,
                 &uav,
-                descriptor_cpu_handle(state, kUavDescriptorBase + write.location.binding));
+                descriptor_cpu_handle(state, slot_index, kUavDescriptorBase + write.location.binding));
         } else if (write.type == rt_descriptor_type::uniform_buffer) {
             ID3D12Resource* const resource = dxr_buffer_resource(state, write.resource);
             if (resource == nullptr) {
@@ -1969,6 +1973,27 @@ bool update_dxr_resource_bindings(
             return fail(&write, "descriptor type is unsupported");
         }
     }
+    return true;
+}
+
+UINT descriptor_target_slot(const dxr_backend_state &state) {
+    return state.active_encoder_id != 0
+        ? state.active_command_slot_index
+        : state.command_slot_index % kRtCommandSlotCount;
+}
+
+bool refresh_command_slot_bindings(dxr_backend_state &state, UINT slot_index) {
+    if (state.pending_binding_writes.empty() ||
+        state.command_slot_binding_generations[slot_index] == state.binding_generation) {
+        return true;
+    }
+    const rt_binding_update_request request{
+        state.pending_binding_writes.data(),
+        state.pending_binding_writes.size()};
+    if (!update_dxr_resource_bindings(state, request, slot_index, nullptr)) {
+        return false;
+    }
+    state.command_slot_binding_generations[slot_index] = state.binding_generation;
     return true;
 }
 
@@ -2659,11 +2684,11 @@ void shutdown_dxr_native(dxr_backend_state &state) {
         safe_release(resource.resource);
     });
     collect_deferred_resource_releases(state, true);
-    safe_release(state.scratch_buffer);
-    safe_release(state.tlas_instance_buffer);
     release_shader_modules(state);
     safe_release(state.command_list);
+    safe_release(state.scratch_buffer);
     for (dxr_command_slot &slot : state.command_slots) {
+        safe_release(slot.tlas_instance_buffer);
         safe_release(slot.allocator);
     }
     safe_release(state.timestamp_query_readback);
@@ -2801,11 +2826,27 @@ bool d3d12_dxr_rhi_device::begin_commands(
     if (out_encoder != nullptr) {
         *out_encoder = {};
     }
-    if (device_.native_state != &native_state_ ||
-        out_encoder == nullptr || queue != rt_queue_class::graphics ||
-        native_state_.active_encoder_id != 0 || !reset_command_list(native_state_)) {
+    if (device_.native_state != &native_state_) {
         if (out_error != nullptr) {
-            *out_error = {rt_device_operation::begin_commands, 0, "DXR command begin failed"};
+            *out_error = {rt_device_operation::begin_commands, 0, "DXR command device state is invalid"};
+        }
+        return false;
+    }
+    if (out_encoder == nullptr || queue != rt_queue_class::graphics) {
+        if (out_error != nullptr) {
+            *out_error = {rt_device_operation::begin_commands, 0, "DXR command queue request is invalid"};
+        }
+        return false;
+    }
+    if (native_state_.active_encoder_id != 0) {
+        if (out_error != nullptr) {
+            *out_error = {rt_device_operation::begin_commands, 0, "DXR command encoder is already active"};
+        }
+        return false;
+    }
+    if (!reset_command_list(native_state_)) {
+        if (out_error != nullptr) {
+            *out_error = {rt_device_operation::begin_commands, 0, "DXR command list reset failed"};
         }
         return false;
     }
@@ -3144,12 +3185,21 @@ bool d3d12_dxr_rhi_device::clear_texture(
         texture_object->resource,
         nullptr,
         &uav,
-        descriptor_cpu_handle(native_state_, kScratchUavDescriptorIndex));
+        descriptor_cpu_handle(
+            native_state_,
+            native_state_.active_command_slot_index,
+            kScratchUavDescriptorIndex));
     ID3D12DescriptorHeap* heaps[] = {native_state_.srv_uav_cbv_heap};
     native_state_.command_list->SetDescriptorHeaps(1, heaps);
     native_state_.command_list->ClearUnorderedAccessViewFloat(
-        descriptor_gpu_handle(native_state_, kScratchUavDescriptorIndex),
-        descriptor_cpu_handle(native_state_, kScratchUavDescriptorIndex),
+        descriptor_gpu_handle(
+            native_state_,
+            native_state_.active_command_slot_index,
+            kScratchUavDescriptorIndex),
+        descriptor_cpu_handle(
+            native_state_,
+            native_state_.active_command_slot_index,
+            kScratchUavDescriptorIndex),
         texture_object->resource,
         color,
         0,
@@ -3184,16 +3234,33 @@ bool d3d12_dxr_rhi_device::trace_rays(
         }
         return false;
     }
+    if (!refresh_command_slot_bindings(
+            native_state_,
+            native_state_.active_command_slot_index)) {
+        if (out_error != nullptr) {
+            *out_error = {
+                rt_device_operation::update_bindings,
+                0,
+                "DXR descriptor snapshot refresh failed"};
+        }
+        return false;
+    }
 
     ID3D12DescriptorHeap* heaps[] = {native_state_.srv_uav_cbv_heap};
     native_state_.command_list->SetDescriptorHeaps(1, heaps);
     native_state_.command_list->SetComputeRootSignature(native_state_.global_root_signature);
     native_state_.command_list->SetComputeRootDescriptorTable(
         0,
-        descriptor_gpu_handle(native_state_, kUavDescriptorBase));
+        descriptor_gpu_handle(
+            native_state_,
+            native_state_.active_command_slot_index,
+            kUavDescriptorBase));
     native_state_.command_list->SetComputeRootDescriptorTable(
         1,
-        descriptor_gpu_handle(native_state_, kSrvDescriptorBase));
+        descriptor_gpu_handle(
+            native_state_,
+            native_state_.active_command_slot_index,
+            kSrvDescriptorBase));
     native_state_.command_list->SetComputeRootConstantBufferView(
         2,
         native_state_.camera_constant_buffer->GetGPUVirtualAddress() +
@@ -3263,13 +3330,40 @@ bool d3d12_dxr_rhi_device::update_bindings(
 {
     std::string detail;
     if (device_.native_state != &native_state_ ||
-        request.writes == nullptr ||
-        !update_dxr_resource_bindings(native_state_, request, &detail)) {
+        request.writes == nullptr || request.write_count == 0) {
+        if (out_error != nullptr) {
+            out_error->detail = "DXR descriptor binding update request is invalid";
+        }
+        return false;
+    }
+
+    native_state_.pending_binding_writes.assign(
+        request.writes,
+        request.writes + request.write_count);
+    ++native_state_.binding_generation;
+    const UINT slot_index = descriptor_target_slot(native_state_);
+    if (native_state_.active_encoder_id == 0) {
+        dxr_command_slot &slot = native_state_.command_slots[slot_index];
+        if (slot.submission && !wait_for_fence_value(native_state_, slot.fence_value)) {
+            if (out_error != nullptr) {
+                out_error->detail = "DXR descriptor binding slot wait failed";
+            }
+            return false;
+        }
+        if (slot.submission) {
+            complete_command_slot(native_state_, slot_index);
+        }
+    }
+    const rt_binding_update_request pending_request{
+        native_state_.pending_binding_writes.data(),
+        native_state_.pending_binding_writes.size()};
+    if (!update_dxr_resource_bindings(native_state_, pending_request, slot_index, &detail)) {
         if (out_error != nullptr) {
             out_error->detail = detail.empty() ? "DXR descriptor binding update failed" : std::move(detail);
         }
         return false;
     }
+    native_state_.command_slot_binding_generations[slot_index] = native_state_.binding_generation;
     return true;
 }
 

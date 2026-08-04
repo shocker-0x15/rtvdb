@@ -4,10 +4,13 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdio>
+#include <cstdarg>
 #include <cstdint>
 #include <bit>
 #include <concepts>
 #include <type_traits>
+#include <vector>
 
 namespace rtvdb {
 
@@ -76,6 +79,8 @@ enum class reference_grid : std::uint32_t {
 };
 
 bool set_reference_grid(reference_grid value);
+
+bool request_capture(bool full_accumulation = true);
 
 // End: Basic APIs
 // ----------------------------------------------------------------
@@ -219,6 +224,29 @@ inline bool set_camera(const camera &value) {
     }
 }
 
+inline bool push_layerf(const char* format, ...) {
+    if (format == nullptr) {
+        return false;
+    }
+
+    va_list args;
+    va_start(args, format);
+    const int length = std::vsnprintf(nullptr, 0, format, args);
+    va_end(args);
+    if (length < 0) {
+        return false;
+    }
+
+    std::vector<char> formatted_name(static_cast<std::size_t>(length) + 1);
+    va_start(args, format);
+    const int written = std::vsnprintf(formatted_name.data(), formatted_name.size(), format, args);
+    va_end(args);
+    if (written != length) {
+        return false;
+    }
+    return push_layer(formatted_name.data());
+}
+
 template <vec3_only_like Color>
 inline void set_color(const Color &value, float a = 1.0f) {
     set_color(
@@ -294,7 +322,7 @@ struct rgba {
 };
 
 constexpr std::uint32_t kMagic = 0x42565452u;
-constexpr std::uint16_t kProtocolVersion = 9;
+constexpr std::uint16_t kProtocolVersion = 10;
 constexpr std::size_t kLayerNameCapacity = 64;
 constexpr std::size_t kPrimitiveBatchFlushCount = 256;
 constexpr std::uint64_t kPrimitiveBatchFlushDelayMs = 100;
@@ -317,6 +345,7 @@ enum class message_kind : std::uint16_t {
     push_layer = 12,
     pop_layer = 13,
     set_reference_grid = 14,
+    request_capture = 15,
 };
 
 #pragma pack(push, 1)
@@ -339,6 +368,10 @@ struct camera_payload {
 
 struct reference_grid_payload {
     reference_grid value;
+};
+
+struct capture_request_payload {
+    std::uint8_t full_accumulation;
 };
 
 struct layer_payload {
@@ -393,10 +426,8 @@ struct line_payload {
 #endif
 
 #include <chrono>
-#include <cstdio>
 #include <cstring>
 #include <string>
-#include <vector>
 
 namespace rtvdb {
 
@@ -903,6 +934,11 @@ inline bool set_orthographic_camera(
 inline bool set_reference_grid(reference_grid value) {
     const reference_grid_payload payload{value};
     return detail::send_control_message(message_kind::set_reference_grid, &payload, sizeof(payload));
+}
+
+inline bool request_capture(bool full_accumulation) {
+    const capture_request_payload payload{static_cast<std::uint8_t>(full_accumulation ? 1 : 0)};
+    return detail::send_control_message(message_kind::request_capture, &payload, sizeof(payload));
 }
 
 

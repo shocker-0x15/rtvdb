@@ -590,7 +590,7 @@ if(WIN32 AND RTVDB_ENABLE_D3D12_DXR)
     )
 endif()
 
-rtvdb_add_client(rtvdb_example_client examples/basic_client.cpp)
+rtvdb_add_client(rtvdb_basic_client examples/basic_client.cpp)
 rtvdb_add_client(rtvdb_obj_stream_client examples/obj_stream_client.cpp)
 rtvdb_add_client(rtvdb_bt2020_volume_client examples/bt2020_volume_client.cpp)
 
@@ -662,7 +662,7 @@ install(TARGETS rtvdb_viewer
 )
 
 install(TARGETS
-    rtvdb_example_client
+    rtvdb_basic_client
     rtvdb_bt2020_volume_client
     rtvdb_obj_stream_client
     RUNTIME DESTINATION examples
@@ -681,3 +681,8 @@ else()
     set(CPACK_PACKAGE_FILE_NAME "rtvdb-${CMAKE_SYSTEM_NAME}")
 endif()
 include(CPack)
+
+if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR AND
+    EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/private/CMakeLists.txt")
+    add_subdirectory(private)
+endif()

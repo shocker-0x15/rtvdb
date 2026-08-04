@@ -138,6 +138,7 @@ struct vulkan_buffer {
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkDeviceSize size = 0;
+    VkMemoryPropertyFlags memory_flags = 0;
     rt_resource_usage usage = rt_resource_usage::undefined;
 };
 
@@ -194,6 +195,7 @@ struct vulkan_command_slot {
     VkCommandPool pool = VK_NULL_HANDLE;
     VkCommandBuffer buffer = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
+    vulkan_buffer tlas_instance_buffer{};
     bool submitted = false;
     rt_submission_token submission{};
     std::uint32_t timestamp_regions = 0;
@@ -223,8 +225,6 @@ struct vulkan_backend_state {
     bool timestamp_queries_supported = false;
     rt_object_registry<vulkan_buffer, rt_buffer_handle> buffer_registry;
     rt_object_registry<vulkan_texture, rt_texture_handle> texture_registry;
-    vulkan_buffer tlas_instance_buffer{};
-    vulkan_buffer scratch_buffer{};
     rt_object_registry<vulkan_acceleration_structure, rt_blas_handle> blas_registry;
     rt_object_registry<vulkan_acceleration_structure, rt_tlas_handle> tlas_registry;
     rt_object_registry<VkShaderModule, rt_shader_module_handle> shader_module_registry;
@@ -238,9 +238,13 @@ struct vulkan_backend_state {
     rt_shader_table_handle shader_table_handle{};
     std::size_t tlas_instance_count = 0;
     vulkan_acceleration_build_context acceleration_build{};
+    vulkan_buffer scratch_buffer{};
     VkDescriptorSetLayout descriptor_set_layout = VK_NULL_HANDLE;
     VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
-    VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+    std::array<VkDescriptorSet, kRtCommandSlotCount> descriptor_sets{};
+    std::vector<rt_binding_write> pending_binding_writes;
+    std::uint64_t binding_generation = 0;
+    std::array<std::uint64_t, kRtCommandSlotCount> command_slot_binding_generations{};
     VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
     vulkan_buffer shader_binding_table{};
@@ -430,7 +434,7 @@ bool submit_command_buffer(
     vulkan_backend_state &state,
     double* out_submit_cpu_ms,
     rt_submission_token* out_submission = nullptr);
-bool wait_for_all_command_slots(vulkan_backend_state &state);
+bool is_submission_complete(vulkan_backend_state &state, rt_submission_token submission);
 
 #if defined(_WIN32)
 constexpr std::array<const char*, 9> kRequiredDeviceExtensions = {
@@ -513,7 +517,9 @@ void defer_native_buffer_release(vulkan_backend_state &state, vulkan_buffer* buf
     if (buffer == nullptr || buffer->buffer == VK_NULL_HANDLE) {
         return;
     }
-    const rt_submission_token submission = latest_submission(state);
+    const rt_submission_token submission = state.active_encoder_id != 0
+        ? rt_submission_token{state.next_submission_serial}
+        : latest_submission(state);
     if (!submission || submission.serial <= state.completed_submission_serial) {
         destroy_native_buffer(state, buffer);
         return;
@@ -611,6 +617,7 @@ void reset_vulkan_state_locked(vulkan_backend_state &state) {
     }
     if (state.device != VK_NULL_HANDLE) {
         for (vulkan_command_slot &slot : state.command_slots) {
+            destroy_native_buffer(state, &slot.tlas_instance_buffer);
             if (slot.fence != VK_NULL_HANDLE) {
                 vkDestroyFence(state.device, slot.fence, nullptr);
             }
@@ -620,6 +627,7 @@ void reset_vulkan_state_locked(vulkan_backend_state &state) {
             slot = {};
         }
     }
+    destroy_native_buffer(state, &state.scratch_buffer);
     state.buffer_registry.clear([&state](vulkan_buffer &buffer) {
         destroy_native_buffer(state, &buffer);
     });
@@ -648,10 +656,14 @@ void reset_vulkan_state_locked(vulkan_backend_state &state) {
         vkDestroyDescriptorPool(state.device, state.descriptor_pool, nullptr);
         state.descriptor_pool = VK_NULL_HANDLE;
     }
+    state.descriptor_sets = {};
     if (state.descriptor_set_layout != VK_NULL_HANDLE && state.device != VK_NULL_HANDLE) {
         vkDestroyDescriptorSetLayout(state.device, state.descriptor_set_layout, nullptr);
         state.descriptor_set_layout = VK_NULL_HANDLE;
     }
+    state.pending_binding_writes.clear();
+    state.binding_generation = 0;
+    state.command_slot_binding_generations = {};
     destroy_tlas_handle(state);
     state.tlas_registry.clear([&state](vulkan_acceleration_structure &accel) {
         destroy_acceleration_structure(state, &accel);
@@ -661,8 +673,6 @@ void reset_vulkan_state_locked(vulkan_backend_state &state) {
         destroy_acceleration_structure(state, &accel);
     });
     collect_deferred_releases(state, true);
-    destroy_native_buffer(state, &state.scratch_buffer);
-    destroy_native_buffer(state, &state.tlas_instance_buffer);
     state.shader_module_registry.clear([&state](VkShaderModule &shader_module) {
         destroy_native_shader_module(state, &shader_module);
     });
@@ -1073,20 +1083,23 @@ bool create_native_buffer(
     if (out_buffer == nullptr) {
         return false;
     }
-    defer_native_buffer_release(state, out_buffer);
+
+    vulkan_buffer created{};
 
     VkBufferCreateInfo buffer_info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     buffer_info.size = size;
     buffer_info.usage = usage;
     buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    if (vkCreateBuffer(state.device, &buffer_info, nullptr, &out_buffer->buffer) != VK_SUCCESS) {
+    const VkResult create_result = vkCreateBuffer(state.device, &buffer_info, nullptr, &created.buffer);
+    if (create_result != VK_SUCCESS) {
         return false;
     }
 
     VkMemoryRequirements memory_requirements{};
-    vkGetBufferMemoryRequirements(state.device, out_buffer->buffer, &memory_requirements);
+    vkGetBufferMemoryRequirements(state.device, created.buffer, &memory_requirements);
     const std::uint32_t memory_index = find_memory_type_index(state, memory_requirements.memoryTypeBits, memory_flags);
     if (memory_index == UINT32_MAX) {
+        destroy_native_buffer(state, &created);
         return false;
     }
 
@@ -1101,13 +1114,20 @@ bool create_native_buffer(
     if (allocate_flags.flags != 0u) {
         allocate_info.pNext = &allocate_flags;
     }
-    if (vkAllocateMemory(state.device, &allocate_info, nullptr, &out_buffer->memory) != VK_SUCCESS) {
+    const VkResult allocate_result = vkAllocateMemory(state.device, &allocate_info, nullptr, &created.memory);
+    if (allocate_result != VK_SUCCESS) {
+        destroy_native_buffer(state, &created);
         return false;
     }
-    if (vkBindBufferMemory(state.device, out_buffer->buffer, out_buffer->memory, 0) != VK_SUCCESS) {
+    const VkResult bind_result = vkBindBufferMemory(state.device, created.buffer, created.memory, 0);
+    if (bind_result != VK_SUCCESS) {
+        destroy_native_buffer(state, &created);
         return false;
     }
-    out_buffer->size = size;
+    created.size = size;
+    created.memory_flags = memory_flags;
+    defer_native_buffer_release(state, out_buffer);
+    *out_buffer = created;
     return true;
 }
 
@@ -1900,9 +1920,10 @@ bool vulkan_rhi_device::build_tlas(
     if (tlas == nullptr) {
         return false;
     }
+    vulkan_command_slot &slot = native_state_.command_slots[native_state_.active_command_slot_index];
     if (request.instance_count == 0) {
         defer_acceleration_release(native_state_, tlas);
-        destroy_native_buffer(native_state_, &native_state_.tlas_instance_buffer);
+        destroy_native_buffer(native_state_, &slot.tlas_instance_buffer);
         native_state_.tlas_instance_count = 0;
         return true;
     }
@@ -1944,7 +1965,7 @@ bool vulkan_rhi_device::build_tlas(
     const auto instance_upload_start = std::chrono::steady_clock::now();
     const bool instance_uploaded = ensure_uploaded_buffer(
         native_state_,
-        &native_state_.tlas_instance_buffer,
+        &slot.tlas_instance_buffer,
         instances.size() * sizeof(VkAccelerationStructureInstanceKHR),
         VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
             VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
@@ -1960,9 +1981,29 @@ bool vulkan_rhi_device::build_tlas(
         }
         return false;
     }
+    VkBufferMemoryBarrier instance_upload_barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    instance_upload_barrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+    instance_upload_barrier.dstAccessMask =
+        VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+    instance_upload_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    instance_upload_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    instance_upload_barrier.buffer = slot.tlas_instance_buffer.buffer;
+    instance_upload_barrier.offset = 0;
+    instance_upload_barrier.size = VK_WHOLE_SIZE;
+    vkCmdPipelineBarrier(
+        native_state_.command_buffer,
+        VK_PIPELINE_STAGE_HOST_BIT,
+        VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+        0,
+        0,
+        nullptr,
+        1,
+        &instance_upload_barrier,
+        0,
+        nullptr);
 
     context.top_instances.arrayOfPointers = VK_FALSE;
-    context.top_instances.data.deviceAddress = buffer_device_address(native_state_, native_state_.tlas_instance_buffer);
+    context.top_instances.data.deviceAddress = buffer_device_address(native_state_, slot.tlas_instance_buffer);
     context.top_geometry.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
     context.top_geometry.geometry.instances = context.top_instances;
     context.top_build_range.primitiveCount = static_cast<std::uint32_t>(instances.size());
@@ -1988,11 +2029,8 @@ bool vulkan_rhi_device::build_tlas(
     native_state_.diagnostics.tlas_prebuild_query_ms += prebuild_ms;
     ++native_state_.diagnostics.tlas_prebuild_query_count;
 
-    context.can_update_tlas =
-        (request.flags & rt_acceleration_build_allow_update) != 0u &&
-        tlas->handle != VK_NULL_HANDLE &&
-        native_state_.tlas_instance_count == instances.size() &&
-        tlas->storage.size >= top_build_sizes.accelerationStructureSize;
+    context.can_update_tlas = false;
+    defer_acceleration_release(native_state_, tlas);
     const auto accel_alloc_start = std::chrono::steady_clock::now();
     const bool acceleration_allocated = ensure_acceleration_structure(
         native_state_,
@@ -2184,33 +2222,46 @@ bool ensure_descriptor_set(
                     return entry.type == type;
                 });
             if (existing == pool_sizes.end()) {
-                pool_sizes.push_back({type, 1});
+                pool_sizes.push_back({
+                    type,
+                    static_cast<std::uint32_t>(kRtCommandSlotCount)});
             } else {
-                ++existing->descriptorCount;
+                existing->descriptorCount += kRtCommandSlotCount;
             }
         }
         VkDescriptorPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-        pool_info.maxSets = 1;
+        pool_info.maxSets = kRtCommandSlotCount;
         pool_info.poolSizeCount = static_cast<std::uint32_t>(pool_sizes.size());
         pool_info.pPoolSizes = pool_sizes.data();
         if (vkCreateDescriptorPool(state.device, &pool_info, nullptr, &state.descriptor_pool) != VK_SUCCESS) {
             return false;
         }
     }
-    if (state.descriptor_set == VK_NULL_HANDLE) {
+    if (state.descriptor_sets[0] == VK_NULL_HANDLE) {
+        std::array<VkDescriptorSetLayout, kRtCommandSlotCount> layouts{};
+        layouts.fill(state.descriptor_set_layout);
         VkDescriptorSetAllocateInfo alloc_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
         alloc_info.descriptorPool = state.descriptor_pool;
-        alloc_info.descriptorSetCount = 1;
-        alloc_info.pSetLayouts = &state.descriptor_set_layout;
-        if (vkAllocateDescriptorSets(state.device, &alloc_info, &state.descriptor_set) != VK_SUCCESS) {
+        alloc_info.descriptorSetCount = kRtCommandSlotCount;
+        alloc_info.pSetLayouts = layouts.data();
+        if (vkAllocateDescriptorSets(
+                state.device,
+                &alloc_info,
+                state.descriptor_sets.data()) != VK_SUCCESS) {
             return false;
         }
     }
     return true;
 }
 
-bool update_descriptor_set(vulkan_backend_state &state, const rt_binding_update_request &request) {
-    if (!ensure_descriptor_set(state, request) || request.writes == nullptr || request.write_count == 0) {
+bool update_descriptor_set(
+    vulkan_backend_state &state,
+    const rt_binding_update_request &request,
+    std::uint32_t slot_index)
+{
+    if (slot_index >= kRtCommandSlotCount ||
+        !ensure_descriptor_set(state, request) ||
+        request.writes == nullptr || request.write_count == 0) {
         return false;
     }
     std::vector<VkDescriptorBufferInfo> buffer_infos(request.write_count);
@@ -2222,7 +2273,7 @@ bool update_descriptor_set(vulkan_backend_state &state, const rt_binding_update_
         const rt_binding_write &source = request.writes[index];
         VkWriteDescriptorSet &write = writes[index];
         write = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-        write.dstSet = state.descriptor_set;
+        write.dstSet = state.descriptor_sets[slot_index];
         write.dstBinding = source.location.binding;
         write.descriptorCount = 1;
         write.descriptorType = vulkan_descriptor_type(source.type);
@@ -2273,6 +2324,28 @@ bool update_descriptor_set(vulkan_backend_state &state, const rt_binding_update_
         nullptr);
     return true;
 }
+
+std::uint32_t descriptor_target_slot(const vulkan_backend_state &state) {
+    return state.active_encoder_id != 0
+        ? state.active_command_slot_index
+        : state.command_slot_index % kRtCommandSlotCount;
+}
+
+bool refresh_command_slot_bindings(vulkan_backend_state &state, std::uint32_t slot_index) {
+    if (state.pending_binding_writes.empty() ||
+        state.command_slot_binding_generations[slot_index] == state.binding_generation) {
+        return true;
+    }
+    const rt_binding_update_request request{
+        state.pending_binding_writes.data(),
+        state.pending_binding_writes.size()};
+    if (!update_descriptor_set(state, request, slot_index)) {
+        return false;
+    }
+    state.command_slot_binding_generations[slot_index] = state.binding_generation;
+    return true;
+}
+
 bool ensure_pipeline_layout(vulkan_backend_state &state) {
     if (state.pipeline_layout != VK_NULL_HANDLE) {
         return true;
@@ -2665,20 +2738,6 @@ bool submit_command_buffer(
     return submitted;
 }
 
-bool wait_for_all_command_slots(vulkan_backend_state &state) {
-    for (std::uint32_t slot_index = 0; slot_index < kRtCommandSlotCount; ++slot_index) {
-        vulkan_command_slot &slot = state.command_slots[slot_index];
-        if (!slot.submitted) {
-            continue;
-        }
-        if (vkWaitForFences(state.device, 1, &slot.fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
-            return false;
-        }
-        complete_command_slot(state, slot_index);
-    }
-    return true;
-}
-
 bool end_and_submit_command_buffer(
     vulkan_backend_state &state,
     double* out_submit_cpu_ms = nullptr,
@@ -2946,11 +3005,27 @@ bool vulkan_rhi_device::begin_commands(
     if (out_encoder != nullptr) {
         *out_encoder = {};
     }
-    if (device_.native_state != &native_state_ ||
-        out_encoder == nullptr || queue != rt_queue_class::graphics ||
-        native_state_.active_encoder_id != 0 || !begin_command_buffer(native_state_)) {
+    if (device_.native_state != &native_state_) {
         if (out_error != nullptr) {
-            *out_error = {rt_device_operation::begin_commands, 0, "Vulkan command begin failed"};
+            *out_error = {rt_device_operation::begin_commands, 0, "Vulkan command device state is invalid"};
+        }
+        return false;
+    }
+    if (out_encoder == nullptr || queue != rt_queue_class::graphics) {
+        if (out_error != nullptr) {
+            *out_error = {rt_device_operation::begin_commands, 0, "Vulkan command queue request is invalid"};
+        }
+        return false;
+    }
+    if (native_state_.active_encoder_id != 0) {
+        if (out_error != nullptr) {
+            *out_error = {rt_device_operation::begin_commands, 0, "Vulkan command encoder is already active"};
+        }
+        return false;
+    }
+    if (!begin_command_buffer(native_state_)) {
+        if (out_error != nullptr) {
+            *out_error = {rt_device_operation::begin_commands, 0, "Vulkan command buffer begin failed"};
         }
         return false;
     }
@@ -3274,6 +3349,27 @@ bool vulkan_rhi_device::copy_buffer(
         }
         return false;
     }
+    if ((source_buffer->memory_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0u) {
+        VkBufferMemoryBarrier source_barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+        source_barrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+        source_barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        source_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        source_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        source_barrier.buffer = source_buffer->buffer;
+        source_barrier.offset = 0;
+        source_barrier.size = VK_WHOLE_SIZE;
+        vkCmdPipelineBarrier(
+            native_state_.command_buffer,
+            VK_PIPELINE_STAGE_HOST_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0,
+            0,
+            nullptr,
+            1,
+            &source_barrier,
+            0,
+            nullptr);
+    }
     const VkBufferCopy copy{
         region.source_offset,
         region.destination_offset,
@@ -3397,12 +3493,23 @@ bool vulkan_rhi_device::trace_rays(
         native_state_.miss_region.deviceAddress != 0u &&
         native_state_.hit_region.deviceAddress != 0u &&
         native_state_.pipeline_layout != VK_NULL_HANDLE &&
-        native_state_.descriptor_set != VK_NULL_HANDLE &&
+        native_state_.descriptor_sets[native_state_.active_command_slot_index] != VK_NULL_HANDLE &&
         native_state_.cmd_trace_rays != nullptr &&
         desc.width > 0u && desc.height > 0u && desc.depth > 0u;
     if (!valid) {
         if (out_error != nullptr) {
             *out_error = {rt_device_operation::trace_rays, 0, "Vulkan ray trace request is invalid"};
+        }
+        return false;
+    }
+    if (!refresh_command_slot_bindings(
+            native_state_,
+            native_state_.active_command_slot_index)) {
+        if (out_error != nullptr) {
+            *out_error = {
+                rt_device_operation::update_bindings,
+                0,
+                "Vulkan descriptor snapshot refresh failed"};
         }
         return false;
     }
@@ -3420,7 +3527,7 @@ bool vulkan_rhi_device::trace_rays(
         native_state_.pipeline_layout,
         0,
         1,
-        &native_state_.descriptor_set,
+        &native_state_.descriptor_sets[native_state_.active_command_slot_index],
         1,
         &viewer_constant_offset);
     if (desc.measure_gpu_time) {
@@ -3466,12 +3573,41 @@ bool vulkan_rhi_device::update_bindings(
     const rt_binding_update_request &request,
     rt_device_error* out_error)
 {
-    if (device_.native_state != &native_state_ || !update_descriptor_set(native_state_, request)) {
+    if (device_.native_state != &native_state_ ||
+        request.writes == nullptr || request.write_count == 0) {
+        if (out_error != nullptr) {
+            out_error->detail = "Vulkan descriptor binding update request is invalid";
+        }
+        return false;
+    }
+
+    native_state_.pending_binding_writes.assign(
+        request.writes,
+        request.writes + request.write_count);
+    ++native_state_.binding_generation;
+    const std::uint32_t slot_index = descriptor_target_slot(native_state_);
+    if (native_state_.active_encoder_id == 0) {
+        vulkan_command_slot &slot = native_state_.command_slots[slot_index];
+        if (slot.submitted) {
+            if (vkWaitForFences(native_state_.device, 1, &slot.fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
+                if (out_error != nullptr) {
+                    out_error->detail = "Vulkan descriptor binding slot wait failed";
+                }
+                return false;
+            }
+            complete_command_slot(native_state_, slot_index);
+        }
+    }
+    const rt_binding_update_request pending_request{
+        native_state_.pending_binding_writes.data(),
+        native_state_.pending_binding_writes.size()};
+    if (!update_descriptor_set(native_state_, pending_request, slot_index)) {
         if (out_error != nullptr) {
             out_error->detail = "Vulkan descriptor binding update failed";
         }
         return false;
     }
+    native_state_.command_slot_binding_generations[slot_index] = native_state_.binding_generation;
     return true;
 }
 

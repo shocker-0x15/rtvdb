@@ -21,6 +21,7 @@ enum class log_event_kind {
     push_layer,
     pop_layer,
     end_frame,
+    request_capture,
     connection_closed,
 };
 
@@ -39,6 +40,10 @@ struct log_entry {
 
 struct session_callbacks {
     void (*frame_ready)(const viewer_backend::frame_scene* scene, void* user_data);
+    void (*capture_requested)(
+        std::uint64_t connection_serial,
+        bool full_accumulation,
+        void* user_data);
     void* user_data;
 };
 

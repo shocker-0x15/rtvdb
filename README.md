@@ -129,12 +129,16 @@ enum class reference_grid : std::uint32_t {
     yz_grid,
 };
 bool set_reference_grid(reference_grid value);
+
+// Request a render PNG from the viewer. The default waits for full accumulation;
+// pass false to save at the first sample.
+bool request_capture(bool full_accumulation = true);
 ```
 
 - ローカル viewer (`127.0.0.1:47909`) への既定接続は、最初の送信系 API 呼び出し時に暗黙接続されます。別ホストへ接続する場合は `connect()` を明示します。\
 The default connection to the local viewer (`127.0.0.1:47909`) is established implicitly on the first sending API call. Call `connect()` explicitly to connect to another host.
-- `push_layer("name")` / `pop_layer()` で primitive をレイヤーに分類できます。入れ子は親子関係を持って viewer の Layers UI に表示されます。\
-`push_layer("name")` / `pop_layer()` classify primitives into layers. Nested layers form parent-child relationships in the viewer's Layers UI.
+- `push_layer("name")` / `push_layerf("mesh_%u", mesh_id)` / `pop_layer()` で primitive をレイヤーに分類できます。`push_layerf()` は `printf` と同じ形式指定でレイヤー名を組み立てます。入れ子は親子関係を持って viewer の Layers UI に表示されます。\
+`push_layer("name")` / `push_layerf("mesh_%u", mesh_id)` / `pop_layer()` classify primitives into layers. `push_layerf()` formats the layer name with `printf`-style arguments. Nested layers form parent-child relationships in the viewer's Layers UI.
 - レイヤー名は空文字と `/` を含む名前を受け付けず、1階層あたり63 byteまでです。\
 Layer names cannot be empty or contain `/`, and are limited to 63 bytes per level.
 - `set_reference_grid()` は viewer に表示する座標軸と基準グリッドの平面の変更を要求します。`off` は非表示、
@@ -144,10 +148,14 @@ Layer names cannot be empty or contain `/`, and are limited to 63 bytes per leve
 hides them, while `xy_grid`, `xz_grid`, and `yz_grid` select the corresponding plane. It is not a persistent client
 setting, so the viewer's `XYZ Grid` setting in the Display UI remains freely editable after the call.
 `viewer_default` makes no change.
+- `request_capture()` は要求受信時点の viewer が保持している scene / 視点を対象にします。scene の snapshot は保持しないため、要求時に表示したい scene を安定した状態で送ることは client 側の責任です。フル accumulation 中に viewer のカメラを操作すると accumulation がリセットされ、保存までの時間が延びることがあります。`request_capture(false)` は accumulation を待たず、その時点の 1 spp 画像を保存します。\
+`request_capture()` captures the scene and view currently held by the viewer when the request is received. It does not retain or copy a scene snapshot, so the client is responsible for keeping the submitted scene stable when requesting a capture. Moving the viewer camera during full accumulation resets accumulation and may delay the save; `request_capture(false)` saves the current 1-spp image without waiting for full accumulation.
+- 保存要求があった場合だけ、Windows/Linux では viewer 実行ファイルと同じディレクトリに、macOS では `~/Library/Application Support/rtvdb/sessions/` にセッションディレクトリを作成します。\
+Capture session directories are created only after a request: beside the viewer executable on Windows/Linux, and under `~/Library/Application Support/rtvdb/sessions/` on macOS.
 
 ## Samples
 
-- `rtvdb_example_client`: Minimal connection check
+- `rtvdb_basic_client`: Minimal connection check
 - `rtvdb_bt2020_volume_client`: Color-gamut volume sample using points and line segments
 - `rtvdb_obj_stream_client`: Sends an OBJ incrementally
 
@@ -267,7 +275,7 @@ WindowsでVulkan RT backendを有効にする場合は、configure時に
 
 主な生成物 / Main build outputs:
 - `build\Debug\rtvdb_viewer.exe`
-- `build\Debug\rtvdb_example_client.exe`
+- `build\Debug\rtvdb_basic_client.exe`
 - `build\Debug\rtvdb_obj_stream_client.exe`
 - `build\Debug\rtvdb_bt2020_volume_client.exe`
 

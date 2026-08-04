@@ -17,6 +17,7 @@
 #endif
 
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 
@@ -256,7 +257,20 @@ void destroy_scene_buffers(rt_device* device, rt_scene_buffer_resources* resourc
     device->api->destroy_buffer(resources->lines);
     device->api->destroy_buffer(resources->point_aabbs);
     device->api->destroy_buffer(resources->line_aabbs);
+    for (const rt_scene_buffer_upload &upload : resources->uploads) {
+        device->api->destroy_buffer(upload.staging);
+    }
     *resources = {};
+}
+
+void destroy_scene_upload_buffers(rt_device* device, rt_scene_buffer_resources* resources) {
+    if (device == nullptr || device->api == nullptr || resources == nullptr) {
+        return;
+    }
+    for (const rt_scene_buffer_upload &upload : resources->uploads) {
+        device->api->destroy_buffer(upload.staging);
+    }
+    resources->uploads.clear();
 }
 
 void destroy_output_resources(rt_device* device) {
@@ -452,16 +466,74 @@ bool create_uploaded_buffer(
     rt_device* device,
     const rt_buffer_desc &desc,
     const void* data,
-    rt_buffer_handle* out_buffer,
+    rt_buffer_handle* out_destination,
+    rt_buffer_handle* out_staging,
     rt_device_error* out_error)
 {
-    if (!device->api->create_buffer(desc, out_buffer, out_error)) {
+    if (out_destination == nullptr || out_staging == nullptr) {
         return false;
     }
-    if (!device->api->upload_buffer(*out_buffer, 0, data, desc.size, out_error)) {
-        device->api->destroy_buffer(*out_buffer);
-        *out_buffer = {};
+    *out_destination = {};
+    *out_staging = {};
+    rt_buffer_desc destination_desc = desc;
+    destination_desc.usage |= rt_buffer_usage_copy_destination;
+    destination_desc.memory_domain = rt_memory_domain::device;
+    const rt_buffer_desc staging_desc{
+        desc.size,
+        rt_buffer_usage_copy_source,
+        rt_memory_domain::upload};
+    if (!device->api->create_buffer(destination_desc, out_destination, out_error)) {
         return false;
+    }
+    if (desc.size == 0) {
+        return true;
+    }
+    if (!device->api->create_buffer(staging_desc, out_staging, out_error) ||
+        !device->api->upload_buffer(*out_staging, 0, data, desc.size, out_error)) {
+        device->api->destroy_buffer(*out_destination);
+        device->api->destroy_buffer(*out_staging);
+        *out_destination = {};
+        *out_staging = {};
+        return false;
+    }
+    return true;
+}
+
+bool create_scene_uploaded_buffer(
+    rt_device* device,
+    rt_scene_buffer_resources* resources,
+    const char* name,
+    const rt_buffer_desc &desc,
+    const void* data,
+    rt_resource_usage destination_usage,
+    rt_buffer_handle* out_destination,
+    rt_device_error* out_error)
+{
+    if (resources == nullptr || out_destination == nullptr) {
+        return false;
+    }
+    rt_buffer_handle staging{};
+    if (!create_uploaded_buffer(
+            device,
+            desc,
+            data,
+            out_destination,
+            &staging,
+            out_error)) {
+        if (out_error != nullptr) {
+            char detail[160]{};
+            std::snprintf(
+                detail,
+                sizeof(detail),
+                "RT scene buffer creation failed: %s (%zu bytes)",
+                name != nullptr ? name : "unnamed",
+                desc.size);
+            out_error->detail = detail;
+        }
+        return false;
+    }
+    if (staging && desc.size != 0) {
+        resources->uploads.push_back({staging, *out_destination, desc.size, destination_usage});
     }
     return true;
 }
@@ -491,42 +563,60 @@ bool upload_scene_buffers(
     const std::uint32_t acceleration_input_usage =
         rt_buffer_usage_acceleration_build_input | rt_buffer_usage_device_address;
     const std::uint32_t shader_read_usage = rt_buffer_usage_shader_read;
-    if (!create_uploaded_buffer(
+    if (!create_scene_uploaded_buffer(
             device,
+            &next,
+            "positions",
             {resources.positions.size() * sizeof(rt_scene_gpu_position), geometry_usage},
             resources.positions.data(),
+            rt_resource_usage::acceleration_build_input,
             &next.positions,
             out_error) ||
-        !create_uploaded_buffer(
+        !create_scene_uploaded_buffer(
             device,
+            &next,
+            "indices",
             {resources.indices.size() * sizeof(std::uint32_t), geometry_usage},
             resources.indices.data(),
+            rt_resource_usage::acceleration_build_input,
             &next.indices,
             out_error) ||
-        !create_uploaded_buffer(
+        !create_scene_uploaded_buffer(
             device,
+            &next,
+            "triangle_colors",
             {resources.triangle_colors.size() * sizeof(rtvdb::rgba), shader_read_usage},
             resources.triangle_colors.data(),
+            rt_resource_usage::shader_read,
             &next.triangle_colors,
             out_error) ||
-        !create_uploaded_buffer(
+        !create_scene_uploaded_buffer(
             device,
+            &next,
+            "instance_metadata",
             {
                 resources.instance_geometry.size() * sizeof(rt_scene_geometry_metadata),
                 shader_read_usage},
             resources.instance_geometry.data(),
+            rt_resource_usage::shader_read,
             &next.instance_metadata,
             out_error) ||
-        !create_uploaded_buffer(
+        !create_scene_uploaded_buffer(
             device,
+            &next,
+            "points",
             {resources.points.size() * sizeof(rt_scene_gpu_point), shader_read_usage},
             resources.points.data(),
+            rt_resource_usage::shader_read,
             &next.points,
             out_error) ||
-        !create_uploaded_buffer(
+        !create_scene_uploaded_buffer(
             device,
+            &next,
+            "lines",
             {resources.lines.size() * sizeof(rt_scene_gpu_line), shader_read_usage},
             resources.lines.data(),
+            rt_resource_usage::shader_read,
             &next.lines,
             out_error)) {
         destroy_scene_buffers(device, &next);
@@ -544,17 +634,23 @@ bool upload_scene_buffers(
         current.line_aabb_count == resources.line_aabbs.size();
     const auto aabb_upload_start = std::chrono::steady_clock::now();
     if ((!reuse_point_aabbs && !resources.point_aabbs.empty() &&
-            !create_uploaded_buffer(
+            !create_scene_uploaded_buffer(
                 device,
+                &next,
+                "point_aabbs",
                 {resources.point_aabbs.size() * sizeof(rt_scene_gpu_aabb), acceleration_input_usage},
                 resources.point_aabbs.data(),
+                rt_resource_usage::acceleration_build_input,
                 &next.point_aabbs,
                 out_error)) ||
         (!reuse_line_aabbs && !resources.line_aabbs.empty() &&
-            !create_uploaded_buffer(
+            !create_scene_uploaded_buffer(
                 device,
+                &next,
+                "line_aabbs",
                 {resources.line_aabbs.size() * sizeof(rt_scene_gpu_aabb), acceleration_input_usage},
                 resources.line_aabbs.data(),
+                rt_resource_usage::acceleration_build_input,
                 &next.line_aabbs,
                 out_error))) {
         destroy_scene_buffers(device, &next);
@@ -636,6 +732,59 @@ bool rt_blas_cache_contains(
     return false;
 }
 
+bool record_scene_buffer_uploads(
+    rt_device* device,
+    rt_command_encoder encoder,
+    const rt_scene_buffer_resources &resources,
+    rt_device_error* out_error)
+{
+    for (const rt_scene_buffer_upload &upload : resources.uploads) {
+        if (!upload.staging || !upload.destination || upload.size == 0 ||
+            !transition_rt_buffer(
+                device,
+                encoder,
+                upload.destination,
+                rt_resource_usage::copy_destination,
+                out_error) ||
+            !record_rt_buffer_copy(
+                device,
+                encoder,
+                upload.staging,
+                upload.destination,
+                {0, 0, upload.size},
+                out_error) ||
+            !transition_rt_buffer(
+                device,
+                encoder,
+                upload.destination,
+                upload.destination_usage,
+                out_error)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool transition_triangle_geometry_to_shader_read(
+    rt_device* device,
+    rt_command_encoder encoder,
+    const rt_scene_buffer_resources &resources,
+    rt_device_error* out_error)
+{
+    return (!resources.positions || transition_rt_buffer(
+                device,
+                encoder,
+                resources.positions,
+                rt_resource_usage::shader_read,
+                out_error)) &&
+        (!resources.indices || transition_rt_buffer(
+                device,
+                encoder,
+                resources.indices,
+                rt_resource_usage::shader_read,
+                out_error));
+}
+
 void destroy_rt_blas_cache(rt_device* device, rt_blas_cache_state* state) {
     if (device == nullptr || device->api == nullptr || state == nullptr) {
         return;
@@ -700,6 +849,7 @@ bool sync_rt_device_acceleration(
         if (!device->api->create_tlas(&device->tlas, &stage_error) ||
             !device->tlas) {
             discard_rt_commands(device, encoder);
+            destroy_scene_upload_buffers(device, &device->scene_buffers);
             if (out_error != nullptr) {
                 *out_error = stage_error;
             }
@@ -708,6 +858,7 @@ bool sync_rt_device_acceleration(
     }
     const auto fail_build = [&]() {
         discard_rt_commands(device, encoder);
+        destroy_scene_upload_buffers(device, &device->scene_buffers);
         for (rt_blas_handle acceleration : created_accelerations) {
             device->api->destroy_blas(acceleration);
         }
@@ -716,6 +867,10 @@ bool sync_rt_device_acceleration(
         }
         return false;
     };
+
+    if (!record_scene_buffer_uploads(device, encoder, device->scene_buffers, &stage_error)) {
+        return fail_build();
+    }
 
     rt_acceleration_build_summary summary{};
     device->last_point_blas_prebuild_info_ms = 0.0;
@@ -808,6 +963,13 @@ bool sync_rt_device_acceleration(
     if (!device->api->build_tlas(encoder, tlas_desc, &stage_error)) {
         return fail_build();
     }
+    if (!transition_triangle_geometry_to_shader_read(
+            device,
+            encoder,
+            device->scene_buffers,
+            &stage_error)) {
+        return fail_build();
+    }
     summary.tlas_rebuild_count = tlas_instances.empty() ? 0 : 1;
 
     std::vector<rt_blas_handle> retired_accelerations;
@@ -852,6 +1014,7 @@ bool sync_rt_device_acceleration(
     for (rt_blas_handle acceleration : retired_accelerations) {
         device->api->destroy_blas(acceleration);
     }
+    destroy_scene_upload_buffers(device, &device->scene_buffers);
     return true;
 }
 
@@ -867,6 +1030,7 @@ void commit_deferred_acceleration_submission(
     for (rt_blas_handle acceleration : deferred_acceleration->retired_accelerations) {
         device->api->destroy_blas(acceleration);
     }
+    destroy_scene_upload_buffers(device, &device->scene_buffers);
     device->frame_state.scene_revision = deferred_acceleration->scene_revision;
     device->frame_state.scene_valid = true;
     *deferred_acceleration = {};
@@ -884,6 +1048,7 @@ void discard_deferred_acceleration_submission(
     for (rt_blas_handle acceleration : deferred_acceleration->created_accelerations) {
         device->api->destroy_blas(acceleration);
     }
+    destroy_scene_upload_buffers(device, &device->scene_buffers);
     *deferred_acceleration = {};
 }
 
@@ -2177,7 +2342,7 @@ bool prepare_rt_device_frame(
             set_frame_error(out_error, rt_device_operation::begin_frame, "RT BLAS cache update plan is invalid");
             return false;
         }
-        if (!device->blas_reuse_enabled) {
+        if (!device->blas_reuse_enabled || result.scene_changed) {
             for (rt_blas_cache_assignment &assignment : blas_cache_plan.assignments) {
                 assignment.reuse_candidate = false;
             }

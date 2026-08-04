@@ -51,6 +51,13 @@ enum class rt_device_operation : std::uint32_t {
     end_frame,
 };
 
+struct rt_scene_buffer_upload {
+    rt_buffer_handle staging{};
+    rt_buffer_handle destination{};
+    std::size_t size = 0;
+    rt_resource_usage destination_usage = rt_resource_usage::undefined;
+};
+
 struct rt_scene_buffer_resources {
     rt_buffer_handle positions{};
     rt_buffer_handle indices{};
@@ -72,6 +79,7 @@ struct rt_scene_buffer_resources {
     std::uint64_t line_geometry_fingerprint = 0;
     std::uint64_t revision = 0;
     double procedural_aabb_upload_ms = 0.0;
+    std::vector<rt_scene_buffer_upload> uploads;
 };
 
 struct rt_binding_write {

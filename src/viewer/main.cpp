@@ -29,6 +29,8 @@
 #include <cstdint>
 #include <cstring>
 #include <cwchar>
+#include <ctime>
+#include <deque>
 #include <exception>
 #include <cstdio>
 #include <filesystem>
@@ -364,6 +366,21 @@ bool g_layer_rebuild_stop = false;
 float g_viewer_window_height = 0.0f;
 float g_camera_speed_log10 = 0.0f;
 std::wstring g_last_manual_png_directory;
+struct client_capture_request {
+    // Capture requests retain control metadata only; rendering uses the current viewer scene.
+    std::uint64_t connection_serial = 0;
+    bool full_accumulation = true;
+};
+
+std::mutex g_client_capture_mutex;
+std::deque<client_capture_request> g_client_capture_requests;
+bool g_client_capture_active = false;
+bool g_client_capture_full_accumulation = true;
+bool g_client_capture_readback_pending = false;
+std::uint64_t g_client_capture_connection_serial = 0;
+std::filesystem::path g_client_capture_directory;
+std::filesystem::path g_client_capture_path;
+std::uint32_t g_client_capture_sequence = 0;
 #if defined(_WIN32)
 HANDLE g_viewer_single_instance_mutex = nullptr;
 #endif
@@ -399,6 +416,15 @@ constexpr const char* kViewerUsage =
     "  -h, --help                           Show this usage\n";
 
 std::wstring capture_directory();
+std::filesystem::path client_capture_directory(std::uint64_t connection_serial);
+std::wstring client_capture_filename(std::uint32_t sequence);
+void on_capture_requested(
+    std::uint64_t connection_serial,
+    bool full_accumulation,
+    void* user_data);
+void prepare_pending_client_capture();
+void process_pending_client_capture(bool has_frame);
+void complete_pending_client_capture_readback();
 std::wstring join_capture_path(const std::wstring &directory, const std::wstring &filename);
 std::wstring default_manual_png_path();
 std::string wide_to_utf8_lossy(const std::wstring &text);
@@ -742,6 +768,168 @@ std::wstring capture_directory() {
     } catch (...) {
         return L"diagnostics";
     }
+}
+
+std::filesystem::path client_capture_directory(std::uint64_t connection_serial) {
+    std::filesystem::path root;
+#if defined(__APPLE__)
+    const char* home = std::getenv("HOME");
+    root = home != nullptr && home[0] != '\0'
+        ? std::filesystem::path(home) / "Library" / "Application Support" / "rtvdb" / "sessions"
+        : std::filesystem::path(".") / "rtvdb_sessions";
+#else
+    root = viewer_executable_directory();
+#endif
+
+    const auto now = std::chrono::system_clock::now();
+    const std::time_t time_value = std::chrono::system_clock::to_time_t(now);
+    std::tm local_time{};
+#if defined(_WIN32)
+    localtime_s(&local_time, &time_value);
+#else
+    localtime_r(&time_value, &local_time);
+#endif
+    wchar_t name[96]{};
+    std::swprintf(
+        name,
+        std::size(name),
+        L"rtvdb_session_%04d%02d%02d_%02d%02d%02d_%06llu",
+        local_time.tm_year + 1900,
+        local_time.tm_mon + 1,
+        local_time.tm_mday,
+        local_time.tm_hour,
+        local_time.tm_min,
+        local_time.tm_sec,
+        static_cast<unsigned long long>(connection_serial));
+    return root / name;
+}
+
+std::wstring client_capture_filename(std::uint32_t sequence) {
+    const auto now = std::chrono::system_clock::now();
+    const std::time_t time_value = std::chrono::system_clock::to_time_t(now);
+    std::tm local_time{};
+#if defined(_WIN32)
+    localtime_s(&local_time, &time_value);
+#else
+    localtime_r(&time_value, &local_time);
+#endif
+    wchar_t name[96]{};
+    std::swprintf(
+        name,
+        std::size(name),
+        L"render_%04d%02d%02d_%02d%02d%02d_%03u.png",
+        local_time.tm_year + 1900,
+        local_time.tm_mon + 1,
+        local_time.tm_mday,
+        local_time.tm_hour,
+        local_time.tm_min,
+        local_time.tm_sec,
+        sequence);
+    return name;
+}
+
+void on_capture_requested(
+    std::uint64_t connection_serial,
+    bool full_accumulation,
+    void*) {
+    {
+        std::scoped_lock lock(g_client_capture_mutex);
+        client_capture_request request{};
+        request.connection_serial = connection_serial;
+        request.full_accumulation = full_accumulation;
+        g_client_capture_requests.push_back(std::move(request));
+    }
+    rtvdb::viewer_shell::request_repaint();
+}
+
+void prepare_pending_client_capture() {
+    if (g_client_capture_active) {
+        return;
+    }
+
+    client_capture_request request{};
+    bool has_request = false;
+    {
+        std::scoped_lock lock(g_client_capture_mutex);
+        if (!g_client_capture_requests.empty()) {
+            request = g_client_capture_requests.front();
+            g_client_capture_requests.pop_front();
+            has_request = true;
+        }
+    }
+    if (!has_request) {
+        return;
+    }
+
+    g_client_capture_active = true;
+    g_client_capture_full_accumulation = request.full_accumulation;
+    g_client_capture_readback_pending = false;
+    g_client_capture_path.clear();
+    if (g_client_capture_connection_serial != request.connection_serial) {
+        g_client_capture_connection_serial = request.connection_serial;
+        g_client_capture_directory.clear();
+        g_client_capture_sequence = 0;
+    }
+}
+
+void process_pending_client_capture(bool has_frame) {
+    if (!g_client_capture_active ||
+        g_client_capture_readback_pending ||
+        !has_frame) {
+        return;
+    }
+    if (rtvdb::viewer_backend::build_in_progress() ||
+        (g_client_capture_full_accumulation && rtvdb::viewer_backend::accumulation_in_progress())) {
+        rtvdb::viewer_shell::request_repaint();
+        return;
+    }
+
+    try {
+        if (g_client_capture_directory.empty()) {
+            g_client_capture_directory = client_capture_directory(g_client_capture_connection_serial);
+            std::filesystem::create_directories(g_client_capture_directory);
+        }
+        g_client_capture_path = g_client_capture_directory / client_capture_filename(g_client_capture_sequence);
+        g_client_capture_readback_pending = true;
+        rtvdb::viewer_shell::request_repaint();
+    } catch (...) {
+        g_client_capture_active = false;
+        append_manual_png_save_log(true, std::wstring(), "client capture directory creation failed");
+    }
+}
+
+void complete_pending_client_capture_readback() {
+    if (!g_client_capture_readback_pending) {
+        return;
+    }
+
+    int render_width = kDefaultCaptureWidth;
+    int render_height = kDefaultCaptureHeight;
+    rtvdb::viewer_shell::render_window_size(&render_width, &render_height);
+    std::vector<std::uint8_t> pixels;
+    if (!rtvdb::viewer_backend::readback_current_frame_to_bgra(
+            render_width,
+            render_height,
+            &pixels) ||
+        pixels.empty()) {
+        rtvdb::viewer_shell::request_repaint();
+        return;
+    }
+
+    const bool saved = rtvdb::viewer_capture::write_png_bgra8(
+        g_client_capture_path.wstring().c_str(),
+        pixels.data(),
+        render_width,
+        render_height,
+        render_width * 4);
+    const std::wstring path = g_client_capture_path.wstring();
+    if (saved) {
+        ++g_client_capture_sequence;
+    }
+    g_client_capture_active = false;
+    g_client_capture_readback_pending = false;
+    g_client_capture_path.clear();
+    append_manual_png_save_log(!saved, path, saved ? nullptr : "client capture png write failed");
 }
 
 std::uint64_t monotonic_time_ms() {
@@ -2783,6 +2971,8 @@ const char* log_event_label(rtvdb::viewer_session::log_event_kind kind) {
         return "pop_layer";
     case rtvdb::viewer_session::log_event_kind::end_frame:
         return "end_frame";
+    case rtvdb::viewer_session::log_event_kind::request_capture:
+        return "request_capture";
     case rtvdb::viewer_session::log_event_kind::connection_closed:
         return "connection_closed";
     default:
@@ -3654,6 +3844,12 @@ void draw_scene_to_paint_context(void*) {
         frame_pacing_state::paint_cpu_timing paint_timing{};
         const bool camera_animation_active = progress_camera_animation();
         process_pending_present_update();
+        if (g_client_capture_readback_pending) {
+            complete_pending_client_capture_readback();
+            if (g_client_capture_readback_pending) {
+                return;
+            }
+        }
         std::shared_ptr<const rtvdb::viewer_backend::frame_scene> scene_snapshot;
         rtvdb::viewer_backend::frame_scene copied_scene{};
         rtvdb::viewer_backend::frame_scene render_scene{};
@@ -3669,6 +3865,8 @@ void draw_scene_to_paint_context(void*) {
             scene = &copied_scene;
             render_input = scene;
         }
+        const bool current_scene_has_frame = has_frame;
+        prepare_pending_client_capture();
         const bool auto_capture_enabled = auto_capture_on_accumulation_complete_enabled();
         const bool accumulation_was_in_progress = has_frame && rtvdb::viewer_backend::accumulation_in_progress();
         if (g_hover_pick_pending) {
@@ -3686,10 +3884,11 @@ void draw_scene_to_paint_context(void*) {
             &paint_timing);
         const auto readback_start = std::chrono::steady_clock::now();
         process_pending_manual_png_capture(has_frame);
+        process_pending_client_capture(has_frame);
         paint_timing.render_target_readback_ms += std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - readback_start).count();
         auto viewer_post_render_start = std::chrono::steady_clock::now();
-        if (has_frame) {
+        if (current_scene_has_frame) {
             maybe_refresh_runtime_build_info_file(scene->frame_serial);
         }
         const bool accumulation_is_in_progress = has_frame && rtvdb::viewer_backend::accumulation_in_progress();
@@ -5829,6 +6028,7 @@ int viewer_main(rtvdb::viewer_shell::platform_app_instance instance, int show_co
 
     const rtvdb::viewer_session::session_callbacks session_callbacks{
         on_frame_ready,
+        on_capture_requested,
         nullptr,
     };
     const rtvdb::viewer_session::session_config session_config{
