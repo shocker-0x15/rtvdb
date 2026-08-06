@@ -375,6 +375,59 @@ void append_dred_breadcrumb_log(ID3D12Device* device) {
     dred->Release();
 }
 
+void append_d3d12_info_queue_log(ID3D12Device* device, const char* stage) {
+    if (device == nullptr) {
+        return;
+    }
+    ID3D12InfoQueue* info_queue = nullptr;
+    if (FAILED(device->QueryInterface(IID_PPV_ARGS(&info_queue))) || info_queue == nullptr) {
+        return;
+    }
+    const UINT64 message_count = info_queue->GetNumStoredMessages();
+    for (UINT64 index = 0; index < message_count; ++index) {
+        SIZE_T message_size = 0;
+        if (FAILED(info_queue->GetMessage(index, nullptr, &message_size)) || message_size == 0) {
+            continue;
+        }
+        std::vector<std::uint8_t> storage(message_size);
+        auto* const message = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
+        if (FAILED(info_queue->GetMessage(index, message, &message_size)) ||
+            message->pDescription == nullptr) {
+            continue;
+        }
+        char line[1024]{};
+        std::snprintf(
+            line,
+            sizeof(line),
+            "DXR D3D12 info queue stage=%s severity=%u id=%u message=%s",
+            stage != nullptr ? stage : "unknown",
+            static_cast<unsigned>(message->Severity),
+            static_cast<unsigned>(message->ID),
+            message->pDescription);
+        append_rt_diagnostics_log_line("dxr_failure.log", line);
+    }
+    info_queue->ClearStoredMessages();
+    info_queue->Release();
+}
+
+void enable_d3d12_debug_layer_if_requested() {
+    const char* const value = std::getenv("RTVDB_ENABLE_D3D12_DEBUG_LAYER");
+    if (value == nullptr ||
+        !(value[0] == '1' || value[0] == 't' || value[0] == 'T' ||
+            value[0] == 'y' || value[0] == 'Y')) {
+        return;
+    }
+    ID3D12Debug* debug = nullptr;
+    const HRESULT hr = D3D12GetDebugInterface(IID_PPV_ARGS(&debug));
+    if (SUCCEEDED(hr) && debug != nullptr) {
+        debug->EnableDebugLayer();
+        debug->Release();
+        append_rt_startup_log("DXR D3D12 debug layer enabled");
+    } else {
+        append_startup_hresult_log("DXR D3D12 debug layer unavailable", hr);
+    }
+}
+
 void record_dxr_failure(dxr_backend_state &state, const char* stage, HRESULT hr = S_OK, const char* detail = nullptr) {
     char line[1024]{};
     if (detail != nullptr && *detail != '\0') {
@@ -891,11 +944,33 @@ bool ensure_buffer_capacity(
     if (out_resource == nullptr) {
         return false;
     }
-    if (*out_resource != nullptr && (*out_resource)->GetDesc().Width >= size_bytes) {
+    const std::size_t current_size = *out_resource != nullptr
+        ? static_cast<std::size_t>((*out_resource)->GetDesc().Width)
+        : 0;
+    if (current_size >= size_bytes) {
         return true;
     }
-    defer_resource_release(state, *out_resource);
-    return create_native_buffer(state, heap_type, size_bytes, initial_state, flags, out_resource);
+    std::size_t target_size = 0;
+    if (!grow_rt_capacity(size_bytes, current_size, 1, &target_size)) {
+        return false;
+    }
+    ID3D12Resource* replacement = nullptr;
+    const bool created = create_native_buffer(
+        state,
+        heap_type,
+        target_size,
+        initial_state,
+        flags,
+        &replacement);
+    if (created) {
+        defer_resource_release(state, *out_resource);
+        *out_resource = replacement;
+        ++state.diagnostics.acceleration_resource_allocation_count;
+        if (current_size != 0) {
+            ++state.diagnostics.acceleration_resource_reallocation_count;
+        }
+    }
+    return created;
 }
 
 bool upload_buffer_data(
@@ -1340,9 +1415,30 @@ bool build_triangle_blas(
     inputs.pGeometryDescs = geometry_descs.data();
     inputs.Flags = dxr_acceleration_build_flags(command.flags);
 
+    std::array<D3D12_RAYTRACING_GEOMETRY_DESC, kRtBlasChunkSetChunkCount> prebuild_geometry_descs =
+        geometry_descs;
+    for (std::size_t geometry_index = 0; geometry_index < command.geometry_count; ++geometry_index) {
+        const std::size_t actual_primitive_count = command.geometries[geometry_index].triangles.index_count / 3u;
+        const std::size_t prebuild_primitive_count = (std::max)(
+            actual_primitive_count,
+            command.allocation_primitive_counts != nullptr
+                ? command.allocation_primitive_counts[geometry_index]
+                : actual_primitive_count);
+        if (prebuild_primitive_count > (std::numeric_limits<UINT>::max)() / 3u) {
+            return false;
+        }
+        prebuild_geometry_descs[geometry_index].Triangles.IndexCount =
+            static_cast<UINT>(prebuild_primitive_count * 3u);
+    }
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS prebuild_inputs = inputs;
+    prebuild_inputs.pGeometryDescs = prebuild_geometry_descs.data();
+
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO prebuild_info{};
     const auto prebuild_start = std::chrono::steady_clock::now();
-    state.device->GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &prebuild_info);
+    state.device->GetRaytracingAccelerationStructurePrebuildInfo(&prebuild_inputs, &prebuild_info);
+    append_device_removed_reason_log(
+        "DXR device removal reason after BLAS triangle prebuild query",
+        state.device);
     double* const prebuild_ms = command.geometry_count == 1
         ? &state.diagnostics.chunk_blas_prebuild_query_ms
         : &state.diagnostics.grouped_blas_prebuild_query_ms;
@@ -1357,7 +1453,6 @@ bool build_triangle_blas(
     if (prebuild_info.ResultDataMaxSizeInBytes == 0) {
         return false;
     }
-
     const auto alloc_start = std::chrono::steady_clock::now();
     if (!ensure_buffer_capacity(
             state,
@@ -1370,6 +1465,11 @@ bool build_triangle_blas(
     }
     state.diagnostics.acceleration_resource_allocate_ms +=
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - alloc_start).count();
+    append_device_removed_reason_log(
+        "DXR device removal reason after BLAS triangle result allocation",
+        state.device);
+    out_result->allocation_size_bytes =
+        static_cast<std::size_t>(entry->result->GetDesc().Width);
 
     dxr_blas_build_record record{};
     record.geometry_descs = geometry_descs;
@@ -1422,9 +1522,29 @@ bool build_procedural_blas(
     inputs.NumDescs = static_cast<UINT>(command.geometry_count);
     inputs.pGeometryDescs = geometry_descs.data();
     inputs.Flags = dxr_acceleration_build_flags(command.flags);
+    std::array<D3D12_RAYTRACING_GEOMETRY_DESC, kRtBlasChunkSetChunkCount> prebuild_geometry_descs =
+        geometry_descs;
+    for (std::size_t geometry_index = 0; geometry_index < command.geometry_count; ++geometry_index) {
+        const std::size_t actual_primitive_count = command.geometries[geometry_index].aabbs.count;
+        const std::size_t prebuild_primitive_count = (std::max)(
+            actual_primitive_count,
+            command.allocation_primitive_counts != nullptr
+                ? command.allocation_primitive_counts[geometry_index]
+                : actual_primitive_count);
+        if (prebuild_primitive_count > (std::numeric_limits<UINT>::max)()) {
+            return false;
+        }
+        prebuild_geometry_descs[geometry_index].AABBs.AABBCount =
+            static_cast<UINT>(prebuild_primitive_count);
+    }
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS prebuild_inputs = inputs;
+    prebuild_inputs.pGeometryDescs = prebuild_geometry_descs.data();
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO prebuild_info{};
     const auto prebuild_start = std::chrono::steady_clock::now();
-    state.device->GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &prebuild_info);
+    state.device->GetRaytracingAccelerationStructurePrebuildInfo(&prebuild_inputs, &prebuild_info);
+    append_device_removed_reason_log(
+        "DXR device removal reason after BLAS procedural prebuild query",
+        state.device);
     const double prebuild_info_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - prebuild_start).count();
     state.diagnostics.acceleration_prebuild_query_ms += prebuild_info_ms;
@@ -1432,7 +1552,6 @@ bool build_procedural_blas(
     if (prebuild_info.ResultDataMaxSizeInBytes == 0) {
         return false;
     }
-
     const auto alloc_start = std::chrono::steady_clock::now();
     if (!ensure_buffer_capacity(
             state,
@@ -1445,6 +1564,11 @@ bool build_procedural_blas(
     }
     state.diagnostics.acceleration_resource_allocate_ms +=
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - alloc_start).count();
+    append_device_removed_reason_log(
+        "DXR device removal reason after BLAS procedural result allocation",
+        state.device);
+    out_result->allocation_size_bytes =
+        static_cast<std::size_t>(entry->result->GetDesc().Width);
 
     dxr_blas_build_record record{};
     record.geometry_descs = geometry_descs;
@@ -1464,6 +1588,9 @@ bool ensure_acceleration_scratch_buffer(dxr_backend_state &state, UINT64 size) {
     if (size == 0) {
         return true;
     }
+    const std::size_t current_size = state.scratch_buffer != nullptr
+        ? static_cast<std::size_t>(state.scratch_buffer->GetDesc().Width)
+        : 0;
     const auto alloc_start = std::chrono::steady_clock::now();
     const bool allocated = ensure_buffer_capacity(
         state,
@@ -1474,6 +1601,16 @@ bool ensure_acceleration_scratch_buffer(dxr_backend_state &state, UINT64 size) {
         &state.scratch_buffer);
     state.diagnostics.acceleration_resource_allocate_ms +=
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - alloc_start).count();
+    if (allocated) {
+        state.diagnostics.scratch_capacity_bytes =
+            static_cast<std::size_t>(state.scratch_buffer->GetDesc().Width);
+        state.diagnostics.scratch_peak_capacity_bytes = (std::max)(
+            state.diagnostics.scratch_peak_capacity_bytes,
+            state.diagnostics.scratch_capacity_bytes);
+        if (current_size != 0 && state.diagnostics.scratch_capacity_bytes > current_size) {
+            ++state.diagnostics.scratch_growth_count;
+        }
+    }
     return allocated;
 }
 
@@ -1498,10 +1635,15 @@ bool record_blas_builds(dxr_backend_state &state) {
         build_desc.ScratchAccelerationStructureData = scratch_address;
         build_desc.DestAccelerationStructureData = record.destination->GetGPUVirtualAddress();
         state.command_list->BuildRaytracingAccelerationStructure(&build_desc, 0, nullptr);
+        append_device_removed_reason_log(
+            "DXR device removal reason after BLAS build recording",
+            state.device);
 
         D3D12_RESOURCE_BARRIER barrier{};
         barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        barrier.UAV.pResource = nullptr;
         state.command_list->ResourceBarrier(1, &barrier);
+        append_d3d12_info_queue_log(state.device, "after BLAS build and scratch barrier");
     }
     state.diagnostics.acceleration_build_call_record_ms +=
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - build_record_start).count();
@@ -1589,6 +1731,9 @@ bool build_top_level_as(dxr_backend_state &state, const rt_tlas_build_desc &requ
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO prebuild_info{};
     const auto prebuild_start = std::chrono::steady_clock::now();
     state.device->GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &prebuild_info);
+    append_device_removed_reason_log(
+        "DXR device removal reason after TLAS prebuild query",
+        state.device);
     add_prebuild_info_timing(
         state,
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - prebuild_start).count(),
@@ -1628,11 +1773,15 @@ bool build_top_level_as(dxr_backend_state &state, const rt_tlas_build_desc &requ
     build_desc.DestAccelerationStructureData = tlas->result->GetGPUVirtualAddress();
     const auto build_record_start = std::chrono::steady_clock::now();
     state.command_list->BuildRaytracingAccelerationStructure(&build_desc, 0, nullptr);
+    append_device_removed_reason_log(
+        "DXR device removal reason after TLAS build recording",
+        state.device);
 
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     barrier.UAV.pResource = nullptr;
     state.command_list->ResourceBarrier(1, &barrier);
+    append_d3d12_info_queue_log(state.device, "after TLAS build and scratch barrier");
     state.diagnostics.acceleration_build_call_record_ms +=
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - build_record_start).count();
     tlas->instance_count = instance_count;
@@ -1769,6 +1918,9 @@ bool d3d12_dxr_rhi_device::build_blas(
         : geometry_type == rt_acceleration_geometry_type::aabbs
             ? build_procedural_blas(native_state_, command, acceleration, out_result)
             : false;
+    append_device_removed_reason_log(
+        "DXR device removal reason after RHI BLAS build",
+        native_state_.device);
     const bool completed = built && acceleration->result != nullptr;
     if (!completed && out_error != nullptr) {
         out_error->detail = "DXR BLAS build failed";
@@ -1790,6 +1942,9 @@ bool d3d12_dxr_rhi_device::build_tlas(
         return false;
     }
     const bool built = build_top_level_as(native_state_, request);
+    append_device_removed_reason_log(
+        "DXR device removal reason after RHI TLAS build",
+        native_state_.device);
     if (!built && out_error != nullptr) {
         out_error->detail = "DXR TLAS build failed";
     }
@@ -1920,8 +2075,11 @@ bool update_dxr_resource_bindings(
                 &srv,
                 descriptor_cpu_handle(state, slot_index, kSrvDescriptorBase + write.location.binding));
         } else if (write.type == rt_descriptor_type::structured_buffer) {
-            ID3D12Resource* const resource = dxr_buffer_resource(state, write.resource);
-            if ((resource == nullptr && write.element_count != 0) || write.element_stride == 0) {
+            if (write.element_count == 0) {
+                continue;
+            }
+            ID3D12Resource* resource = dxr_buffer_resource(state, write.resource);
+            if (resource == nullptr || write.element_stride == 0) {
                 return fail(&write, "structured buffer is invalid");
             }
             D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
@@ -2004,6 +2162,7 @@ bool ensure_global_root_signature(
     if (state.global_root_signature != nullptr) {
         return true;
     }
+    append_d3d12_info_queue_log(state.device, "before global root signature");
     std::vector<D3D12_DESCRIPTOR_RANGE1> uav_ranges;
     std::vector<D3D12_DESCRIPTOR_RANGE1> srv_ranges;
     UINT uniform_binding = UINT_MAX;
@@ -2059,7 +2218,10 @@ bool ensure_global_root_signature(
 
     ID3DBlob* serialized = nullptr;
     ID3DBlob* errors = nullptr;
-    const HRESULT serialize_hr = D3D12SerializeVersionedRootSignature(&root_desc, &serialized, &errors);
+    const HRESULT serialize_hr = D3D12SerializeVersionedRootSignature(
+        &root_desc,
+        &serialized,
+        &errors);
     if (FAILED(serialize_hr)) {
         record_dxr_failure(state, "ensure_global_root_signature.D3D12SerializeVersionedRootSignature", serialize_hr);
         safe_release(errors);
@@ -2075,6 +2237,9 @@ bool ensure_global_root_signature(
     safe_release(serialized);
     if (FAILED(hr)) {
         record_dxr_failure(state, "ensure_global_root_signature.CreateRootSignature", hr);
+        append_device_removed_reason_log(
+            "DXR device removal reason after CreateRootSignature",
+            state.device);
     }
     return SUCCEEDED(hr);
 }
@@ -2374,15 +2539,24 @@ bool close_and_execute_command_list(
         record_dxr_failure(state, "close_and_execute_command_list.Close", close_hr);
         return false;
     }
+    append_device_removed_reason_log(
+        "DXR device removal reason after command list close",
+        state.device);
     ID3D12CommandList* command_lists[] = {state.command_list};
     const auto submit_start = std::chrono::steady_clock::now();
     state.queue->ExecuteCommandLists(1, command_lists);
+    append_device_removed_reason_log(
+        "DXR device removal reason after ExecuteCommandLists",
+        state.device);
     const std::uint64_t fence_value = state.submitted_fence_value + 1u;
     const HRESULT signal_hr = state.queue->Signal(state.fence, fence_value);
     if (FAILED(signal_hr)) {
         record_dxr_failure(state, "close_and_execute_command_list.Signal", signal_hr);
         return false;
     }
+    append_device_removed_reason_log(
+        "DXR device removal reason after command queue signal",
+        state.device);
     if (out_submit_cpu_ms != nullptr) {
         *out_submit_cpu_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - submit_start).count();
@@ -2500,6 +2674,8 @@ bool initialize_dxr_native(dxr_backend_state &state, const rt_rhi_device_desc &d
         append_rt_startup_log("DXR startup failed: invalid capture size");
         return false;
     }
+
+    enable_d3d12_debug_layer_if_requested();
 
     HRESULT hr = CreateDXGIFactory2(0, IID_PPV_ARGS(&state.factory));
     if (FAILED(hr)) {

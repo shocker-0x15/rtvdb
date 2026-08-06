@@ -548,6 +548,7 @@ bool make_rt_scene_resource_data(
 
     rt_scene_resource_data data{};
     data.revision = build.revision;
+    data.connection_serial = build.connection_serial;
     data.positions.resize(build.vertex_count);
     data.indices = build.indices;
     data.triangle_colors.resize(build.triangle_count);
@@ -777,6 +778,11 @@ bool make_rt_acceleration_command_plan(
             if (geometry_index == 0) {
                 command.visible = visible;
             }
+            const std::size_t default_capacity = item.kind == rt_acceleration_geometry_kind::triangle
+                ? kDefaultRtSceneTriangleChunkPrimitives
+                : kDefaultRtSceneProceduralChunkPrimitives;
+            command.allocation_primitive_counts[geometry_index] =
+                (std::max)(default_capacity, item.primitive_counts[geometry_index]);
         }
         plan.blas_commands.push_back(command);
     }
@@ -868,6 +874,52 @@ bool rt_blas_cache_key_equals(const rt_blas_cache_key &a, const rt_blas_cache_ke
     return true;
 }
 
+bool rt_blas_storage_key_equals(const rt_blas_storage_key &a, const rt_blas_storage_key &b) {
+    if (a.kind != b.kind || a.geometry_count != b.geometry_count ||
+        a.build_flags != b.build_flags ||
+        a.geometry_count > kRtBlasChunkSetChunkCount) {
+        return false;
+    }
+    for (std::size_t geometry_index = 0; geometry_index < a.geometry_count; ++geometry_index) {
+        if (a.geometry_types[geometry_index] != b.geometry_types[geometry_index] ||
+            a.geometry_flags[geometry_index] != b.geometry_flags[geometry_index] ||
+            a.geometry_formats[geometry_index] != b.geometry_formats[geometry_index] ||
+            a.primitive_counts[geometry_index] != b.primitive_counts[geometry_index] ||
+            a.strides[geometry_index] != b.strides[geometry_index]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+rt_blas_storage_key make_rt_blas_storage_key(
+    const rt_blas_build_command &command,
+    std::uint32_t build_flags)
+{
+    rt_blas_storage_key key{};
+    key.kind = command.kind;
+    key.geometry_count = command.geometry_count;
+    key.build_flags = build_flags;
+    for (std::size_t geometry_index = 0;
+         geometry_index < command.geometry_count &&
+             geometry_index < kRtBlasChunkSetChunkCount;
+         ++geometry_index) {
+        const rt_acceleration_geometry_desc &geometry = command.geometries[geometry_index];
+        key.geometry_types[geometry_index] = geometry.type;
+        key.geometry_flags[geometry_index] = geometry.flags;
+        key.primitive_counts[geometry_index] = command.allocation_primitive_counts[geometry_index];
+        if (geometry.type == rt_acceleration_geometry_type::triangles) {
+            key.geometry_formats[geometry_index] =
+                (static_cast<std::uint32_t>(geometry.triangles.vertex_format) << 16u) |
+                static_cast<std::uint32_t>(geometry.triangles.index_format);
+            key.strides[geometry_index] = geometry.triangles.vertex_stride;
+        } else if (geometry.type == rt_acceleration_geometry_type::aabbs) {
+            key.strides[geometry_index] = geometry.aabbs.stride;
+        }
+    }
+    return key;
+}
+
 bool make_rt_blas_cache_update_plan(
     const rt_acceleration_build_plan &build_plan,
     const rt_blas_cache_state &current_state,
@@ -949,6 +1001,8 @@ bool make_rt_blas_cache_update_plan(
                 if (slot.valid &&
                     ++slot.unused_revision_count >= kRtBlasCacheRetentionRevisions) {
                     slot.key = {};
+                    slot.storage_key = {};
+                    slot.storage_capacity_bytes = 0;
                     slot.acceleration = {};
                     slot.unused_revision_count = 0;
                     slot.valid = false;
@@ -1011,6 +1065,57 @@ void copy_rt_diagnostics(scene_build_info* out_info, const scene_build_info &dia
     out_info->accumulation_sample_count = diagnostics.accumulation_sample_count;
     out_info->accumulation_target_sample_count = diagnostics.accumulation_target_sample_count;
     out_info->accumulation_in_progress = diagnostics.accumulation_in_progress;
+}
+
+bool grow_rt_capacity(
+    std::size_t required,
+    std::size_t current,
+    std::size_t alignment,
+    std::size_t* out_capacity)
+{
+    if (out_capacity == nullptr || alignment == 0) {
+        return false;
+    }
+    if (required == 0) {
+        *out_capacity = 0;
+        return true;
+    }
+
+    const std::size_t max_size = (std::numeric_limits<std::size_t>::max)();
+    const auto align_checked = [max_size, alignment](std::size_t value, std::size_t* out_value) {
+        const std::size_t remainder = value % alignment;
+        if (remainder == 0) {
+            *out_value = value;
+            return true;
+        }
+        const std::size_t padding = alignment - remainder;
+        if (value > max_size - padding) {
+            return false;
+        }
+        *out_value = value + padding;
+        return true;
+    };
+
+    std::size_t aligned_required = 0;
+    if (!align_checked(required, &aligned_required)) {
+        return false;
+    }
+    std::size_t aligned_current = 0;
+    if (!align_checked(current, &aligned_current)) {
+        return false;
+    }
+    if (aligned_current >= aligned_required) {
+        *out_capacity = aligned_current;
+        return true;
+    }
+
+    const std::size_t half = aligned_current / 2u + (aligned_current % 2u);
+    if (aligned_current > max_size - half) {
+        return false;
+    }
+    const std::size_t grown = aligned_current + half;
+    const std::size_t target = (std::max)(aligned_required, grown);
+    return align_checked(target, out_capacity);
 }
 
 } // namespace rtvdb::viewer_backend

@@ -2,6 +2,8 @@
 
 project(rtvdb VERSION 0.1.0 LANGUAGES CXX)
 
+include(CTest)
+
 set_property(GLOBAL PROPERTY USE_FOLDERS ON)
 
 if(APPLE)

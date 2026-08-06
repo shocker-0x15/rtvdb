@@ -4447,6 +4447,16 @@ void capture_build_info_to_files(std::uint64_t frame_serial) {
             "accel_line_blas_prebuild_info_ms=%.3f\naccel_line_blas_prebuild_info_count=%u\n"
             "accel_tlas_prebuild_info_ms=%.3f\naccel_tlas_prebuild_info_count=%u\n"
             "accel_startup_prebuild_warmup_ms=%.3f\naccel_tlas_instance_upload_ms=%.3f\n"
+            "scratch_growth_count=%llu\nscratch_capacity_bytes=%llu\nscratch_peak_capacity_bytes=%llu\n"
+            "acceleration_resource_allocation_count=%llu\n"
+            "acceleration_resource_reallocation_count=%llu\n"
+            "acceleration_capacity_bytes=%llu\nacceleration_peak_capacity_bytes=%llu\n"
+            "scene_buffer_allocation_count=%llu\nscene_buffer_growth_count=%llu\n"
+            "scene_buffer_capacity_bytes=%llu\nscene_buffer_peak_capacity_bytes=%llu\n"
+            "blas_storage_pool_hit_count=%llu\nblas_storage_pool_miss_count=%llu\n"
+            "scene_buffer_pool_hit_count=%llu\nscene_buffer_pool_miss_count=%llu\n"
+            "blas_storage_pool_bytes=%llu\nscene_buffer_pool_bytes=%llu\n"
+            "retired_resource_bytes=%llu\nresource_pool_eviction_count=%llu\n"
             "render_cpu_total_ms=%.3f\naccel_cpu_enqueue_ms=%.3f\naccel_cpu_wait_ms=%.3f\n"
             "accel_gpu_busy_ms=%.3f\n"
             "render_cpu_enqueue_ms=%.3f\nrender_cpu_wait_ms=%.3f\n"
@@ -4504,6 +4514,25 @@ void capture_build_info_to_files(std::uint64_t frame_serial) {
             static_cast<unsigned>(build_info.accel_tlas_prebuild_info_count),
             build_info.accel_startup_prebuild_warmup_ms,
             build_info.accel_tlas_instance_upload_ms,
+            static_cast<unsigned long long>(build_info.scratch_growth_count),
+            static_cast<unsigned long long>(build_info.scratch_capacity_bytes),
+            static_cast<unsigned long long>(build_info.scratch_peak_capacity_bytes),
+            static_cast<unsigned long long>(build_info.acceleration_resource_allocation_count),
+            static_cast<unsigned long long>(build_info.acceleration_resource_reallocation_count),
+            static_cast<unsigned long long>(build_info.acceleration_capacity_bytes),
+            static_cast<unsigned long long>(build_info.acceleration_peak_capacity_bytes),
+            static_cast<unsigned long long>(build_info.scene_buffer_allocation_count),
+            static_cast<unsigned long long>(build_info.scene_buffer_growth_count),
+            static_cast<unsigned long long>(build_info.scene_buffer_capacity_bytes),
+            static_cast<unsigned long long>(build_info.scene_buffer_peak_capacity_bytes),
+            static_cast<unsigned long long>(build_info.blas_storage_pool_hit_count),
+            static_cast<unsigned long long>(build_info.blas_storage_pool_miss_count),
+            static_cast<unsigned long long>(build_info.scene_buffer_pool_hit_count),
+            static_cast<unsigned long long>(build_info.scene_buffer_pool_miss_count),
+            static_cast<unsigned long long>(build_info.blas_storage_pool_bytes),
+            static_cast<unsigned long long>(build_info.scene_buffer_pool_bytes),
+            static_cast<unsigned long long>(build_info.retired_resource_bytes),
+            static_cast<unsigned long long>(build_info.resource_pool_eviction_count),
             build_info.dispatch_ms,
             build_info.accel_submit_cpu_ms,
             build_info.accel_gpu_wait_ms,
@@ -5171,7 +5200,13 @@ void draw_layer_tree_node(
 rtvdb::viewer_backend::frame_scene filter_scene_layers(const rtvdb::viewer_backend::frame_scene &source) {
     rtvdb::viewer_backend::frame_scene filtered = source;
     scene_aabb helper_overlay_bounds{};
-    if (try_compute_scene_aabb(source, &helper_overlay_bounds)) {
+    if (source.helper_overlay_bounds_valid) {
+        helper_overlay_bounds.min = source.helper_overlay_bounds_min;
+        helper_overlay_bounds.max = source.helper_overlay_bounds_max;
+        filtered.helper_overlay_bounds_min = helper_overlay_bounds.min;
+        filtered.helper_overlay_bounds_max = helper_overlay_bounds.max;
+        filtered.helper_overlay_bounds_valid = true;
+    } else if (try_compute_scene_aabb(source, &helper_overlay_bounds)) {
         filtered.helper_overlay_bounds_min = helper_overlay_bounds.min;
         filtered.helper_overlay_bounds_max = helper_overlay_bounds.max;
         filtered.helper_overlay_bounds_valid = true;
@@ -5285,6 +5320,7 @@ void on_frame_ready(const rtvdb::viewer_backend::frame_scene* scene, void*) {
         return;
     }
     bool force_connection_auto_frame = false;
+    bool requires_layer_filter = false;
     {
         std::scoped_lock lock(g_layer_visibility_mutex);
         if (scene->connection_serial != g_layer_connection_serial) {
@@ -5304,6 +5340,16 @@ void on_frame_ready(const rtvdb::viewer_backend::frame_scene* scene, void*) {
         for (const std::string &path : layer_paths) {
             g_layer_visibility.try_emplace(path, true);
         }
+        for (const auto &entry : g_layer_visibility) {
+            if (!entry.second) {
+                requires_layer_filter = true;
+                break;
+            }
+        }
+    }
+    if (!requires_layer_filter && !force_connection_auto_frame) {
+        rtvdb::viewer_backend::submit_scene_build(*scene, has_primitives);
+        return;
     }
     rtvdb::viewer_backend::frame_scene filtered_scene = filter_scene_layers(*scene);
     if (force_connection_auto_frame) {
@@ -5313,6 +5359,13 @@ void on_frame_ready(const rtvdb::viewer_backend::frame_scene* scene, void*) {
         filtered_scene.projection_blend_t = 1.0f;
     }
     rtvdb::viewer_backend::submit_scene_build(filtered_scene, has_primitives);
+}
+
+void on_frame_ready_shared(
+    const std::shared_ptr<const rtvdb::viewer_backend::frame_scene> &scene,
+    void* user_data)
+{
+    on_frame_ready(scene.get(), user_data);
 }
 
 void select_display_mode(rtvdb::viewer_backend::display_mode mode) {
@@ -6028,6 +6081,7 @@ int viewer_main(rtvdb::viewer_shell::platform_app_instance instance, int show_co
 
     const rtvdb::viewer_session::session_callbacks session_callbacks{
         on_frame_ready,
+        on_frame_ready_shared,
         on_capture_requested,
         nullptr,
     };

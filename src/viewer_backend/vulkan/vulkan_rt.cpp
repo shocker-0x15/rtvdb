@@ -513,13 +513,17 @@ rt_submission_token latest_submission(const vulkan_backend_state &state) {
         : rt_submission_token{};
 }
 
+rt_submission_token current_resource_retirement_submission(const vulkan_backend_state &state) {
+    return state.active_encoder_id != 0
+        ? rt_submission_token{state.next_submission_serial}
+        : latest_submission(state);
+}
+
 void defer_native_buffer_release(vulkan_backend_state &state, vulkan_buffer* buffer) {
     if (buffer == nullptr || buffer->buffer == VK_NULL_HANDLE) {
         return;
     }
-    const rt_submission_token submission = state.active_encoder_id != 0
-        ? rt_submission_token{state.next_submission_serial}
-        : latest_submission(state);
+    const rt_submission_token submission = current_resource_retirement_submission(state);
     if (!submission || submission.serial <= state.completed_submission_serial) {
         destroy_native_buffer(state, buffer);
         return;
@@ -535,7 +539,7 @@ void defer_acceleration_release(
     if (acceleration == nullptr || acceleration->handle == VK_NULL_HANDLE) {
         return;
     }
-    const rt_submission_token submission = latest_submission(state);
+    const rt_submission_token submission = current_resource_retirement_submission(state);
     if (!submission || submission.serial <= state.completed_submission_serial) {
         destroy_acceleration_structure(state, acceleration);
         return;
@@ -548,7 +552,7 @@ void defer_texture_release(vulkan_backend_state &state, vulkan_texture* texture)
     if (texture == nullptr || texture->image == VK_NULL_HANDLE) {
         return;
     }
-    const rt_submission_token submission = latest_submission(state);
+    const rt_submission_token submission = current_resource_retirement_submission(state);
     if (!submission || submission.serial <= state.completed_submission_serial) {
         destroy_native_texture(state, texture);
         return;
@@ -1473,10 +1477,18 @@ bool ensure_acceleration_structure(
         return true;
     }
 
+    if (size > (std::numeric_limits<std::size_t>::max)()) {
+        return false;
+    }
+    const std::size_t current_size = static_cast<std::size_t>(accel->storage.size);
+    std::size_t target_size = 0;
+    if (!grow_rt_capacity(static_cast<std::size_t>(size), current_size, 1, &target_size)) {
+        return false;
+    }
     defer_acceleration_release(state, accel);
     if (!create_native_buffer(
             state,
-            size,
+            static_cast<VkDeviceSize>(target_size),
             VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
             &accel->storage)) {
@@ -1486,12 +1498,17 @@ bool ensure_acceleration_structure(
     VkAccelerationStructureCreateInfoKHR accel_create_info{
         VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR};
     accel_create_info.type = type;
-    accel_create_info.size = size;
+    accel_create_info.size = static_cast<VkDeviceSize>(target_size);
     accel_create_info.buffer = accel->storage.buffer;
     if (state.create_acceleration_structure(state.device, &accel_create_info, nullptr, &accel->handle) !=
         VK_SUCCESS) {
         destroy_acceleration_structure(state, accel);
         return false;
+    }
+
+    ++state.diagnostics.acceleration_resource_allocation_count;
+    if (current_size != 0) {
+        ++state.diagnostics.acceleration_resource_reallocation_count;
     }
 
     return true;
@@ -1552,12 +1569,35 @@ bool ensure_scratch_buffer(vulkan_backend_state &state, VkDeviceSize size) {
     if (state.scratch_buffer.buffer != VK_NULL_HANDLE && state.scratch_buffer.size >= size) {
         return true;
     }
-    return create_native_buffer(
+    if (size > (std::numeric_limits<std::size_t>::max)()) {
+        return false;
+    }
+    const std::size_t current_size = static_cast<std::size_t>(state.scratch_buffer.size);
+    std::size_t target_size = 0;
+    if (!grow_rt_capacity(static_cast<std::size_t>(size), current_size, 1, &target_size)) {
+        return false;
+    }
+    vulkan_buffer replacement{};
+    const bool created = create_native_buffer(
         state,
-        size,
+        static_cast<VkDeviceSize>(target_size),
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-        &state.scratch_buffer);
+        &replacement);
+    if (created) {
+        defer_native_buffer_release(state, &state.scratch_buffer);
+        state.scratch_buffer = replacement;
+        ++state.diagnostics.acceleration_resource_allocation_count;
+        if (current_size != 0) {
+            ++state.diagnostics.acceleration_resource_reallocation_count;
+            ++state.diagnostics.scratch_growth_count;
+        }
+        state.diagnostics.scratch_capacity_bytes = static_cast<std::size_t>(state.scratch_buffer.size);
+        state.diagnostics.scratch_peak_capacity_bytes = (std::max)(
+            state.diagnostics.scratch_peak_capacity_bytes,
+            state.diagnostics.scratch_capacity_bytes);
+    }
+    return created;
 }
 
 bool begin_acceleration_recording(vulkan_backend_state &state) {
@@ -1666,14 +1706,31 @@ bool build_triangle_blas(
     build_info.flags = vulkan_acceleration_build_flags(command.flags);
     build_info.geometryCount = static_cast<std::uint32_t>(command.geometry_count);
     build_info.pGeometries = context.geometries.data() + geometry_offset;
+    std::array<VkAccelerationStructureGeometryKHR, kRtBlasChunkSetChunkCount> prebuild_geometries{};
+    std::array<std::uint32_t, kRtBlasChunkSetChunkCount> prebuild_primitive_counts{};
+    for (std::size_t geometry_index = 0; geometry_index < command.geometry_count; ++geometry_index) {
+        prebuild_geometries[geometry_index] = context.geometries[geometry_offset + geometry_index];
+        const std::size_t actual_primitive_count = primitive_counts[geometry_index];
+        const std::size_t primitive_count = (std::max)(
+            actual_primitive_count,
+            command.allocation_primitive_counts != nullptr
+                ? command.allocation_primitive_counts[geometry_index]
+                : actual_primitive_count);
+        if (primitive_count > (std::numeric_limits<std::uint32_t>::max)()) {
+            return false;
+        }
+        prebuild_primitive_counts[geometry_index] = static_cast<std::uint32_t>(primitive_count);
+    }
+    VkAccelerationStructureBuildGeometryInfoKHR prebuild_build_info = build_info;
+    prebuild_build_info.pGeometries = prebuild_geometries.data();
     VkAccelerationStructureBuildSizesInfoKHR build_sizes{
         VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
     const auto prebuild_start = std::chrono::steady_clock::now();
     state.get_acceleration_structure_build_sizes(
         state.device,
         VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
-        &build_info,
-        primitive_counts.data(),
+        &prebuild_build_info,
+        prebuild_primitive_counts.data(),
         &build_sizes);
     const double prebuild_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - prebuild_start).count();
@@ -1697,6 +1754,7 @@ bool build_triangle_blas(
     if (!allocated) {
         return false;
     }
+    out_result->allocation_size_bytes = static_cast<std::size_t>(entry->storage.size);
     build_info.dstAccelerationStructure = entry->handle;
     context.build_infos.push_back(build_info);
     context.build_range_offsets.push_back(geometry_offset);
@@ -1761,14 +1819,31 @@ bool build_procedural_blas(
     build_info.flags = vulkan_acceleration_build_flags(command.flags);
     build_info.geometryCount = static_cast<std::uint32_t>(command.geometry_count);
     build_info.pGeometries = context.geometries.data() + geometry_offset;
+    std::array<VkAccelerationStructureGeometryKHR, kRtBlasChunkSetChunkCount> prebuild_geometries{};
+    std::array<std::uint32_t, kRtBlasChunkSetChunkCount> prebuild_primitive_counts{};
+    for (std::size_t geometry_index = 0; geometry_index < command.geometry_count; ++geometry_index) {
+        prebuild_geometries[geometry_index] = context.geometries[geometry_offset + geometry_index];
+        const std::size_t actual_primitive_count = primitive_counts[geometry_index];
+        const std::size_t primitive_count = (std::max)(
+            actual_primitive_count,
+            command.allocation_primitive_counts != nullptr
+                ? command.allocation_primitive_counts[geometry_index]
+                : actual_primitive_count);
+        if (primitive_count > (std::numeric_limits<std::uint32_t>::max)()) {
+            return false;
+        }
+        prebuild_primitive_counts[geometry_index] = static_cast<std::uint32_t>(primitive_count);
+    }
+    VkAccelerationStructureBuildGeometryInfoKHR prebuild_build_info = build_info;
+    prebuild_build_info.pGeometries = prebuild_geometries.data();
     VkAccelerationStructureBuildSizesInfoKHR build_sizes{
         VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
     const auto prebuild_start = std::chrono::steady_clock::now();
     state.get_acceleration_structure_build_sizes(
         state.device,
         VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
-        &build_info,
-        primitive_counts.data(),
+        &prebuild_build_info,
+        prebuild_primitive_counts.data(),
         &build_sizes);
     const double prebuild_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - prebuild_start).count();
@@ -1786,6 +1861,7 @@ bool build_procedural_blas(
     if (!allocated) {
         return false;
     }
+    out_result->allocation_size_bytes = static_cast<std::size_t>(entry->storage.size);
     build_info.dstAccelerationStructure = entry->handle;
     context.build_infos.push_back(build_info);
     context.build_range_offsets.push_back(geometry_offset);

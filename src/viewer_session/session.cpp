@@ -20,11 +20,14 @@
 #include "rtvdb/rtvdb.h"
 #include "viewer_session/session.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <condition_variable>
 #include <cstring>
+#include <memory>
 #include <mutex>
+#include <limits>
 #include <string>
 #include <thread>
 #include <vector>
@@ -33,7 +36,10 @@ namespace rtvdb::viewer_session {
 namespace {
 
 constexpr auto kImplicitSnapshotDelay = std::chrono::milliseconds(250);
+constexpr auto kLargeSceneImplicitSnapshotDelay = std::chrono::milliseconds(1000);
 constexpr std::size_t kImplicitSnapshotPrimitiveDelta = 32768;
+constexpr std::size_t kLargeSceneImplicitSnapshotPrimitiveDelta = 262144;
+constexpr std::size_t kLargeScenePrimitiveThreshold = 65536;
 constexpr std::size_t kMaxRecentLogCount = 128;
 
 #if defined(_WIN32)
@@ -48,9 +54,15 @@ struct shared_state {
     std::mutex mutex;
     std::condition_variable condition;
     viewer_backend::frame_scene working_scene;
-    viewer_backend::frame_scene published_scene;
+    std::shared_ptr<const viewer_backend::frame_scene> published_scene;
+    struct working_bounds_state {
+        rtvdb::vec3 min{};
+        rtvdb::vec3 max{};
+        bool valid = false;
+    } working_bounds;
     bool has_frame = false;
     bool dirty = false;
+    bool primitive_dirty = false;
     bool explicit_frame_open = false;
     std::size_t last_published_triangle_count = 0;
     std::size_t last_published_point_count = 0;
@@ -75,6 +87,69 @@ struct shared_state {
     std::vector<pending_capture_request> pending_capture_requests;
     std::uint64_t next_log_sequence = 1;
 } g_state;
+
+void reset_working_bounds_locked() {
+    g_state.working_bounds = {};
+}
+
+void expand_working_bounds_locked(const rtvdb::vec3 &point) {
+    if (!g_state.working_bounds.valid) {
+        g_state.working_bounds.min = point;
+        g_state.working_bounds.max = point;
+        g_state.working_bounds.valid = true;
+        return;
+    }
+    g_state.working_bounds.min.x = (std::min)(g_state.working_bounds.min.x, point.x);
+    g_state.working_bounds.min.y = (std::min)(g_state.working_bounds.min.y, point.y);
+    g_state.working_bounds.min.z = (std::min)(g_state.working_bounds.min.z, point.z);
+    g_state.working_bounds.max.x = (std::max)(g_state.working_bounds.max.x, point.x);
+    g_state.working_bounds.max.y = (std::max)(g_state.working_bounds.max.y, point.y);
+    g_state.working_bounds.max.z = (std::max)(g_state.working_bounds.max.z, point.z);
+}
+
+void expand_working_bounds_locked(const rtvdb::triangle_payload &triangle) {
+    expand_working_bounds_locked(triangle.a);
+    expand_working_bounds_locked(triangle.b);
+    expand_working_bounds_locked(triangle.c);
+}
+
+void expand_working_bounds_locked(const rtvdb::point_payload &point) {
+    expand_working_bounds_locked(rtvdb::vec3{
+        point.position.x - point.radius,
+        point.position.y - point.radius,
+        point.position.z - point.radius});
+    expand_working_bounds_locked(rtvdb::vec3{
+        point.position.x + point.radius,
+        point.position.y + point.radius,
+        point.position.z + point.radius});
+}
+
+void expand_working_bounds_locked(const rtvdb::line_payload &line) {
+    expand_working_bounds_locked(rtvdb::vec3{line.a.x - line.radius, line.a.y - line.radius, line.a.z - line.radius});
+    expand_working_bounds_locked(rtvdb::vec3{line.a.x + line.radius, line.a.y + line.radius, line.a.z + line.radius});
+    expand_working_bounds_locked(rtvdb::vec3{line.b.x - line.radius, line.b.y - line.radius, line.b.z - line.radius});
+    expand_working_bounds_locked(rtvdb::vec3{line.b.x + line.radius, line.b.y + line.radius, line.b.z + line.radius});
+}
+
+template <typename T>
+bool reserve_for_append(std::vector<T>* values, std::size_t append_count) {
+    if (values == nullptr || append_count > (std::numeric_limits<std::size_t>::max)() - values->size()) {
+        return false;
+    }
+
+    const std::size_t required = values->size() + append_count;
+    if (required <= values->capacity()) {
+        return true;
+    }
+
+    const std::size_t growth = values->capacity() / 2 + 1;
+    const std::size_t target_capacity =
+        required > (std::numeric_limits<std::size_t>::max)() - growth
+        ? required
+        : (std::max)(required, values->capacity() + growth);
+    values->reserve(target_capacity);
+    return true;
+}
 
 std::uint64_t current_timestamp_ms() {
     using clock = std::chrono::steady_clock;
@@ -186,8 +261,31 @@ void mark_dirty_locked() {
 }
 
 bool primitive_delta_reached(std::size_t current_count, std::size_t published_count) {
+    const std::size_t total_primitive_count =
+        g_state.working_scene.triangles.size() +
+        g_state.working_scene.points.size() +
+        g_state.working_scene.lines.size();
+    const std::size_t total_published_count =
+        g_state.last_published_triangle_count +
+        g_state.last_published_point_count +
+        g_state.last_published_line_count;
+    const std::size_t delta_threshold =
+        g_state.primitive_dirty && total_primitive_count >= kLargeScenePrimitiveThreshold
+        ? kLargeSceneImplicitSnapshotPrimitiveDelta
+        : kImplicitSnapshotPrimitiveDelta;
     return current_count >= published_count &&
-        current_count - published_count >= kImplicitSnapshotPrimitiveDelta;
+        current_count - published_count >= delta_threshold &&
+        total_primitive_count >= total_published_count;
+}
+
+std::chrono::milliseconds implicit_snapshot_delay_locked() {
+    const std::size_t primitive_count =
+        g_state.working_scene.triangles.size() +
+        g_state.working_scene.points.size() +
+        g_state.working_scene.lines.size();
+    return g_state.primitive_dirty && primitive_count >= kLargeScenePrimitiveThreshold
+        ? kLargeSceneImplicitSnapshotDelay
+        : kImplicitSnapshotDelay;
 }
 
 bool implicit_snapshot_primitive_threshold_reached_locked() {
@@ -216,15 +314,25 @@ std::string current_layer_path_locked() {
     return path;
 }
 
-bool publish_locked(viewer_backend::frame_scene* out_scene, session_callbacks* out_callbacks) {
+bool publish_locked(
+    std::shared_ptr<const viewer_backend::frame_scene>* out_scene,
+    session_callbacks* out_callbacks)
+{
     ensure_pending_revision_locked();
-    g_state.published_scene = g_state.working_scene;
+    viewer_backend::frame_scene snapshot = g_state.working_scene;
+    snapshot.helper_overlay_bounds_valid = g_state.working_bounds.valid;
+    if (g_state.working_bounds.valid) {
+        snapshot.helper_overlay_bounds_min = g_state.working_bounds.min;
+        snapshot.helper_overlay_bounds_max = g_state.working_bounds.max;
+    }
+    g_state.published_scene = std::make_shared<const viewer_backend::frame_scene>(std::move(snapshot));
     g_state.has_frame = true;
     g_state.published_revision = g_state.current_revision;
     g_state.last_published_triangle_count = g_state.working_scene.triangles.size();
     g_state.last_published_point_count = g_state.working_scene.points.size();
     g_state.last_published_line_count = g_state.working_scene.lines.size();
     g_state.dirty = false;
+    g_state.primitive_dirty = false;
     g_state.dirty_since_time = {};
 
     if (out_scene != nullptr) {
@@ -238,17 +346,19 @@ bool publish_locked(viewer_backend::frame_scene* out_scene, session_callbacks* o
 }
 
 void publish_now(viewer_backend::frame_scene* out_scene = nullptr) {
-    viewer_backend::frame_scene scene{};
+    std::shared_ptr<const viewer_backend::frame_scene> scene;
     session_callbacks callbacks{};
     {
         std::scoped_lock lock(g_state.mutex);
         publish_locked(&scene, &callbacks);
     }
-    if (callbacks.frame_ready != nullptr) {
-        callbacks.frame_ready(&scene, callbacks.user_data);
+    if (callbacks.frame_ready_shared != nullptr) {
+        callbacks.frame_ready_shared(scene, callbacks.user_data);
+    } else if (callbacks.frame_ready != nullptr) {
+        callbacks.frame_ready(scene.get(), callbacks.user_data);
     }
-    if (out_scene != nullptr) {
-        *out_scene = scene;
+    if (out_scene != nullptr && scene != nullptr) {
+        *out_scene = *scene;
     }
 }
 
@@ -279,12 +389,16 @@ void append_triangles_locked(const rtvdb::triangle_payload* triangles, std::size
         return;
     }
     ensure_pending_revision_locked();
-    g_state.working_scene.triangles.reserve(g_state.working_scene.triangles.size() + triangle_count);
+    if (!reserve_for_append(&g_state.working_scene.triangles, triangle_count)) {
+        return;
+    }
     for (std::size_t i = 0; i < triangle_count; ++i) {
         const rtvdb::triangle_payload &payload = triangles[i];
+        expand_working_bounds_locked(payload);
         g_state.working_scene.triangles.push_back(
             {payload.a, payload.b, payload.c, payload.color, payload.user_data, current_layer_path_locked()});
     }
+    g_state.primitive_dirty = true;
     mark_dirty_locked();
 }
 
@@ -293,12 +407,16 @@ void append_points_locked(const rtvdb::point_payload* points, std::size_t point_
         return;
     }
     ensure_pending_revision_locked();
-    g_state.working_scene.points.reserve(g_state.working_scene.points.size() + point_count);
+    if (!reserve_for_append(&g_state.working_scene.points, point_count)) {
+        return;
+    }
     for (std::size_t i = 0; i < point_count; ++i) {
         const rtvdb::point_payload &payload = points[i];
+        expand_working_bounds_locked(payload);
         g_state.working_scene.points.push_back(
             {payload.position, payload.radius, payload.color, payload.user_data, current_layer_path_locked()});
     }
+    g_state.primitive_dirty = true;
     mark_dirty_locked();
 }
 
@@ -307,13 +425,17 @@ void append_lines_locked(const rtvdb::line_payload* lines, std::size_t line_coun
         return;
     }
     ensure_pending_revision_locked();
-    g_state.working_scene.lines.reserve(g_state.working_scene.lines.size() + line_count);
+    if (!reserve_for_append(&g_state.working_scene.lines, line_count)) {
+        return;
+    }
     for (std::size_t i = 0; i < line_count; ++i) {
         const rtvdb::line_payload &payload = lines[i];
+        expand_working_bounds_locked(payload);
         g_state.working_scene.lines.push_back(
             {payload.a, payload.radius, payload.b, payload.color, payload.user_data, viewer_backend::line_flags::none,
              current_layer_path_locked()});
     }
+    g_state.primitive_dirty = true;
     mark_dirty_locked();
 }
 
@@ -322,24 +444,25 @@ void implicit_snapshot_thread() {
     for (;;) {
         g_state.condition.wait(lock, [] { return g_state.dirty && !g_state.explicit_frame_open; });
 
-        if (!implicit_snapshot_primitive_threshold_reached_locked()) {
-            const auto due_time = g_state.dirty_since_time + kImplicitSnapshotDelay;
-            (void)g_state.condition.wait_until(lock, due_time, [] {
-                return !g_state.dirty ||
-                    g_state.explicit_frame_open ||
-                    implicit_snapshot_primitive_threshold_reached_locked();
-            });
-            if (!g_state.dirty || g_state.explicit_frame_open) {
-                continue;
+        while (g_state.dirty && !g_state.explicit_frame_open &&
+               !implicit_snapshot_primitive_threshold_reached_locked()) {
+            const auto due_time = g_state.dirty_since_time + implicit_snapshot_delay_locked();
+            if (g_state.condition.wait_until(lock, due_time) == std::cv_status::timeout) {
+                break;
             }
         }
+        if (!g_state.dirty || g_state.explicit_frame_open) {
+            continue;
+        }
 
-        viewer_backend::frame_scene scene{};
+        std::shared_ptr<const viewer_backend::frame_scene> scene;
         session_callbacks callbacks{};
         publish_locked(&scene, &callbacks);
         lock.unlock();
-        if (callbacks.frame_ready != nullptr) {
-            callbacks.frame_ready(&scene, callbacks.user_data);
+        if (callbacks.frame_ready_shared != nullptr) {
+            callbacks.frame_ready_shared(scene, callbacks.user_data);
+        } else if (callbacks.frame_ready != nullptr) {
+            callbacks.frame_ready(scene.get(), callbacks.user_data);
         }
         lock.lock();
     }
@@ -387,6 +510,7 @@ void network_thread() {
                     g_state.working_scene.triangles.clear();
                     g_state.working_scene.points.clear();
                     g_state.working_scene.lines.clear();
+                    reset_working_bounds_locked();
                     g_state.explicit_frame_open = false;
                     append_log_locked(log_event_kind::handshake, header.payload_size, 0, payload.app_name);
                     mark_dirty_locked();
@@ -411,6 +535,8 @@ void network_thread() {
                     g_state.working_scene.triangles.clear();
                     g_state.working_scene.points.clear();
                     g_state.working_scene.lines.clear();
+                    reset_working_bounds_locked();
+                    g_state.primitive_dirty = true;
                     g_state.explicit_frame_open = true;
                     mark_dirty_locked();
                     append_log_locked(log_event_kind::begin_frame, header.payload_size, 0, nullptr);
@@ -427,6 +553,8 @@ void network_thread() {
                     g_state.working_scene.triangles.clear();
                     g_state.working_scene.points.clear();
                     g_state.working_scene.lines.clear();
+                    reset_working_bounds_locked();
+                    g_state.primitive_dirty = true;
                     mark_dirty_locked();
                     append_log_locked(log_event_kind::clear, header.payload_size, 0, nullptr);
                 }
@@ -671,7 +799,7 @@ void network_thread() {
 
 connection_end:
         {
-            viewer_backend::frame_scene scene{};
+            std::shared_ptr<const viewer_backend::frame_scene> scene;
             session_callbacks callbacks{};
             bool publish_on_disconnect = false;
             {
@@ -680,6 +808,7 @@ connection_end:
                     g_state.working_scene.triangles.clear();
                     g_state.working_scene.points.clear();
                     g_state.working_scene.lines.clear();
+                    reset_working_bounds_locked();
                     g_state.explicit_frame_open = false;
                     g_state.dirty = false;
                     g_state.pending_capture_requests.clear();
@@ -690,8 +819,10 @@ connection_end:
                 g_state.layer_stack.clear();
                 append_log_locked(log_event_kind::connection_closed, 0, 0, nullptr);
             }
-            if (publish_on_disconnect && callbacks.frame_ready != nullptr) {
-                callbacks.frame_ready(&scene, callbacks.user_data);
+            if (publish_on_disconnect && callbacks.frame_ready_shared != nullptr) {
+                callbacks.frame_ready_shared(scene, callbacks.user_data);
+            } else if (publish_on_disconnect && callbacks.frame_ready != nullptr) {
+                callbacks.frame_ready(scene.get(), callbacks.user_data);
             }
         }
         close_platform_socket(client);
@@ -790,7 +921,11 @@ bool start_session(const session_callbacks &callbacks, const session_config &con
 void copy_latest_scene(viewer_backend::frame_scene* out_scene, bool* out_has_frame) {
     std::scoped_lock lock(g_state.mutex);
     if (out_scene != nullptr) {
-        *out_scene = g_state.published_scene;
+        if (g_state.published_scene != nullptr) {
+            *out_scene = *g_state.published_scene;
+        } else {
+            *out_scene = {};
+        }
     }
     if (out_has_frame != nullptr) {
         *out_has_frame = g_state.has_frame;

@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace rtvdb::viewer_session {
@@ -40,6 +41,9 @@ struct log_entry {
 
 struct session_callbacks {
     void (*frame_ready)(const viewer_backend::frame_scene* scene, void* user_data);
+    void (*frame_ready_shared)(
+        const std::shared_ptr<const viewer_backend::frame_scene> &scene,
+        void* user_data);
     void (*capture_requested)(
         std::uint64_t connection_serial,
         bool full_accumulation,

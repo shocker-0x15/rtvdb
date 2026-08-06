@@ -319,14 +319,24 @@ bool build_rt_scene_input(
     const rt_scene_build* previous_build,
     std::uint64_t revision,
     std::size_t triangle_chunk_primitive_count,
-    rt_scene_build* out_build)
+    rt_scene_build* out_build,
+    rt_scene_build_cancel_callback cancel_callback,
+    void* cancel_user_data)
 {
     if (out_build == nullptr) {
         return false;
     }
 
+    const auto should_cancel = [&]() {
+        return cancel_callback != nullptr && cancel_callback(cancel_user_data);
+    };
+    if (should_cancel()) {
+        return false;
+    }
+
     rt_scene_build build{};
     build.revision = revision;
+    build.connection_serial = scene.connection_serial;
     build.triangle_count = scene.triangles.size();
     build.point_count = scene.points.size();
     build.line_count = scene.lines.size();
@@ -335,8 +345,15 @@ bool build_rt_scene_input(
     build.points = scene.points;
     build.lines = scene.lines;
 
+    const rt_scene_build* session_previous_build = previous_build != nullptr &&
+            previous_build->connection_serial == scene.connection_serial
+        ? previous_build
+        : nullptr;
     const std::size_t effective_chunk_size = (std::max)(std::size_t{1}, triangle_chunk_primitive_count);
     for (std::size_t first = 0; first < scene.triangles.size();) {
+        if (should_cancel()) {
+            return false;
+        }
         std::size_t layer_end = first + 1;
         while (layer_end < scene.triangles.size() &&
                scene.triangles[layer_end].layer == scene.triangles[first].layer &&
@@ -353,9 +370,9 @@ bool build_rt_scene_input(
             &build.bounds);
         chunk.sealed = chunk.triangle_count == effective_chunk_size;
 
-        const rt_triangle_chunk* reusable_chunk = find_reusable_chunk(previous_build, chunk);
+        const rt_triangle_chunk* reusable_chunk = find_reusable_chunk(session_previous_build, chunk);
         if (reusable_chunk != nullptr) {
-            append_reused_chunk_geometry(&build, &chunk, *previous_build, *reusable_chunk);
+            append_reused_chunk_geometry(&build, &chunk, *session_previous_build, *reusable_chunk);
             ++build.reused_triangle_chunk_count;
         } else {
             append_new_chunk_geometry(scene, &build, &chunk);
@@ -369,6 +386,9 @@ bool build_rt_scene_input(
     const std::size_t effective_procedural_group_size =
         (std::max)(std::size_t{1}, kDefaultRtSceneProceduralChunkPrimitives);
     for (std::size_t first = 0; first < scene.points.size();) {
+        if (should_cancel()) {
+            return false;
+        }
         std::size_t end = first + 1;
         while (end < scene.points.size() && end - first < effective_procedural_group_size &&
                scene.points[end].layer == scene.points[first].layer &&
@@ -392,6 +412,9 @@ bool build_rt_scene_input(
         }
     }
     for (std::size_t first = 0; first < scene.lines.size();) {
+        if (should_cancel()) {
+            return false;
+        }
         std::size_t end = first + 1;
         while (end < scene.lines.size() && end - first < effective_procedural_group_size &&
                scene.lines[end].layer == scene.lines[first].layer &&
@@ -421,6 +444,96 @@ bool build_rt_scene_input(
 
     build.vertex_count = build.vertices.size();
     build.index_count = build.indices.size();
+    *out_build = std::move(build);
+    return true;
+}
+
+bool build_rt_scene_overlay_input(
+    const frame_scene &scene,
+    const rt_scene_build &base_build,
+    std::uint64_t revision,
+    rt_scene_build* out_build,
+    rt_scene_build_cancel_callback cancel_callback,
+    void* cancel_user_data)
+{
+    if (out_build == nullptr) {
+        return false;
+    }
+
+    const auto should_cancel = [&]() {
+        return cancel_callback != nullptr && cancel_callback(cancel_user_data);
+    };
+    if (should_cancel()) {
+        return false;
+    }
+
+    rt_scene_build build = base_build;
+    build.revision = revision;
+    build.connection_serial = scene.connection_serial;
+    build.point_count = scene.points.size();
+    build.line_count = scene.lines.size();
+    build.points = scene.points;
+    build.lines = scene.lines;
+
+    build.point_chunks.clear();
+    build.line_chunks.clear();
+    build.point_blas_chunk_sets.clear();
+    build.line_blas_chunk_sets.clear();
+
+    const std::size_t effective_group_size =
+        (std::max)(std::size_t{1}, kDefaultRtSceneProceduralChunkPrimitives);
+    for (std::size_t first = 0; first < scene.points.size();) {
+        if (should_cancel()) {
+            return false;
+        }
+        std::size_t end = first + 1;
+        while (end < scene.points.size() && end - first < effective_group_size &&
+               scene.points[end].layer == scene.points[first].layer &&
+               scene.points[end].visible == scene.points[first].visible) {
+            ++end;
+        }
+        rt_procedural_chunk group{};
+        group.first_primitive = first;
+        group.primitive_count = end - first;
+        group.layer = scene.points[first].layer;
+        group.visible = scene.points[first].visible;
+        for (std::size_t index = first; index < end; ++index) {
+            expand_bounds(&group.bounds, scene.points[index]);
+        }
+        build.point_chunks.push_back(std::move(group));
+        first = end;
+    }
+
+    for (std::size_t first = 0; first < scene.lines.size();) {
+        if (should_cancel()) {
+            return false;
+        }
+        std::size_t end = first + 1;
+        while (end < scene.lines.size() && end - first < effective_group_size &&
+               scene.lines[end].layer == scene.lines[first].layer &&
+               scene.lines[end].visible == scene.lines[first].visible) {
+            ++end;
+        }
+        rt_procedural_chunk group{};
+        group.first_primitive = first;
+        group.primitive_count = end - first;
+        group.layer = scene.lines[first].layer;
+        group.visible = scene.lines[first].visible;
+        for (std::size_t index = first; index < end; ++index) {
+            expand_bounds(&group.bounds, scene.lines[index]);
+        }
+        build.line_chunks.push_back(std::move(group));
+        first = end;
+    }
+
+    const std::size_t base_line_count = base_build.line_count;
+    if (base_line_count < scene.lines.size()) {
+        for (std::size_t index = base_line_count; index < scene.lines.size(); ++index) {
+            expand_bounds(&build.bounds, scene.lines[index]);
+        }
+    }
+    build.point_blas_chunk_sets = build_blas_chunk_sets(build.point_chunks, false);
+    build.line_blas_chunk_sets = build_blas_chunk_sets(build.line_chunks, false);
     *out_build = std::move(build);
     return true;
 }

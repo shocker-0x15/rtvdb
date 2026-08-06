@@ -53,6 +53,7 @@ struct rt_blas_chunk_set {
 
 struct rt_scene_build {
     std::uint64_t revision = 0;
+    std::uint64_t connection_serial = 0;
     std::size_t triangle_count = 0;
     std::size_t point_count = 0;
     std::size_t line_count = 0;
@@ -76,11 +77,23 @@ struct rt_scene_build {
 constexpr std::size_t kDefaultRtSceneTriangleChunkPrimitives = 8192;
 constexpr std::size_t kDefaultRtSceneProceduralChunkPrimitives = 8192;
 
+using rt_scene_build_cancel_callback = bool (*)(void* user_data);
+
 bool build_rt_scene_input(
     const frame_scene &scene,
     const rt_scene_build* previous_build,
     std::uint64_t revision,
     std::size_t triangle_chunk_primitive_count,
-    rt_scene_build* out_build);
+    rt_scene_build* out_build,
+    rt_scene_build_cancel_callback cancel_callback = nullptr,
+    void* cancel_user_data = nullptr);
+
+bool build_rt_scene_overlay_input(
+    const frame_scene &scene,
+    const rt_scene_build &base_build,
+    std::uint64_t revision,
+    rt_scene_build* out_build,
+    rt_scene_build_cancel_callback cancel_callback = nullptr,
+    void* cancel_user_data = nullptr);
 
 } // namespace rtvdb::viewer_backend

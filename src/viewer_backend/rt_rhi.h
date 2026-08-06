@@ -106,6 +106,17 @@ struct rt_rhi_diagnostics {
     double dispatch_gpu_ms = 0.0;
     double command_slot_reuse_wait_ms = 0.0;
     double readback_cpu_ms = 0.0;
+    std::uint64_t scratch_growth_count = 0;
+    std::size_t scratch_capacity_bytes = 0;
+    std::size_t scratch_peak_capacity_bytes = 0;
+    std::uint64_t acceleration_resource_allocation_count = 0;
+    std::uint64_t acceleration_resource_reallocation_count = 0;
+    std::size_t acceleration_capacity_bytes = 0;
+    std::size_t acceleration_peak_capacity_bytes = 0;
+    std::uint64_t scene_buffer_allocation_count = 0;
+    std::uint64_t scene_buffer_growth_count = 0;
+    std::size_t scene_buffer_capacity_bytes = 0;
+    std::size_t scene_buffer_peak_capacity_bytes = 0;
 };
 
 struct rt_trace_rays_desc {
@@ -368,6 +379,7 @@ struct rt_blas_build_desc {
     const rt_acceleration_geometry_desc* geometries = nullptr;
     std::size_t geometry_count = 0;
     std::uint32_t flags = rt_acceleration_build_prefer_fast_trace;
+    const std::size_t* allocation_primitive_counts = nullptr;
 };
 
 struct rt_tlas_instance_desc {
@@ -386,9 +398,7 @@ struct rt_tlas_build_desc {
     rt_tlas_handle destination{};
     const rt_tlas_instance_desc* instances = nullptr;
     std::size_t instance_count = 0;
-    std::uint32_t flags =
-        rt_acceleration_build_prefer_fast_trace |
-        rt_acceleration_build_allow_update;
+    std::uint32_t flags = rt_acceleration_build_prefer_fast_trace;
 };
 
 } // namespace rtvdb::viewer_backend

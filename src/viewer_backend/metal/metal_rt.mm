@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstring>
 #include <mutex>
+#include <limits>
 #include <vector>
 
 namespace rtvdb::viewer_backend {
@@ -263,6 +264,7 @@ struct metal_state {
     std::uint32_t accumulation_sample_count = 0;
     bool accumulation_active = false;
     std::uint64_t synced_revision = 0;
+    std::uint64_t synced_connection_serial = 0;
     std::size_t synced_blas_reused_count = 0;
     std::size_t synced_blas_rebuilt_count = 0;
     std::size_t synced_blas_reused_triangle_chunk_count = 0;
@@ -360,6 +362,7 @@ void reset_metal_state_contents() {
     g_metal.accumulation_sample_count = 0;
     g_metal.accumulation_active = false;
     g_metal.synced_revision = 0;
+    g_metal.synced_connection_serial = 0;
     g_metal.synced_blas_reused_count = 0;
     g_metal.synced_blas_rebuilt_count = 0;
     g_metal.synced_blas_reused_triangle_chunk_count = 0;
@@ -589,13 +592,23 @@ bool ensure_shared_buffer_capacity(
     if (*buffer != nil && *capacity >= required_length) {
         return true;
     }
-    const NSUInteger grown_capacity = *capacity > 0
-        ? *capacity + *capacity / 2u
-        : required_length;
-    const NSUInteger new_capacity = (std::max)(required_length, grown_capacity);
+    std::size_t new_capacity_size = 0;
+    if (!grow_rt_capacity(
+            static_cast<std::size_t>(required_length),
+            static_cast<std::size_t>(*capacity),
+            1,
+            &new_capacity_size) ||
+        new_capacity_size > (std::numeric_limits<NSUInteger>::max)()) {
+        return false;
+    }
+    const NSUInteger new_capacity = static_cast<NSUInteger>(new_capacity_size);
     id<MTLBuffer> new_buffer = new_shared_buffer(new_capacity);
     if (new_buffer == nil) {
         return false;
+    }
+    ++g_metal.build_info.scene_buffer_allocation_count;
+    if (*capacity != 0 && new_capacity > *capacity) {
+        ++g_metal.build_info.scene_buffer_growth_count;
     }
     *buffer = new_buffer;
     *capacity = new_capacity;
@@ -603,6 +616,14 @@ bool ensure_shared_buffer_capacity(
         *out_reallocated = true;
     }
     return true;
+}
+
+std::size_t metal_scene_buffer_capacity_bytes() {
+    return static_cast<std::size_t>(g_metal.position_buffer_capacity) +
+        static_cast<std::size_t>(g_metal.index_buffer_capacity) +
+        static_cast<std::size_t>(g_metal.triangle_color_buffer_capacity) +
+        static_cast<std::size_t>(g_metal.triangle_geometry_index_buffer_capacity) +
+        static_cast<std::size_t>(g_metal.triangle_instance_index_buffer_capacity);
 }
 
 bool ensure_output_buffer(int width, int height) {
@@ -1115,6 +1136,15 @@ bool sync_scene_resources(const rt_scene_build &build, command_timing* out_timin
     if (g_metal.device == nil) {
         return false;
     }
+    if (g_metal.synced_connection_serial != build.connection_serial) {
+        g_metal.uploaded_triangle_chunks.clear();
+        g_metal.triangle_blas_cache.clear();
+        g_metal.triangle_scene_blas.clear();
+        g_metal.point_blas = nil;
+        g_metal.point_fingerprint = 0;
+        g_metal.line_blas = nil;
+        g_metal.line_fingerprint = 0;
+    }
     std::size_t blas_reused_count = 0;
     std::size_t blas_rebuilt_count = 0;
     std::size_t blas_reused_triangle_chunk_count = 0;
@@ -1540,10 +1570,15 @@ bool sync_scene_resources(const rt_scene_build &build, command_timing* out_timin
     }
 
     g_metal.synced_revision = build.revision;
+    g_metal.synced_connection_serial = build.connection_serial;
     g_metal.synced_blas_reused_count = blas_reused_count;
     g_metal.synced_blas_rebuilt_count = blas_rebuilt_count;
     g_metal.synced_blas_reused_triangle_chunk_count = blas_reused_triangle_chunk_count;
     g_metal.synced_blas_rebuilt_triangle_chunk_count = blas_rebuilt_triangle_chunk_count;
+    g_metal.build_info.scene_buffer_capacity_bytes = metal_scene_buffer_capacity_bytes();
+    g_metal.build_info.scene_buffer_peak_capacity_bytes = (std::max)(
+        g_metal.build_info.scene_buffer_peak_capacity_bytes,
+        g_metal.build_info.scene_buffer_capacity_bytes);
     return true;
 }
 

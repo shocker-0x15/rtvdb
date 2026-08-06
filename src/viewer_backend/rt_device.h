@@ -75,9 +75,18 @@ struct rt_scene_buffer_resources {
     std::size_t point_aabb_count = 0;
     std::size_t line_aabb_count = 0;
     std::size_t instance_metadata_count = 0;
+    std::size_t positions_capacity_bytes = 0;
+    std::size_t indices_capacity_bytes = 0;
+    std::size_t triangle_colors_capacity_bytes = 0;
+    std::size_t instance_metadata_capacity_bytes = 0;
+    std::size_t points_capacity_bytes = 0;
+    std::size_t lines_capacity_bytes = 0;
+    std::size_t point_aabbs_capacity_bytes = 0;
+    std::size_t line_aabbs_capacity_bytes = 0;
     std::uint64_t point_geometry_fingerprint = 0;
     std::uint64_t line_geometry_fingerprint = 0;
     std::uint64_t revision = 0;
+    std::uint64_t connection_serial = 0;
     double procedural_aabb_upload_ms = 0.0;
     std::vector<rt_scene_buffer_upload> uploads;
 };
@@ -228,7 +237,38 @@ struct rt_device_frame_request {
 struct rt_blas_build_result {
     rt_blas_handle acceleration{};
     double prebuild_info_ms = 0.0;
+    std::size_t allocation_size_bytes = 0;
     bool reused = false;
+};
+
+struct rt_blas_storage_pool_entry {
+    rt_blas_storage_key key{};
+    rt_blas_handle acceleration{};
+    std::size_t capacity_bytes = 0;
+    rt_submission_token retirement_submission{};
+    std::uint64_t sequence = 0;
+};
+
+enum class rt_scene_buffer_role : std::uint8_t {
+    positions,
+    indices,
+    triangle_colors,
+    instance_metadata,
+    points,
+    lines,
+    point_aabbs,
+    line_aabbs,
+};
+
+struct rt_scene_buffer_pool_entry {
+    rt_buffer_handle buffer{};
+    std::size_t capacity_bytes = 0;
+    rt_scene_buffer_role role = rt_scene_buffer_role::positions;
+    std::size_t format_stride = 0;
+    std::uint32_t usage = 0;
+    rt_memory_domain memory_domain = rt_memory_domain::device;
+    rt_submission_token retirement_submission{};
+    std::uint64_t sequence = 0;
 };
 
 struct rt_acceleration_build_summary {
@@ -413,8 +453,10 @@ struct rt_deferred_acceleration_submission {
     rt_command_encoder encoder{};
     rt_blas_cache_state next_blas_cache_state{};
     std::vector<rt_blas_handle> created_accelerations;
-    std::vector<rt_blas_handle> retired_accelerations;
+    std::vector<rt_blas_storage_pool_entry> acquired_accelerations;
+    std::vector<rt_blas_storage_pool_entry> retired_accelerations;
     std::uint64_t scene_revision = 0;
+    std::uint64_t connection_serial = 0;
 };
 
 struct rt_device {
@@ -437,6 +479,20 @@ struct rt_device {
     rt_buffer_handle pick_output_buffer{};
     std::array<rt_pick_slot, kRtCommandSlotCount> pick_slots{};
     rt_blas_cache_state blas_cache_state{};
+    std::uint64_t current_connection_serial = 0;
+    std::vector<rt_blas_storage_pool_entry> blas_storage_pool;
+    std::vector<rt_scene_buffer_pool_entry> scene_buffer_pool;
+    std::uint64_t resource_pool_sequence = 1;
+    rt_submission_token last_submission{};
+    std::uint64_t blas_storage_pool_hit_count = 0;
+    std::uint64_t blas_storage_pool_miss_count = 0;
+    std::uint64_t scene_buffer_pool_hit_count = 0;
+    std::uint64_t scene_buffer_pool_miss_count = 0;
+    std::uint64_t scene_buffer_allocation_count = 0;
+    std::uint64_t scene_buffer_growth_count = 0;
+    std::uint64_t resource_pool_eviction_count = 0;
+    std::size_t acceleration_peak_capacity_bytes = 0;
+    std::size_t scene_buffer_peak_capacity_bytes = 0;
     rt_tlas_handle tlas{};
     std::uint64_t last_acceleration_revision = 0;
     rt_acceleration_build_summary last_acceleration_summary{};

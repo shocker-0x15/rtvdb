@@ -187,6 +187,25 @@ struct scene_build_info {
     bool accumulation_in_progress = false;
     std::size_t vertex_count = 0;
     std::size_t index_count = 0;
+    std::uint64_t scratch_growth_count = 0;
+    std::size_t scratch_capacity_bytes = 0;
+    std::size_t scratch_peak_capacity_bytes = 0;
+    std::uint64_t acceleration_resource_allocation_count = 0;
+    std::uint64_t acceleration_resource_reallocation_count = 0;
+    std::size_t acceleration_capacity_bytes = 0;
+    std::size_t acceleration_peak_capacity_bytes = 0;
+    std::uint64_t scene_buffer_allocation_count = 0;
+    std::uint64_t scene_buffer_growth_count = 0;
+    std::size_t scene_buffer_capacity_bytes = 0;
+    std::size_t scene_buffer_peak_capacity_bytes = 0;
+    std::uint64_t blas_storage_pool_hit_count = 0;
+    std::uint64_t blas_storage_pool_miss_count = 0;
+    std::uint64_t scene_buffer_pool_hit_count = 0;
+    std::uint64_t scene_buffer_pool_miss_count = 0;
+    std::size_t blas_storage_pool_bytes = 0;
+    std::size_t scene_buffer_pool_bytes = 0;
+    std::size_t retired_resource_bytes = 0;
+    std::uint64_t resource_pool_eviction_count = 0;
 };
 
 struct hover_highlight {

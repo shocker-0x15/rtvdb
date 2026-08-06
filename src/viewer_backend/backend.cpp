@@ -4,6 +4,7 @@
 #include "viewer_capture/png.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstring>
@@ -16,6 +17,9 @@ namespace {
 
 constexpr float kPi = 3.14159265f;
 constexpr float kMinVectorLengthSq = 1.0e-8f;
+constexpr auto kStaleSceneCoalesceDelay = std::chrono::milliseconds(100);
+constexpr auto kLargeSceneCoalesceDelay = std::chrono::milliseconds(1500);
+constexpr std::size_t kLargeScenePrimitiveThreshold = 65536;
 
 struct backend_state {
     backend_config config{};
@@ -23,6 +27,7 @@ struct backend_state {
     const backend_ops* ops = nullptr;
     std::mutex mutex;
     std::condition_variable condition;
+    std::chrono::steady_clock::time_point pending_updated_at{};
     std::thread worker;
     bool stop_worker = false;
     frame_scene pending_client_scene;
@@ -46,6 +51,30 @@ struct backend_state {
     hover_highlight highlight{};
     bool recovery_in_progress = false;
 } g_backend;
+
+struct scene_build_cancel_context {
+    std::uint64_t revision = 0;
+};
+
+bool should_cancel_scene_build(void* user_data) {
+    const auto* context = static_cast<const scene_build_cancel_context*>(user_data);
+    if (context == nullptr) {
+        return false;
+    }
+
+    std::scoped_lock lock(g_backend.mutex);
+    return g_backend.stop_worker || context->revision != g_backend.pending_revision;
+}
+
+std::chrono::milliseconds scene_coalesce_delay_locked() {
+    const std::size_t primitive_count =
+        g_backend.pending_client_scene.triangles.size() +
+        g_backend.pending_client_scene.points.size() +
+        g_backend.pending_client_scene.lines.size();
+    return primitive_count >= kLargeScenePrimitiveThreshold
+        ? kLargeSceneCoalesceDelay
+        : kStaleSceneCoalesceDelay;
+}
 
 backend_info unsupported_backend_info() {
     return {
@@ -171,6 +200,7 @@ void schedule_helper_overlay_rebuild_locked() {
     g_backend.pending_has_frame = g_backend.present_client_has_frame;
     g_backend.pending_allow_auto_frame = false;
     g_backend.pending_revision = ++g_backend.next_revision;
+    g_backend.pending_updated_at = std::chrono::steady_clock::now();
     g_backend.build_in_progress = g_backend.pending_has_frame;
     g_backend.condition.notify_all();
 }
@@ -185,6 +215,35 @@ void backend_worker() {
             break;
         }
 
+        for (;;) {
+            const auto observed_pending_updated_at = g_backend.pending_updated_at;
+            const auto coalesce_deadline = observed_pending_updated_at + scene_coalesce_delay_locked();
+            const bool pending_changed = g_backend.condition.wait_until(
+                lock,
+                coalesce_deadline,
+                [&] {
+                    return g_backend.stop_worker
+                        || g_backend.pending_revision == 0
+                        || g_backend.pending_updated_at != observed_pending_updated_at;
+                });
+            if (g_backend.stop_worker) {
+                break;
+            }
+            if (g_backend.pending_revision == 0) {
+                break;
+            }
+            if (pending_changed) {
+                continue;
+            }
+            break;
+        }
+        if (g_backend.stop_worker) {
+            break;
+        }
+        if (g_backend.pending_revision == 0) {
+            continue;
+        }
+
         frame_scene pending_scene = g_backend.pending_client_scene;
         const bool pending_has_frame = g_backend.pending_has_frame;
         const bool pending_allow_auto_frame = g_backend.pending_allow_auto_frame;
@@ -194,8 +253,18 @@ void backend_worker() {
         const bool helper_overlay = g_backend.helper_overlay;
         const helper_plane helper_overlay_plane = g_backend.helper_overlay_plane;
         const rt_scene_build previous_client_build = g_backend.present_client_rt_build;
-        const rt_scene_build previous_render_build = g_backend.present_render_rt_build;
         lock.unlock();
+
+        scene_build_cancel_context cancel_context{pending_revision};
+
+        const auto pending_scene_is_stale = [&]() {
+            lock.lock();
+            const bool stale = g_backend.stop_worker || pending_revision != g_backend.pending_revision;
+            if (!stale) {
+                lock.unlock();
+            }
+            return stale;
+        };
 
         rt_scene_build client_rt_build{};
         if (!build_rt_scene_input(
@@ -203,9 +272,16 @@ void backend_worker() {
                 previous_client_build.revision != 0 ? &previous_client_build : nullptr,
                 pending_revision,
                 kDefaultRtSceneTriangleChunkPrimitives,
-                &client_rt_build)) {
+                &client_rt_build,
+                should_cancel_scene_build,
+                &cancel_context)) {
             lock.lock();
-            g_backend.build_in_progress = false;
+            if (g_backend.pending_revision == pending_revision) {
+                g_backend.build_in_progress = false;
+            }
+            continue;
+        }
+        if (pending_scene_is_stale()) {
             continue;
         }
         if (pending_has_frame && auto_frame && pending_allow_auto_frame) {
@@ -223,15 +299,22 @@ void backend_worker() {
             append_default_helper_lines(helper_overlay_bounds, helper_overlay_plane, &render_scene);
         }
 
+        if (pending_scene_is_stale()) {
+            continue;
+        }
+
         rt_scene_build render_rt_build{};
-        if (!build_rt_scene_input(
+        if (!build_rt_scene_overlay_input(
                 render_scene,
-                previous_render_build.revision != 0 ? &previous_render_build : nullptr,
+                client_rt_build,
                 pending_revision,
-                kDefaultRtSceneTriangleChunkPrimitives,
-                &render_rt_build)) {
+                &render_rt_build,
+                should_cancel_scene_build,
+                &cancel_context)) {
             lock.lock();
-            g_backend.build_in_progress = false;
+            if (g_backend.pending_revision == pending_revision) {
+                g_backend.build_in_progress = false;
+            }
             continue;
         }
 
@@ -246,6 +329,10 @@ void backend_worker() {
         }
         const bool superseded_by_newer_scene = pending_revision != g_backend.pending_revision;
 
+        if (superseded_by_newer_scene) {
+            continue;
+        }
+
         g_backend.present_client_scene = pending_scene;
         g_backend.present_client_has_frame = pending_has_frame;
         g_backend.present_client_revision = pending_revision;
@@ -254,10 +341,8 @@ void backend_worker() {
         g_backend.present_render_has_frame = pending_has_frame;
         g_backend.present_render_revision = pending_revision;
         g_backend.present_render_rt_build = std::move(render_rt_build);
-        if (!superseded_by_newer_scene) {
-            g_backend.pending_revision = 0;
-            g_backend.build_in_progress = false;
-        }
+        g_backend.pending_revision = 0;
+        g_backend.build_in_progress = false;
 
         ready_scene = g_backend.present_client_scene;
         ready_has_frame = g_backend.present_client_has_frame;
@@ -435,6 +520,7 @@ void shutdown_backend() {
     g_backend.pending_has_frame = false;
     g_backend.pending_allow_auto_frame = true;
     g_backend.pending_revision = 0;
+    g_backend.pending_updated_at = {};
     g_backend.next_revision = 0;
     g_backend.present_client_scene = {};
     g_backend.present_client_has_frame = false;
@@ -462,6 +548,7 @@ bool submit_scene_build(const frame_scene &scene, bool has_frame, bool allow_aut
     g_backend.pending_has_frame = has_frame;
     g_backend.pending_allow_auto_frame = allow_auto_frame;
     g_backend.pending_revision = ++g_backend.next_revision;
+    g_backend.pending_updated_at = std::chrono::steady_clock::now();
     g_backend.build_in_progress = true;
     g_backend.condition.notify_all();
     return true;

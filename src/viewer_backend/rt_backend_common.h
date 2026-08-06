@@ -208,11 +208,24 @@ struct rt_blas_cache_key {
     std::size_t geometry_count = 0;
 };
 
+struct rt_blas_storage_key {
+    rt_acceleration_geometry_kind kind = rt_acceleration_geometry_kind::triangle;
+    std::array<rt_acceleration_geometry_type, kRtBlasChunkSetChunkCount> geometry_types{};
+    std::array<std::uint32_t, kRtBlasChunkSetChunkCount> geometry_flags{};
+    std::array<std::uint32_t, kRtBlasChunkSetChunkCount> geometry_formats{};
+    std::array<std::size_t, kRtBlasChunkSetChunkCount> primitive_counts{};
+    std::array<std::size_t, kRtBlasChunkSetChunkCount> strides{};
+    std::size_t geometry_count = 0;
+    std::uint32_t build_flags = rt_acceleration_build_prefer_fast_trace;
+};
+
 constexpr std::size_t kRtBlasCachePoolCount = 3;
 constexpr std::uint8_t kRtBlasCacheRetentionRevisions = 4;
 
 struct rt_blas_cache_slot {
     rt_blas_cache_key key{};
+    rt_blas_storage_key storage_key{};
+    std::size_t storage_capacity_bytes = 0;
     rt_blas_handle acceleration{};
     std::uint8_t unused_revision_count = 0;
     bool valid = false;
@@ -283,6 +296,7 @@ struct rt_scene_geometry_metadata {
 
 struct rt_scene_resource_data {
     std::uint64_t revision = 0;
+    std::uint64_t connection_serial = 0;
     std::vector<rt_scene_gpu_position> positions;
     std::vector<std::uint32_t> indices;
     std::vector<rtvdb::rgba> triangle_colors;
@@ -297,6 +311,7 @@ struct rt_blas_build_command {
     rt_acceleration_geometry_kind kind = rt_acceleration_geometry_kind::triangle;
     std::array<rt_acceleration_geometry_desc, kRtBlasChunkSetChunkCount> geometries{};
     std::size_t geometry_count = 0;
+    std::array<std::size_t, kRtBlasChunkSetChunkCount> allocation_primitive_counts{};
     rt_blas_handle destination{};
     std::uint32_t instance_index = 0;
     std::uint32_t hit_group_contribution = 0;
@@ -364,6 +379,10 @@ rt_procedural_geometry_update_plan make_rt_procedural_geometry_update_plan(
     std::uint64_t cached_line_fingerprint);
 rt_blas_cache_key make_rt_blas_cache_key(const rt_acceleration_build_item &item);
 bool rt_blas_cache_key_equals(const rt_blas_cache_key &a, const rt_blas_cache_key &b);
+bool rt_blas_storage_key_equals(const rt_blas_storage_key &a, const rt_blas_storage_key &b);
+rt_blas_storage_key make_rt_blas_storage_key(
+    const rt_blas_build_command &command,
+    std::uint32_t build_flags);
 bool make_rt_blas_cache_update_plan(
     const rt_acceleration_build_plan &build_plan,
     const rt_blas_cache_state &current_state,
@@ -371,5 +390,11 @@ bool make_rt_blas_cache_update_plan(
 void copy_rt_diagnostics(scene_build_info* out_info, const scene_build_info &diagnostics);
 void append_rt_diagnostics_log_line(std::string_view filename, std::string_view text);
 void append_rt_startup_log(std::string_view text);
+
+bool grow_rt_capacity(
+    std::size_t required,
+    std::size_t current,
+    std::size_t alignment,
+    std::size_t* out_capacity);
 
 } // namespace rtvdb::viewer_backend
