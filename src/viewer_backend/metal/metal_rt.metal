@@ -498,7 +498,8 @@ kernel void rtvdb_trace_kernel(
     float3 direction;
     make_view_ray(view, float2(tid), view.blend_and_jitter.yz, ray_origin, direction);
     float3 accumulated_color = float3(0.0f);
-    float3 throughput = float3(1.0f);
+    float accumulated_alpha = 0.0f;
+    float throughput = 1.0f;
     for (uint layer = 0u; layer < kMaxTransparencyLayers; ++layer) {
         ray view_ray(
             ray_origin,
@@ -525,12 +526,14 @@ kernel void rtvdb_trace_kernel(
         const float alpha = clamp(shaded.a, 0.0f, 1.0f);
         if (alpha >= kAlphaOpaqueThreshold) {
             accumulated_color += throughput * shaded.rgb;
+            accumulated_alpha += throughput;
             break;
         }
         accumulated_color += throughput * shaded.rgb * alpha;
+        accumulated_alpha += throughput * alpha;
         throughput *= 1.0f - alpha;
         ray_origin += direction * (hit.distance + scene_hit_advance_bias(view));
-        if (max(throughput.r, max(throughput.g, throughput.b)) <= 0.001f) {
+        if (throughput <= 0.001f) {
             break;
         }
     }
@@ -540,11 +543,14 @@ kernel void rtvdb_trace_kernel(
         ? float4(0.0f)
         : float4(accumulation.read(tid));
     const float sample_count = float(sample_index + 1u);
-    const float4 averaged = float4(
-        (previous.rgb * float(sample_index) + accumulated_color) / sample_count,
-        1.0f);
-    accumulation.write(half4(averaged), tid);
-    output.write(averaged, tid);
+    const float4 averaged_premultiplied =
+        (previous * float(sample_index) + float4(accumulated_color, accumulated_alpha)) / sample_count;
+    const float output_alpha = clamp(averaged_premultiplied.w, 0.0f, 1.0f);
+    const float3 output_rgb = output_alpha > 1.0e-6f
+        ? averaged_premultiplied.xyz / output_alpha
+        : float3(0.0f);
+    accumulation.write(half4(averaged_premultiplied), tid);
+    output.write(float4(output_rgb, output_alpha), tid);
 }
 
 kernel void rtvdb_pick_kernel(

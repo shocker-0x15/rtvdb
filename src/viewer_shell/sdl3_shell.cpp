@@ -97,6 +97,7 @@ std::string g_imgui_ini_path;
 std::wstring g_imgui_ini_requested_path;
 frame_timing g_frame_timing{};
 std::chrono::steady_clock::time_point g_last_present_end{};
+float g_background_color[3] = {0.0f, 0.0f, 0.0f};
 
 constexpr auto kResizeSettleDelay = std::chrono::milliseconds(150);
 constexpr char kPreferenceOrganization[] = "rtvdb";
@@ -512,6 +513,9 @@ void destroy_frame_textures() {
 }
 
 void set_active_frame_texture(SDL_Texture* texture, frame_texture_kind kind, int width, int height) {
+    if (texture != nullptr) {
+        SDL_SetTextureBlendMode(texture, SDL_BLENDMODE_BLEND);
+    }
     g_frame_texture = texture;
     g_frame_texture_kind = texture != nullptr ? kind : frame_texture_kind::none;
     g_frame_width = texture != nullptr ? width : 0;
@@ -753,7 +757,12 @@ bool render_main_window() {
     }
     ImGui::Render();
 
-    SDL_SetRenderDrawColor(g_renderer, 0, 0, 0, 255);
+    SDL_SetRenderDrawColor(
+        g_renderer,
+        static_cast<Uint8>(std::lround(g_background_color[0] * 255.0f)),
+        static_cast<Uint8>(std::lround(g_background_color[1] * 255.0f)),
+        static_cast<Uint8>(std::lround(g_background_color[2] * 255.0f)),
+        255);
     SDL_RenderClear(g_renderer);
 
     if (g_frame_texture != nullptr) {
@@ -1077,6 +1086,15 @@ void set_window_title(const wchar_t* title) {
     if (g_window != nullptr && title != nullptr) {
         SDL_SetWindowTitle(g_window, narrow_utf8(title).c_str());
     }
+}
+
+void set_background_color(float red, float green, float blue) {
+    const auto clamp_color = [](float value) {
+        return std::fmax(0.0f, std::fmin(1.0f, value));
+    };
+    g_background_color[0] = clamp_color(red);
+    g_background_color[1] = clamp_color(green);
+    g_background_color[2] = clamp_color(blue);
 }
 
 native_window_handle native_window() {

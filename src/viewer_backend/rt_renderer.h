@@ -103,7 +103,7 @@ struct rt_native_frame_request {
     int height = 0;
     const rt_scene_build* build = nullptr;
     rt_viewer_constants constants{};
-    float clear_color[4]{0.0f, 0.0f, 0.0f, 1.0f};
+    float clear_color[4]{0.0f, 0.0f, 0.0f, 0.0f};
     bool reuse_output = false;
     bool update_build_info = false;
     void* native_target = nullptr;

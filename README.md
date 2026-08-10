@@ -158,6 +158,16 @@ Capture session directories are created only after a request: beside the viewer 
 - `rtvdb_basic_client`: Minimal connection check
 - `rtvdb_bt2020_volume_client`: Color-gamut volume sample using points and line segments
 - `rtvdb_obj_stream_client`: Sends an OBJ incrementally
+  - Add `--wireframe` to send unique OBJ face-boundary edges as line primitives without triangles.
+
+```powershell
+.\build\Debug\rtvdb_obj_stream_client.exe --mesh .\mesh.obj --wireframe --batch 512 --sleep-ms 0
+```
+
+Wireframe extraction treats edges as undirected geometry edges, removes shared or duplicate edges, and does not
+include triangulation diagonals from polygon faces. With `--limit-triangles`, only faces covered by the triangle limit
+contribute edges; `--color-rgba` also controls the wireframe color. Wireframe line radius is automatically set to 0.1%
+of the mesh AABB's longest extent, or can be overridden with `--line-radius <value>`.
 
 ## Remote Viewer Connection
 

@@ -370,6 +370,8 @@ std::uint64_t g_layer_rebuild_generation = 0;
 bool g_layer_rebuild_stop = false;
 float g_viewer_window_height = 0.0f;
 float g_camera_speed_log10 = 0.0f;
+float g_display_background_color[3] = {0.0f, 0.0f, 0.0f};
+bool g_save_transparent_background = false;
 std::wstring g_last_manual_png_directory;
 struct client_capture_request {
     // Capture requests retain control metadata only; rendering uses the current viewer scene.
@@ -430,6 +432,11 @@ void on_capture_requested(
 void prepare_pending_client_capture();
 void process_pending_client_capture(bool has_frame);
 void complete_pending_client_capture_readback();
+bool prepare_png_save_pixels(
+    const std::vector<std::uint8_t> &render_pixels,
+    int render_width,
+    int render_height,
+    std::vector<std::uint8_t>* out_pixels);
 void reset_post_present_capture_readiness();
 void cancel_post_present_capture();
 #if defined(RTVDB_ENABLE_VULKAN_RT) && \
@@ -937,9 +944,19 @@ void complete_pending_client_capture_readback() {
         return;
     }
 
+    std::vector<std::uint8_t> save_pixels;
+    if (!prepare_png_save_pixels(pixels, render_width, render_height, &save_pixels)) {
+        const std::wstring path = g_client_capture_path.wstring();
+        g_client_capture_active = false;
+        g_client_capture_readback_pending = false;
+        g_client_capture_path.clear();
+        append_manual_png_save_log(true, path, "render capture composition failed");
+        return;
+    }
+
     const bool saved = rtvdb::viewer_capture::write_png_bgra8(
         g_client_capture_path.wstring().c_str(),
-        pixels.data(),
+        save_pixels.data(),
         render_width,
         render_height,
         render_width * 4);
@@ -1389,9 +1406,17 @@ void process_pending_manual_png_capture(bool has_frame)
         rtvdb::viewer_shell::request_repaint();
         return;
     }
+    std::vector<std::uint8_t> save_pixels;
+    if (!prepare_png_save_pixels(pixels, render_width, render_height, &save_pixels)) {
+        append_manual_png_save_log(true, g_manual_png_capture_path, "render capture composition failed");
+        g_manual_png_capture_pending = false;
+        g_manual_png_capture_converged = false;
+        g_manual_png_capture_path.clear();
+        return;
+    }
     if (!rtvdb::viewer_capture::write_png_bgra8(
             g_manual_png_capture_path.c_str(),
-            pixels.data(),
+            save_pixels.data(),
             render_width,
             render_height,
             render_width * 4)) {
@@ -2914,6 +2939,8 @@ float compute_viewer_window_height() {
     display_tab_height += text_line; // mode label
     display_tab_height += framed_line * static_cast<float>(visible_display_mode_count());
     display_tab_height += separator_height;
+    display_tab_height += text_line; // background label
+    display_tab_height += framed_line * 2.0f; // background color + save alpha
     display_tab_height += text_line; // grid label
     display_tab_height += framed_line; // grid radios
 
@@ -4367,6 +4394,30 @@ void cache_render_capture(
     g_cached_render_valid = true;
 }
 
+bool prepare_png_save_pixels(
+    const std::vector<std::uint8_t> &render_pixels,
+    int render_width,
+    int render_height,
+    std::vector<std::uint8_t>* out_pixels)
+{
+    if (out_pixels == nullptr || render_pixels.empty()) {
+        return false;
+    }
+    if (g_save_transparent_background) {
+        *out_pixels = render_pixels;
+        return true;
+    }
+    return rtvdb::viewer_capture::composite_bgra8_over_color(
+        render_pixels.data(),
+        render_width,
+        render_height,
+        render_width * 4,
+        0,
+        0,
+        0,
+        out_pixels);
+}
+
 void write_render_capture_files(
     std::uint64_t frame_serial,
     int render_width,
@@ -4374,10 +4425,15 @@ void write_render_capture_files(
     const std::vector<std::uint8_t> &pixels)
 {
     const std::wstring base_dir = capture_directory();
+    std::vector<std::uint8_t> save_pixels;
+    if (!prepare_png_save_pixels(pixels, render_width, render_height, &save_pixels)) {
+        append_render_stall_trace_line("capture_prepare_failed=latest_render");
+        return;
+    }
     const std::wstring latest_render_path = join_capture_path(base_dir, L"latest_render.png");
     if (!rtvdb::viewer_capture::write_png_bgra8(
             latest_render_path.c_str(),
-            pixels.data(),
+            save_pixels.data(),
             render_width,
             render_height,
             render_width * 4)) {
@@ -4390,7 +4446,7 @@ void write_render_capture_files(
         const std::wstring history_render_path = join_capture_path(base_dir, format_capture_name(L"render", frame_serial));
         if (!rtvdb::viewer_capture::write_png_bgra8(
                 history_render_path.c_str(),
-                pixels.data(),
+                save_pixels.data(),
                 render_width,
                 render_height,
                 render_width * 4)) {
@@ -5970,6 +6026,21 @@ void on_ui(void*) {
             }
 
             ImGui::Separator();
+
+            ImGui::TextUnformatted("Display Background");
+            if (ImGui::ColorEdit3(
+                    "##DisplayBackground",
+                    g_display_background_color,
+                    ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoAlpha)) {
+                rtvdb::viewer_shell::set_background_color(
+                    g_display_background_color[0],
+                    g_display_background_color[1],
+                    g_display_background_color[2]);
+                rtvdb::viewer_shell::request_repaint();
+            }
+            if (ImGui::Checkbox("Transparent background on save", &g_save_transparent_background)) {
+                rtvdb::viewer_shell::request_repaint();
+            }
 
             bool helper_overlay = rtvdb::viewer_backend::helper_overlay_enabled();
             rtvdb::viewer_backend::helper_plane helper_plane = rtvdb::viewer_backend::current_helper_overlay_plane();

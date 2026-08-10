@@ -395,9 +395,21 @@ bool capture_png(const wchar_t* path, const rt_render_request &request) {
     if (pixels.size() != expected_size) {
         return false;
     }
+    std::vector<std::uint8_t> save_pixels;
+    if (!viewer_capture::composite_bgra8_over_color(
+            pixels.data(),
+            request.width,
+            request.height,
+            request.width * 4,
+            0,
+            0,
+            0,
+            &save_pixels)) {
+        return false;
+    }
     return viewer_capture::write_png_bgra8(
         path,
-        pixels.data(),
+        save_pixels.data(),
         request.width,
         request.height,
         request.width * 4);

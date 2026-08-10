@@ -125,4 +125,40 @@ bool write_png_bgra8(const wchar_t* path, const std::uint8_t* bgra, int width, i
     return write_png_rgba8(path, rgba.data(), width, height, width * 4);
 }
 
+bool composite_bgra8_over_color(
+    const std::uint8_t* bgra,
+    int width,
+    int height,
+    int stride,
+    std::uint8_t red,
+    std::uint8_t green,
+    std::uint8_t blue,
+    std::vector<std::uint8_t>* out_bgra)
+{
+    if (!validate_arguments(L"composite", bgra, width, height, stride) || out_bgra == nullptr) {
+        return false;
+    }
+
+    out_bgra->resize(static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4u);
+    for (int y = 0; y < height; ++y) {
+        const std::uint8_t* src_row = bgra + static_cast<std::size_t>(y) * static_cast<std::size_t>(stride);
+        std::uint8_t* dst_row = out_bgra->data() +
+            static_cast<std::size_t>(y) * static_cast<std::size_t>(width) * 4u;
+        for (int x = 0; x < width; ++x) {
+            const std::uint8_t* src = src_row + static_cast<std::size_t>(x) * 4u;
+            std::uint8_t* dst = dst_row + static_cast<std::size_t>(x) * 4u;
+            const unsigned alpha = src[3];
+            const unsigned inverse_alpha = 255u - alpha;
+            dst[0] = static_cast<std::uint8_t>((static_cast<unsigned>(src[0]) * alpha +
+                static_cast<unsigned>(blue) * inverse_alpha + 127u) / 255u);
+            dst[1] = static_cast<std::uint8_t>((static_cast<unsigned>(src[1]) * alpha +
+                static_cast<unsigned>(green) * inverse_alpha + 127u) / 255u);
+            dst[2] = static_cast<std::uint8_t>((static_cast<unsigned>(src[2]) * alpha +
+                static_cast<unsigned>(red) * inverse_alpha + 127u) / 255u);
+            dst[3] = 255u;
+        }
+    }
+    return true;
+}
+
 } // namespace rtvdb::viewer_capture

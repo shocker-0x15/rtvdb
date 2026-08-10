@@ -150,7 +150,8 @@ void shared_raygen()
     float2 uv = ((float2(pixel) + 0.5 + jitter) / float2(shared_width(), shared_height())) * 2.0 - 1.0;
     uv.y = -uv.y;
     float3 accum = float3(0.0, 0.0, 0.0);
-    float3 throughput = float3(1.0, 1.0, 1.0);
+    float accumulated_alpha = 0.0;
+    float throughput = 1.0;
     float3 ray_origin = shared_origin();
     float3 direction = shared_forward();
     build_projection_ray(
@@ -195,7 +196,6 @@ void shared_raygen()
 
         if (payload.hit == 0u)
         {
-            accum += throughput * payload.color.rgb;
             break;
         }
 
@@ -203,14 +203,16 @@ void shared_raygen()
         if (alpha >= kAlphaOpaqueThreshold)
         {
             accum += throughput * payload.color.rgb;
+            accumulated_alpha += throughput;
             break;
         }
 
         accum += throughput * payload.color.rgb * alpha;
+        accumulated_alpha += throughput * alpha;
         throughput *= 1.0 - alpha;
         ray_origin += direction * (payload.hit_t + scene_hit_advance_bias());
 
-        if (max(throughput.r, max(throughput.g, throughput.b)) <= 0.001)
+        if (throughput <= 0.001)
         {
             break;
         }
@@ -218,10 +220,14 @@ void shared_raygen()
 
     const float4 previous = sample_index == 0 ? float4(0.0, 0.0, 0.0, 0.0) : g_accum[pixel];
     const float sample_count = float(sample_index + 1);
-    const float3 averaged = (previous.rgb * float(sample_index) + accum) / sample_count;
-    const float4 output = float4(averaged, 1.0);
-    g_accum[pixel] = output;
-    g_output[pixel] = output;
+    const float4 averaged_premultiplied =
+        (previous * float(sample_index) + float4(accum, accumulated_alpha)) / sample_count;
+    const float output_alpha = saturate(averaged_premultiplied.a);
+    const float3 output_rgb = output_alpha > 1.0e-6
+        ? averaged_premultiplied.rgb / output_alpha
+        : float3(0.0, 0.0, 0.0);
+    g_accum[pixel] = averaged_premultiplied;
+    g_output[pixel] = float4(output_rgb, output_alpha);
 }
 
 void shared_pick_raygen()
@@ -282,7 +288,7 @@ void shared_pick_raygen()
 
 void shared_miss(ARG_INOUT(Payload, payload))
 {
-    payload.color = float4(0.0, 0.0, 0.0, 1.0);
+    payload.color = float4(0.0, 0.0, 0.0, 0.0);
     payload.hit_t = 0.0;
     payload.hit = 0u;
     payload.primitive_kind = 0u;

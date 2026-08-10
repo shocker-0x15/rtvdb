@@ -102,7 +102,7 @@ struct dxr_backend_state {
     UINT height = 0;
     UINT output_width = 0;
     UINT output_height = 0;
-    float clear_color[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    float clear_color[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     rt_rhi_diagnostics diagnostics{};
     rt_object_registry<dxr_buffer, rt_buffer_handle> buffer_registry;
     rt_object_registry<dxr_texture, rt_texture_handle> texture_registry;
