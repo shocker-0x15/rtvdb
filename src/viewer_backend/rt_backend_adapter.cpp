@@ -404,6 +404,7 @@ bool capture_png(const wchar_t* path, const rt_render_request &request) {
             0,
             0,
             0,
+            255,
             &save_pixels)) {
         return false;
     }

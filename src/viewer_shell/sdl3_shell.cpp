@@ -67,6 +67,7 @@ SDL_Texture* g_bgra_frame_texture = nullptr;
 SDL_Texture* g_d3d12_frame_texture = nullptr;
 SDL_Texture* g_metal_frame_texture = nullptr;
 SDL_Texture* g_vulkan_frame_texture = nullptr;
+SDL_Texture* g_checkerboard_texture = nullptr;
 frame_texture_kind g_frame_texture_kind = frame_texture_kind::none;
 int g_frame_width = 0;
 int g_frame_height = 0;
@@ -82,6 +83,8 @@ int g_metal_frame_height = 0;
 int g_vulkan_frame_width = 0;
 int g_vulkan_frame_height = 0;
 void* g_vulkan_frame_image = nullptr;
+int g_checkerboard_width = 0;
+int g_checkerboard_height = 0;
 void* g_native_window = nullptr;
 native_window_kind g_native_window_kind = native_window_kind::none;
 d3d12_renderer_interop g_d3d12_renderer_interop{};
@@ -97,12 +100,15 @@ std::string g_imgui_ini_path;
 std::wstring g_imgui_ini_requested_path;
 frame_timing g_frame_timing{};
 std::chrono::steady_clock::time_point g_last_present_end{};
-float g_background_color[3] = {0.0f, 0.0f, 0.0f};
+float g_background_color[4] = {0.0f, 0.0f, 0.0f, 1.0f};
 
 constexpr auto kResizeSettleDelay = std::chrono::milliseconds(150);
+constexpr int kCheckerboardCellSize = 16;
 constexpr char kPreferenceOrganization[] = "rtvdb";
 constexpr char kPreferenceApplication[] = "viewer";
 constexpr char kImguiIniFilename[] = "imgui.ini";
+
+void destroy_checkerboard_texture();
 
 std::filesystem::path capture_log_path(const char* filename) {
     try {
@@ -523,6 +529,7 @@ void set_active_frame_texture(SDL_Texture* texture, frame_texture_kind kind, int
 }
 
 void destroy_renderer() {
+    destroy_checkerboard_texture();
     destroy_frame_textures();
     g_d3d12_renderer_interop = {};
     if (g_renderer != nullptr) {
@@ -739,6 +746,53 @@ void cache_renderer_interop() {
 #endif
 }
 
+void destroy_checkerboard_texture() {
+    if (g_checkerboard_texture != nullptr) {
+        SDL_DestroyTexture(g_checkerboard_texture);
+        g_checkerboard_texture = nullptr;
+    }
+    g_checkerboard_width = 0;
+    g_checkerboard_height = 0;
+}
+
+bool ensure_checkerboard_texture(int width, int height) {
+    if (g_renderer == nullptr || width <= 0 || height <= 0) {
+        return false;
+    }
+    if (g_checkerboard_texture != nullptr &&
+        g_checkerboard_width == width &&
+        g_checkerboard_height == height) {
+        return true;
+    }
+
+    destroy_checkerboard_texture();
+    SDL_Surface* surface = SDL_CreateSurface(width, height, SDL_PIXELFORMAT_RGBA32);
+    if (surface == nullptr) {
+        return false;
+    }
+    const Uint32 light = SDL_MapSurfaceRGBA(surface, 192u, 192u, 192u, 255u);
+    const Uint32 dark = SDL_MapSurfaceRGBA(surface, 144u, 144u, 144u, 255u);
+    for (int y = 0; y < height; ++y) {
+        Uint32* row = reinterpret_cast<Uint32*>(
+            static_cast<Uint8*>(surface->pixels) +
+            static_cast<std::size_t>(y) * static_cast<std::size_t>(surface->pitch));
+        for (int x = 0; x < width; ++x) {
+            const bool light_cell =
+                ((x / kCheckerboardCellSize) + (y / kCheckerboardCellSize)) % 2 == 0;
+            row[x] = light_cell ? light : dark;
+        }
+    }
+    g_checkerboard_texture = SDL_CreateTextureFromSurface(g_renderer, surface);
+    SDL_DestroySurface(surface);
+    if (g_checkerboard_texture == nullptr) {
+        return false;
+    }
+    SDL_SetTextureBlendMode(g_checkerboard_texture, SDL_BLENDMODE_NONE);
+    g_checkerboard_width = width;
+    g_checkerboard_height = height;
+    return true;
+}
+
 bool render_main_window() {
     if (g_renderer == nullptr) {
         return false;
@@ -757,13 +811,32 @@ bool render_main_window() {
     }
     ImGui::Render();
 
-    SDL_SetRenderDrawColor(
-        g_renderer,
-        static_cast<Uint8>(std::lround(g_background_color[0] * 255.0f)),
-        static_cast<Uint8>(std::lround(g_background_color[1] * 255.0f)),
-        static_cast<Uint8>(std::lround(g_background_color[2] * 255.0f)),
-        255);
-    SDL_RenderClear(g_renderer);
+    int output_width = 0;
+    int output_height = 0;
+    SDL_GetRenderOutputSize(g_renderer, &output_width, &output_height);
+    if (ensure_checkerboard_texture(output_width, output_height)) {
+        SDL_SetRenderDrawColor(g_renderer, 0, 0, 0, 255);
+        SDL_SetRenderDrawBlendMode(g_renderer, SDL_BLENDMODE_NONE);
+        SDL_RenderClear(g_renderer);
+        SDL_RenderTexture(g_renderer, g_checkerboard_texture, nullptr, nullptr);
+        SDL_SetRenderDrawColor(
+            g_renderer,
+            static_cast<Uint8>(std::lround(g_background_color[0] * 255.0f)),
+            static_cast<Uint8>(std::lround(g_background_color[1] * 255.0f)),
+            static_cast<Uint8>(std::lround(g_background_color[2] * 255.0f)),
+            static_cast<Uint8>(std::lround(g_background_color[3] * 255.0f)));
+        SDL_SetRenderDrawBlendMode(g_renderer, SDL_BLENDMODE_BLEND);
+        SDL_RenderFillRect(g_renderer, nullptr);
+        SDL_SetRenderDrawBlendMode(g_renderer, SDL_BLENDMODE_NONE);
+    } else {
+        SDL_SetRenderDrawColor(
+            g_renderer,
+            static_cast<Uint8>(std::lround(g_background_color[0] * 255.0f)),
+            static_cast<Uint8>(std::lround(g_background_color[1] * 255.0f)),
+            static_cast<Uint8>(std::lround(g_background_color[2] * 255.0f)),
+            255);
+        SDL_RenderClear(g_renderer);
+    }
 
     if (g_frame_texture != nullptr) {
         SDL_RenderTexture(g_renderer, g_frame_texture, nullptr, nullptr);
@@ -1088,13 +1161,14 @@ void set_window_title(const wchar_t* title) {
     }
 }
 
-void set_background_color(float red, float green, float blue) {
+void set_background_color(float red, float green, float blue, float alpha) {
     const auto clamp_color = [](float value) {
         return std::fmax(0.0f, std::fmin(1.0f, value));
     };
     g_background_color[0] = clamp_color(red);
     g_background_color[1] = clamp_color(green);
     g_background_color[2] = clamp_color(blue);
+    g_background_color[3] = clamp_color(alpha);
 }
 
 native_window_handle native_window() {

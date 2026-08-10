@@ -133,6 +133,7 @@ bool composite_bgra8_over_color(
     std::uint8_t red,
     std::uint8_t green,
     std::uint8_t blue,
+    std::uint8_t alpha,
     std::vector<std::uint8_t>* out_bgra)
 {
     if (!validate_arguments(L"composite", bgra, width, height, stride) || out_bgra == nullptr) {
@@ -147,15 +148,28 @@ bool composite_bgra8_over_color(
         for (int x = 0; x < width; ++x) {
             const std::uint8_t* src = src_row + static_cast<std::size_t>(x) * 4u;
             std::uint8_t* dst = dst_row + static_cast<std::size_t>(x) * 4u;
-            const unsigned alpha = src[3];
-            const unsigned inverse_alpha = 255u - alpha;
-            dst[0] = static_cast<std::uint8_t>((static_cast<unsigned>(src[0]) * alpha +
-                static_cast<unsigned>(blue) * inverse_alpha + 127u) / 255u);
-            dst[1] = static_cast<std::uint8_t>((static_cast<unsigned>(src[1]) * alpha +
-                static_cast<unsigned>(green) * inverse_alpha + 127u) / 255u);
-            dst[2] = static_cast<std::uint8_t>((static_cast<unsigned>(src[2]) * alpha +
-                static_cast<unsigned>(red) * inverse_alpha + 127u) / 255u);
-            dst[3] = 255u;
+            const unsigned source_alpha = src[3];
+            const unsigned inverse_source_alpha = 255u - source_alpha;
+            const unsigned output_alpha_scaled = source_alpha * 255u + alpha * inverse_source_alpha;
+            if (output_alpha_scaled == 0u) {
+                dst[0] = 0u;
+                dst[1] = 0u;
+                dst[2] = 0u;
+            } else {
+                const auto composite_channel = [output_alpha_scaled, source_alpha, inverse_source_alpha, alpha](
+                    unsigned source,
+                    unsigned background) {
+                    const std::uint64_t premultiplied =
+                        static_cast<std::uint64_t>(source) * source_alpha * 255u +
+                        static_cast<std::uint64_t>(background) * alpha * inverse_source_alpha;
+                    return static_cast<std::uint8_t>(
+                        (premultiplied + output_alpha_scaled / 2u) / output_alpha_scaled);
+                };
+                dst[0] = composite_channel(src[0], blue);
+                dst[1] = composite_channel(src[1], green);
+                dst[2] = composite_channel(src[2], red);
+            }
+            dst[3] = static_cast<std::uint8_t>((output_alpha_scaled + 127u) / 255u);
         }
     }
     return true;

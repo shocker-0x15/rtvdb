@@ -112,7 +112,7 @@ void run_shell_loop();
 void request_shutdown();
 void request_repaint();
 void set_window_title(const wchar_t* title);
-void set_background_color(float red, float green, float blue);
+void set_background_color(float red, float green, float blue, float alpha);
 native_window_handle native_window();
 bool render_window_size(int* out_width, int* out_height);
 bool render_coordinate_to_pixel(int x, int y, int* out_pixel_x, int* out_pixel_y);

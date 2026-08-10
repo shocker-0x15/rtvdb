@@ -370,8 +370,7 @@ std::uint64_t g_layer_rebuild_generation = 0;
 bool g_layer_rebuild_stop = false;
 float g_viewer_window_height = 0.0f;
 float g_camera_speed_log10 = 0.0f;
-float g_display_background_color[3] = {0.0f, 0.0f, 0.0f};
-bool g_save_transparent_background = false;
+float g_display_background_color[4] = {0.0f, 0.0f, 0.0f, 1.0f};
 std::wstring g_last_manual_png_directory;
 struct client_capture_request {
     // Capture requests retain control metadata only; rendering uses the current viewer scene.
@@ -2940,7 +2939,7 @@ float compute_viewer_window_height() {
     display_tab_height += framed_line * static_cast<float>(visible_display_mode_count());
     display_tab_height += separator_height;
     display_tab_height += text_line; // background label
-    display_tab_height += framed_line * 2.0f; // background color + save alpha
+    display_tab_height += framed_line; // background color
     display_tab_height += text_line; // grid label
     display_tab_height += framed_line; // grid radios
 
@@ -4403,18 +4402,18 @@ bool prepare_png_save_pixels(
     if (out_pixels == nullptr || render_pixels.empty()) {
         return false;
     }
-    if (g_save_transparent_background) {
-        *out_pixels = render_pixels;
-        return true;
-    }
+    const auto to_byte = [](float value) {
+        return static_cast<std::uint8_t>(std::lround((std::clamp)(value, 0.0f, 1.0f) * 255.0f));
+    };
     return rtvdb::viewer_capture::composite_bgra8_over_color(
         render_pixels.data(),
         render_width,
         render_height,
         render_width * 4,
-        0,
-        0,
-        0,
+        to_byte(g_display_background_color[0]),
+        to_byte(g_display_background_color[1]),
+        to_byte(g_display_background_color[2]),
+        to_byte(g_display_background_color[3]),
         out_pixels);
 }
 
@@ -6028,17 +6027,15 @@ void on_ui(void*) {
             ImGui::Separator();
 
             ImGui::TextUnformatted("Display Background");
-            if (ImGui::ColorEdit3(
+            if (ImGui::ColorEdit4(
                     "##DisplayBackground",
                     g_display_background_color,
-                    ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoAlpha)) {
+                    ImGuiColorEditFlags_NoInputs)) {
                 rtvdb::viewer_shell::set_background_color(
                     g_display_background_color[0],
                     g_display_background_color[1],
-                    g_display_background_color[2]);
-                rtvdb::viewer_shell::request_repaint();
-            }
-            if (ImGui::Checkbox("Transparent background on save", &g_save_transparent_background)) {
+                    g_display_background_color[2],
+                    g_display_background_color[3]);
                 rtvdb::viewer_shell::request_repaint();
             }
 

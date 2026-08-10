@@ -34,6 +34,7 @@ struct backend_state {
     frame_scene pending_client_scene;
     bool pending_has_frame = false;
     bool pending_allow_auto_frame = true;
+    bool pending_helper_overlay_update = false;
     std::uint64_t pending_revision = 0;
     std::uint64_t next_revision = 0;
     frame_scene present_client_scene;
@@ -198,9 +199,9 @@ void apply_auto_frame(frame_scene* scene, const backend_config &config, const sc
 }
 
 void schedule_helper_overlay_rebuild_locked() {
-    g_backend.pending_client_scene = g_backend.present_client_scene;
     g_backend.pending_has_frame = g_backend.present_client_has_frame;
     g_backend.pending_allow_auto_frame = false;
+    g_backend.pending_helper_overlay_update = true;
     g_backend.pending_revision = ++g_backend.next_revision;
     g_backend.pending_updated_at = std::chrono::steady_clock::now();
     g_backend.build_in_progress = g_backend.pending_has_frame;
@@ -218,6 +219,9 @@ void backend_worker() {
         }
 
         for (;;) {
+            if (g_backend.pending_helper_overlay_update) {
+                break;
+            }
             const auto observed_pending_updated_at = g_backend.pending_updated_at;
             const auto coalesce_deadline = observed_pending_updated_at + scene_coalesce_delay_locked();
             const bool pending_changed = g_backend.condition.wait_until(
@@ -246,7 +250,10 @@ void backend_worker() {
             continue;
         }
 
-        frame_scene pending_scene = g_backend.pending_client_scene;
+        const bool pending_helper_overlay_update = g_backend.pending_helper_overlay_update;
+        frame_scene pending_scene = pending_helper_overlay_update
+            ? g_backend.present_client_scene
+            : g_backend.pending_client_scene;
         const bool pending_has_frame = g_backend.pending_has_frame;
         const bool pending_allow_auto_frame = g_backend.pending_allow_auto_frame;
         const std::uint64_t pending_revision = g_backend.pending_revision;
@@ -268,15 +275,24 @@ void backend_worker() {
             return stale;
         };
 
+        const bool can_reuse_client_build = pending_helper_overlay_update &&
+            previous_client_build.revision != 0 &&
+            previous_client_build.connection_serial == pending_scene.connection_serial &&
+            previous_client_build.triangle_count == pending_scene.triangles.size() &&
+            previous_client_build.point_count == pending_scene.points.size() &&
+            previous_client_build.line_count == pending_scene.lines.size();
         rt_scene_build client_rt_build{};
-        if (!build_rt_scene_input(
-                pending_scene,
-                previous_client_build.revision != 0 ? &previous_client_build : nullptr,
-                pending_revision,
-                kDefaultRtSceneTriangleChunkPrimitives,
-                &client_rt_build,
-                should_cancel_scene_build,
-                &cancel_context)) {
+        if (can_reuse_client_build) {
+            client_rt_build = previous_client_build;
+            client_rt_build.revision = pending_revision;
+        } else if (!build_rt_scene_input(
+                       pending_scene,
+                       previous_client_build.revision != 0 ? &previous_client_build : nullptr,
+                       pending_revision,
+                       kDefaultRtSceneTriangleChunkPrimitives,
+                       &client_rt_build,
+                       should_cancel_scene_build,
+                       &cancel_context)) {
             lock.lock();
             if (g_backend.pending_revision == pending_revision) {
                 g_backend.build_in_progress = false;
@@ -344,6 +360,7 @@ void backend_worker() {
         g_backend.present_render_revision = pending_revision;
         g_backend.present_render_rt_build = std::move(render_rt_build);
         g_backend.pending_revision = 0;
+        g_backend.pending_helper_overlay_update = false;
         g_backend.build_in_progress = false;
 
         ready_scene = g_backend.present_client_scene;
@@ -388,7 +405,9 @@ bool try_recover_backend(const d3d12_interop_config* replacement_d3d12 = nullptr
         display = g_backend.display;
         highlight = g_backend.highlight;
         if (g_backend.pending_revision != 0) {
-            recovery_scene = g_backend.pending_client_scene;
+            recovery_scene = g_backend.pending_helper_overlay_update
+                ? g_backend.present_client_scene
+                : g_backend.pending_client_scene;
             recovery_has_frame = g_backend.pending_has_frame;
             recovery_allow_auto_frame = g_backend.pending_allow_auto_frame;
         } else {
@@ -556,6 +575,7 @@ void shutdown_backend() {
     g_backend.pending_client_scene = {};
     g_backend.pending_has_frame = false;
     g_backend.pending_allow_auto_frame = true;
+    g_backend.pending_helper_overlay_update = false;
     g_backend.pending_revision = 0;
     g_backend.pending_updated_at = {};
     g_backend.next_revision = 0;
@@ -601,6 +621,7 @@ bool submit_scene_build(const frame_scene &scene, bool has_frame, bool allow_aut
     g_backend.pending_client_scene = scene;
     g_backend.pending_has_frame = has_frame;
     g_backend.pending_allow_auto_frame = allow_auto_frame;
+    g_backend.pending_helper_overlay_update = false;
     g_backend.pending_revision = ++g_backend.next_revision;
     g_backend.pending_updated_at = std::chrono::steady_clock::now();
     g_backend.build_in_progress = true;

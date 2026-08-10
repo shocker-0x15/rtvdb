@@ -16,6 +16,7 @@ bool composite_bgra8_over_color(
     std::uint8_t red,
     std::uint8_t green,
     std::uint8_t blue,
+    std::uint8_t alpha,
     std::vector<std::uint8_t>* out_bgra);
 
 } // namespace rtvdb::viewer_capture
