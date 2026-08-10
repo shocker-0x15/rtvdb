@@ -3,7 +3,6 @@
 #include "viewer_backend/rt_render_plan.h"
 
 #include <algorithm>
-#include <cmath>
 #include <limits>
 #include <utility>
 
@@ -141,14 +140,6 @@ bool make_rt_scene_resource_data(
     data.line_aabbs.resize(build.line_count);
     data.instance_geometry.resize(plan.items.size() * kRtBlasChunkSetChunkCount);
 
-    const auto encode_srgb_channel = [](float value) {
-        const float x = (std::clamp)(value, 0.0f, 1.0f);
-        if (x <= 0.0031308f) {
-            return x * 12.92f;
-        }
-        return 1.055f * std::pow(x, 1.0f / 2.4f) - 0.055f;
-    };
-
     for (std::size_t vertex_index = 0; vertex_index < build.vertex_count; ++vertex_index) {
         const rtvdb::vec3 &position = build.vertices[vertex_index].position;
         data.positions[vertex_index] = {position.x, position.y, position.z, 0.0f};
@@ -174,9 +165,9 @@ bool make_rt_scene_resource_data(
             }
             const rtvdb::rgba &color = build.vertices[vertex_index].color;
             data.triangle_colors[chunk.first_triangle + local_triangle_index] = {
-                encode_srgb_channel(color.r),
-                encode_srgb_channel(color.g),
-                encode_srgb_channel(color.b),
+                color.r,
+                color.g,
+                color.b,
                 color.a,
             };
         }
