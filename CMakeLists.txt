@@ -36,6 +36,10 @@ else()
     option(RTVDB_ENABLE_VULKAN_RT "Build the viewer against the Vulkan RT backend" OFF)
 endif()
 
+if(APPLE AND RTVDB_ENABLE_VULKAN_RT)
+    message(FATAL_ERROR "RTVDB_ENABLE_VULKAN_RT is unsupported on Apple platforms; use the Metal backend")
+endif()
+
 if((WIN32 AND RTVDB_ENABLE_D3D12_DXR) OR RTVDB_ENABLE_VULKAN_RT)
     set(_rtvdb_dxc_search_paths)
     if(WIN32 AND DEFINED ENV{WindowsSdkVerBinPath})
@@ -58,8 +62,6 @@ set(RTVDB_SHADER_SHARED_HEADERS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/viewer_backend/shaders/rt_logic_shared_core.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/viewer_backend/shaders/rt_shader_entrypoints.h
 )
-set(RTVDB_VIEWER_BACKEND_SHADER_OUTPUTS)
-
 function(rtvdb_set_hlsl_vs_custom_build source message command outputs additional_inputs)
     if(CMAKE_GENERATOR MATCHES "Visual Studio")
         set(_vs_settings
@@ -124,11 +126,6 @@ if(WIN32 AND RTVDB_ENABLE_D3D12_DXR)
         "${_rtvdb_d3d12_vs_command}"
         ${RTVDB_D3D12_RAYTRACING_STAMP}
         "$(RTVDB_D3D12_SHADER_INPUTS)")
-    list(APPEND RTVDB_VIEWER_BACKEND_SHADER_OUTPUTS
-        ${RTVDB_D3D12_RAYTRACING_DXIL}
-        ${RTVDB_D3D12_RAYTRACING_HEADER}
-        ${RTVDB_D3D12_RAYTRACING_STAMP})
-
     source_group("Source Files\\viewer_backend\\d3d12" FILES ${RTVDB_D3D12_RAYTRACING_HLSL})
 endif()
 
@@ -222,24 +219,6 @@ if(RTVDB_ENABLE_VULKAN_RT)
         ${RTVDB_VULKAN_RT_STAMP}
         "$(RTVDB_VULKAN_SHADER_INPUTS)")
 
-    list(APPEND RTVDB_VIEWER_BACKEND_SHADER_OUTPUTS
-        ${RTVDB_VULKAN_RT_RGEN_SPV}
-        ${RTVDB_VULKAN_RT_PICK_RGEN_SPV}
-        ${RTVDB_VULKAN_RT_RMISS_SPV}
-        ${RTVDB_VULKAN_RT_RCHIT_SPV}
-        ${RTVDB_VULKAN_RT_POINT_RCHIT_SPV}
-        ${RTVDB_VULKAN_RT_POINT_RINT_SPV}
-        ${RTVDB_VULKAN_RT_LINE_RCHIT_SPV}
-        ${RTVDB_VULKAN_RT_LINE_RINT_SPV}
-        ${RTVDB_VULKAN_RT_RGEN_HEADER}
-        ${RTVDB_VULKAN_RT_PICK_RGEN_HEADER}
-        ${RTVDB_VULKAN_RT_RMISS_HEADER}
-        ${RTVDB_VULKAN_RT_RCHIT_HEADER}
-        ${RTVDB_VULKAN_RT_POINT_RCHIT_HEADER}
-        ${RTVDB_VULKAN_RT_POINT_RINT_HEADER}
-        ${RTVDB_VULKAN_RT_LINE_RCHIT_HEADER}
-        ${RTVDB_VULKAN_RT_LINE_RINT_HEADER}
-        ${RTVDB_VULKAN_RT_STAMP})
     source_group("Source Files\\viewer_backend\\vulkan" FILES ${RTVDB_VULKAN_RT_HLSL})
 endif()
 
@@ -309,11 +288,6 @@ if(APPLE)
         VERBATIM
     )
     set(RTVDB_METAL_RT_GENERATED_HEADERS ${RTVDB_METAL_RT_SHADER_METALLIB_HEADER})
-    list(APPEND RTVDB_VIEWER_BACKEND_SHADER_OUTPUTS
-        ${RTVDB_METAL_RT_SHADER_AIR}
-        ${RTVDB_METAL_RT_SHADER_METALLIB}
-        ${RTVDB_METAL_RT_SHADER_METALLIB_HEADER})
-
     source_group("Shader Files" FILES ${RTVDB_METAL_RT_SHADER_MSL} ${RTVDB_METAL_SHADER_SHARED_HEADERS})
 endif()
 
@@ -326,7 +300,7 @@ source_group("CMake Files" FILES
 set(SDL_SHARED OFF CACHE BOOL "Build SDL shared library" FORCE)
 set(SDL_STATIC ON CACHE BOOL "Build SDL static library" FORCE)
 set(SDL_TEST_LIBRARY OFF CACHE BOOL "Build SDL test library" FORCE)
-if(RTVDB_ENABLE_VULKAN_RT)
+if((WIN32 AND RTVDB_ENABLE_D3D12_DXR) OR RTVDB_ENABLE_VULKAN_RT)
     include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/apply_sdl_patches.cmake)
 endif()
 add_subdirectory(third_party/SDL EXCLUDE_FROM_ALL)
@@ -356,41 +330,70 @@ set(RTVDB_IMGUI_SOURCES
 set(RTVDB_VIEWER_BACKEND_SOURCES
     src/viewer_backend/backend.cpp
     src/viewer_backend/helper_overlay.cpp
-    src/viewer_backend/rt_backend.cpp
-    src/viewer_backend/rt_backend_common.cpp
-    src/viewer_backend/rt_device.cpp
+    src/viewer_backend/rt_acceleration_plan.cpp
+    src/viewer_backend/rt_backend_adapter.cpp
+    src/viewer_backend/rt_diagnostics.cpp
+    src/viewer_backend/rt_render_plan.cpp
+    src/viewer_backend/rt_renderer.cpp
+    src/viewer_backend/rt_rhi.cpp
     src/viewer_backend/rt_scene_builder.cpp
 )
 set(RTVDB_VIEWER_BACKEND_HEADERS
     src/viewer_backend/backend.h
     src/viewer_backend/backend_internal.h
     src/viewer_backend/helper_overlay.h
-    src/viewer_backend/rt_backend_common.h
-    src/viewer_backend/rt_device.h
+    src/viewer_backend/rt_acceleration_plan.h
+    src/viewer_backend/rt_diagnostics.h
+    src/viewer_backend/rt_render_plan.h
+    src/viewer_backend/rt_renderer.h
     src/viewer_backend/rt_object_registry.h
     src/viewer_backend/rt_rhi.h
+    src/viewer_backend/rt_rhi_device.h
     src/viewer_backend/rt_scene_builder.h
 )
 list(APPEND RTVDB_VIEWER_BACKEND_SOURCES ${RTVDB_VIEWER_BACKEND_HEADERS})
 if(WIN32 AND RTVDB_ENABLE_D3D12_DXR)
     list(APPEND RTVDB_VIEWER_BACKEND_SOURCES
         src/viewer_backend/d3d12/d3d12_dxr.cpp
+        src/viewer_backend/d3d12/d3d12_rt_shaders.cpp
+        src/viewer_backend/d3d12/d3d12_rt_shaders.h
     )
 endif()
 if(RTVDB_ENABLE_VULKAN_RT)
     list(APPEND RTVDB_VIEWER_BACKEND_SOURCES
         src/viewer_backend/vulkan/vulkan_rt.cpp
+        src/viewer_backend/vulkan/vulkan_rt_shaders.cpp
+        src/viewer_backend/vulkan/vulkan_rt_shaders.h
     )
 elseif(APPLE)
     list(APPEND RTVDB_VIEWER_BACKEND_SOURCES
-        src/viewer_backend/metal/metal_rt.mm
+        src/viewer_backend/metal/metal_rhi.mm
+        src/viewer_backend/metal/metal_rt_shaders.cpp
+        src/viewer_backend/metal/metal_rt_shaders.h
     )
 endif()
 
 add_library(rtvdb_viewer_backend ${RTVDB_VIEWER_BACKEND_SOURCES})
-if(RTVDB_VIEWER_BACKEND_SHADER_OUTPUTS AND NOT CMAKE_GENERATOR MATCHES "Visual Studio")
-    set_property(SOURCE src/viewer_backend/backend.cpp APPEND PROPERTY OBJECT_DEPENDS
-        "${RTVDB_VIEWER_BACKEND_SHADER_OUTPUTS}")
+if(NOT CMAKE_GENERATOR MATCHES "Visual Studio")
+    if(WIN32 AND RTVDB_ENABLE_D3D12_DXR)
+        set_property(SOURCE src/viewer_backend/d3d12/d3d12_rt_shaders.cpp APPEND PROPERTY OBJECT_DEPENDS
+            "${RTVDB_D3D12_RAYTRACING_HEADER}")
+    endif()
+    if(RTVDB_ENABLE_VULKAN_RT)
+        set_property(SOURCE src/viewer_backend/vulkan/vulkan_rt_shaders.cpp APPEND PROPERTY OBJECT_DEPENDS
+            "${RTVDB_VULKAN_RT_RGEN_HEADER}"
+            "${RTVDB_VULKAN_RT_PICK_RGEN_HEADER}"
+            "${RTVDB_VULKAN_RT_RMISS_HEADER}"
+            "${RTVDB_VULKAN_RT_RCHIT_HEADER}"
+            "${RTVDB_VULKAN_RT_POINT_RCHIT_HEADER}"
+            "${RTVDB_VULKAN_RT_POINT_RINT_HEADER}"
+            "${RTVDB_VULKAN_RT_LINE_RCHIT_HEADER}"
+            "${RTVDB_VULKAN_RT_LINE_RINT_HEADER}")
+    endif()
+    if(APPLE)
+        set_property(SOURCE src/viewer_backend/metal/metal_rt_shaders.cpp APPEND PROPERTY OBJECT_DEPENDS
+            "${RTVDB_METAL_RT_SHADER_METALLIB_HEADER}")
+    endif()
 endif()
 if(WIN32 AND RTVDB_ENABLE_D3D12_DXR)
     set_target_properties(rtvdb_viewer_backend PROPERTIES

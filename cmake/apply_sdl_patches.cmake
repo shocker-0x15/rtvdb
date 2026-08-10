@@ -9,6 +9,15 @@ file(GLOB RTVDB_SDL_PATCHES "${RTVDB_SDL_PATCH_DIRECTORY}/*.patch")
 list(SORT RTVDB_SDL_PATCHES)
 
 foreach(RTVDB_SDL_PATCH IN LISTS RTVDB_SDL_PATCHES)
+    get_filename_component(RTVDB_SDL_PATCH_NAME "${RTVDB_SDL_PATCH}" NAME)
+    if(RTVDB_SDL_PATCH_NAME MATCHES "-vulkan-" AND NOT RTVDB_ENABLE_VULKAN_RT)
+        continue()
+    endif()
+    if(RTVDB_SDL_PATCH_NAME MATCHES "-d3d12-" AND
+        NOT (WIN32 AND RTVDB_ENABLE_D3D12_DXR))
+        continue()
+    endif()
+
     execute_process(
         COMMAND ${RTVDB_GIT_EXECUTABLE} -C ${RTVDB_SDL_DIRECTORY}
             apply --check --reverse ${RTVDB_SDL_PATCH}

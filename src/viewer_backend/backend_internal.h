@@ -1,10 +1,8 @@
 ﻿#pragma once
 
 #include "viewer_backend/backend.h"
-#include "viewer_backend/rt_device.h"
+#include "viewer_backend/rt_renderer.h"
 #include "viewer_backend/rt_scene_builder.h"
-
-#include <memory>
 
 namespace rtvdb::viewer_backend {
 
@@ -49,21 +47,13 @@ struct backend_ops {
     bool (*accumulation_in_progress)();
     bool (*native_d3d12_texture_present_supported)();
     bool (*get_vulkan_renderer_interop)(vulkan_renderer_interop* out_interop);
-    void (*notify_shell_post_present)();
+    bool (*track_latest_native_delivery)();
+    bool (*notify_shell_post_present)(bool* out_tracked_delivery_complete);
 };
 
 bool select_rt_rhi(backend_preference preference);
 const backend_ops* rt_backend_ops();
 
-#if defined(RTVDB_ENABLE_D3D12_DXR)
-std::unique_ptr<rt_rhi_device> create_d3d12_dxr_rhi_device();
-#endif
-#if defined(RTVDB_ENABLE_VULKAN_RT)
-std::unique_ptr<rt_rhi_device> create_vulkan_rhi_device();
-#endif
-#if defined(__APPLE__)
-const backend_ops* metal_rt_backend_ops();
-#endif
 void copy_present_render_scene(frame_scene* out_scene, bool* out_has_frame);
 void copy_present_client_rt_scene_build(rt_scene_build* out_build);
 void copy_present_render_rt_scene_build(rt_scene_build* out_build);

@@ -81,7 +81,7 @@ struct frame_timing {
 struct render_callbacks {
     void (*paint)(void* user_data);
     void (*pre_present)(void* user_data);
-    void (*post_present)(void* user_data);
+    void (*post_present)(bool present_succeeded, void* user_data);
     void (*shutdown)(void* user_data);
     void (*key_down)(key_code key, bool shift_pressed, void* user_data);
     void (*mouse_move)(int x, int y, void* user_data);
@@ -107,7 +107,9 @@ bool initialize_shell(
     const shell_config &config,
     const render_callbacks &callbacks);
 bool initialize_renderer(const renderer_config &config);
+void shutdown_renderer();
 void run_shell_loop();
+void request_shutdown();
 void request_repaint();
 void set_window_title(const wchar_t* title);
 native_window_handle native_window();

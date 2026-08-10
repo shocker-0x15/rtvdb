@@ -105,6 +105,12 @@ struct line {
     bool visible = true;
 };
 
+struct scene_bounds {
+    rtvdb::vec3 min{};
+    rtvdb::vec3 max{};
+    bool valid = false;
+};
+
 struct frame_scene {
     std::uint64_t frame_serial = 0;
     std::uint64_t connection_serial = 0;
@@ -124,6 +130,7 @@ struct frame_scene {
 };
 
 struct scene_build_info {
+    std::uint64_t backend_recovery_count = 0;
     std::uint64_t revision = 0;
     std::size_t triangle_count = 0;
     std::size_t point_count = 0;
@@ -254,6 +261,8 @@ backend_info current_backend();
 const char* display_mode_name(display_mode mode);
 bool initialize_backend(const backend_config &config);
 void shutdown_backend();
+bool recover_backend();
+bool recover_backend_with_d3d12_interop(const d3d12_interop_config &d3d12);
 bool submit_scene_build(const frame_scene &scene, bool has_frame, bool allow_auto_frame = true);
 void copy_present_scene(frame_scene* out_scene, bool* out_has_frame);
 void copy_present_render_scene(frame_scene* out_scene, bool* out_has_frame);
@@ -293,7 +302,8 @@ bool pick_query_pending();
 bool accumulation_in_progress();
 bool native_d3d12_texture_present_supported();
 bool get_vulkan_renderer_interop(vulkan_renderer_interop* out_interop);
-void notify_shell_post_present();
+bool track_latest_native_delivery();
+bool notify_shell_post_present(bool* out_tracked_delivery_complete);
 bool render_frame_to_native_d3d12_texture(
     int width,
     int height,

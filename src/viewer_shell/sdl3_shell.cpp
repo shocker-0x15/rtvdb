@@ -99,6 +99,9 @@ frame_timing g_frame_timing{};
 std::chrono::steady_clock::time_point g_last_present_end{};
 
 constexpr auto kResizeSettleDelay = std::chrono::milliseconds(150);
+constexpr char kPreferenceOrganization[] = "rtvdb";
+constexpr char kPreferenceApplication[] = "viewer";
+constexpr char kImguiIniFilename[] = "imgui.ini";
 
 std::filesystem::path capture_log_path(const char* filename) {
     try {
@@ -440,7 +443,7 @@ SDL_Texture* create_shared_d3d12_frame_texture(int width, int height) {
         &heap_properties,
         D3D12_HEAP_FLAG_SHARED,
         &resource_desc,
-        D3D12_RESOURCE_STATE_COPY_DEST,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
         nullptr,
         IID_PPV_ARGS(&resource));
     device->Release();
@@ -458,6 +461,10 @@ SDL_Texture* create_shared_d3d12_frame_texture(int width, int height) {
     SDL_SetNumberProperty(properties, SDL_PROP_TEXTURE_CREATE_WIDTH_NUMBER, width);
     SDL_SetNumberProperty(properties, SDL_PROP_TEXTURE_CREATE_HEIGHT_NUMBER, height);
     SDL_SetPointerProperty(properties, SDL_PROP_TEXTURE_CREATE_D3D12_TEXTURE_POINTER, resource);
+    SDL_SetNumberProperty(
+        properties,
+        SDL_PROP_TEXTURE_CREATE_D3D12_RESOURCE_STATE_NUMBER,
+        static_cast<Sint64>(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
     SDL_Texture* texture = SDL_CreateTextureWithProperties(g_renderer, properties);
     SDL_DestroyProperties(properties);
     resource->Release();
@@ -728,9 +735,9 @@ void cache_renderer_interop() {
 #endif
 }
 
-void render_main_window() {
+bool render_main_window() {
     if (g_renderer == nullptr) {
-        return;
+        return false;
     }
 
     const auto composition_start = std::chrono::steady_clock::now();
@@ -758,7 +765,7 @@ void render_main_window() {
         g_callbacks.pre_present(g_callbacks.user_data);
     }
     const auto present_start = std::chrono::steady_clock::now();
-    SDL_RenderPresent(g_renderer);
+    const bool present_succeeded = SDL_RenderPresent(g_renderer);
     const auto present_end = std::chrono::steady_clock::now();
     g_frame_timing.composition_cpu_ms = std::chrono::duration<double, std::milli>(
         present_start - composition_start).count();
@@ -768,6 +775,7 @@ void render_main_window() {
         ? 0.0
         : std::chrono::duration<double, std::milli>(present_end - g_last_present_end).count();
     g_last_present_end = present_end;
+    return present_succeeded;
 }
 
 void shutdown_shell() {
@@ -831,6 +839,21 @@ bool initialize_shell(
         return false;
     }
 
+#if defined(__APPLE__)
+    if (g_imgui_ini_requested_path.empty()) {
+        char* preference_path = SDL_GetPrefPath(kPreferenceOrganization, kPreferenceApplication);
+        if (preference_path != nullptr) {
+            g_imgui_ini_path = std::string(preference_path) + kImguiIniFilename;
+            SDL_free(preference_path);
+        } else {
+            std::fprintf(
+                stderr,
+                "rtvdb_viewer: failed to get macOS application support path for ImGui state: %s\n",
+                SDL_GetError());
+        }
+    }
+#endif
+
     const std::string title = narrow_utf8(config.title);
     Uint64 window_flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIDDEN | SDL_WINDOW_HIGH_PIXEL_DENSITY;
     if (config.prefer_vulkan_window) {
@@ -885,6 +908,10 @@ bool initialize_renderer(const renderer_config &config) {
         if (!g_imgui_ini_requested_path.empty()) {
             g_imgui_ini_path = narrow_utf8(g_imgui_ini_requested_path.c_str());
             ImGui::GetIO().IniFilename = g_imgui_ini_path.c_str();
+        } else if (!g_imgui_ini_path.empty()) {
+            ImGui::GetIO().IniFilename = g_imgui_ini_path.c_str();
+        } else {
+            ImGui::GetIO().IniFilename = nullptr;
         }
         ImGui::StyleColorsDark();
         g_imgui_context_created = true;
@@ -902,6 +929,18 @@ bool initialize_renderer(const renderer_config &config) {
     }
     g_imgui_renderer_initialized = true;
     return true;
+}
+
+void shutdown_renderer() {
+    if (g_imgui_renderer_initialized) {
+        ImGui_ImplSDLRenderer3_Shutdown();
+        g_imgui_renderer_initialized = false;
+    }
+    if (g_imgui_sdl_initialized) {
+        ImGui_ImplSDL3_Shutdown();
+        g_imgui_sdl_initialized = false;
+    }
+    destroy_renderer();
 }
 
 void run_shell_loop() {
@@ -1004,10 +1043,13 @@ void run_shell_loop() {
                 g_callbacks.paint(g_callbacks.user_data);
             }
         }
+        if (!g_running) {
+            break;
+        }
 
-        render_main_window();
+        const bool present_succeeded = render_main_window();
         if (g_callbacks.post_present != nullptr) {
-            g_callbacks.post_present(g_callbacks.user_data);
+            g_callbacks.post_present(present_succeeded, g_callbacks.user_data);
         }
 
         if (!handled_event && !g_dirty.load(std::memory_order_relaxed)) {
@@ -1021,6 +1063,10 @@ void run_shell_loop() {
     }
 
     shutdown_shell();
+}
+
+void request_shutdown() {
+    g_running = false;
 }
 
 void request_repaint() {
@@ -1248,7 +1294,10 @@ bool acquire_d3d12_frame_target(int width, int height, void** out_texture_resour
         g_d3d12_frame_height == height) {
         SDL_PropertiesID texture_props = SDL_GetTextureProperties(g_d3d12_frame_texture);
         if (texture_props != 0) {
-            *out_texture_resource = SDL_GetPointerProperty(texture_props, SDL_PROP_TEXTURE_D3D12_TEXTURE_POINTER, nullptr);
+            *out_texture_resource = SDL_GetPointerProperty(
+                texture_props,
+                SDL_PROP_TEXTURE_D3D12_TEXTURE_POINTER,
+                nullptr);
         }
         if (*out_texture_resource != nullptr) {
             set_active_frame_texture(g_d3d12_frame_texture, frame_texture_kind::d3d12_texture, width, height);
@@ -1305,6 +1354,10 @@ bool acquire_metal_frame_target(int width, int height, void** out_pixel_buffer) 
     if (width <= 0 || height <= 0) {
         destroy_active_frame_texture();
         return true;
+    }
+
+    if (recreate_native_target_each_frame()) {
+        destroy_metal_frame_texture();
     }
 
     if (g_metal_frame_texture != nullptr &&

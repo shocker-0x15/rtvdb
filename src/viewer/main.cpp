@@ -314,12 +314,14 @@ std::thread g_render_watchdog_thread;
 std::mutex g_present_update_mutex;
 std::mutex g_capture_cache_mutex;
 std::uint64_t g_cached_render_frame_serial = 0;
+std::uint64_t g_cached_render_view_revision = 0;
 int g_cached_render_width = 0;
 int g_cached_render_height = 0;
 bool g_cached_render_valid = false;
 std::vector<std::uint8_t> g_display_pixels;
 bool g_last_display_used_native_frame = false;
 bool g_post_present_capture_display_ready = false;
+bool g_post_present_capture_delivery_tracking_required = false;
 std::vector<std::uint8_t> g_cached_render_pixels;
 std::mutex g_build_info_snapshot_mutex;
 rtvdb::viewer_backend::scene_build_info g_last_nonzero_build_info{};
@@ -339,9 +341,12 @@ std::uint64_t g_view_revision = 0;
 bool g_pending_present_update = false;
 bool g_pending_post_present_capture = false;
 bool g_pending_completed_scene_capture = false;
+bool g_post_present_accumulation_in_progress = false;
 std::chrono::steady_clock::time_point g_last_keyboard_navigation_tick{};
 std::uint64_t g_pending_capture_frame_serial = 0;
+std::uint64_t g_pending_capture_view_revision = 0;
 std::uint64_t g_last_submitted_frame_serial = 0;
+std::uint64_t g_last_submitted_view_revision = 0;
 std::uint64_t g_last_render_capture_frame_serial = 0;
 std::uint64_t g_last_window_capture_frame_serial = 0;
 std::vector<rtvdb::viewer_session::log_entry> g_recent_session_logs;
@@ -425,6 +430,16 @@ void on_capture_requested(
 void prepare_pending_client_capture();
 void process_pending_client_capture(bool has_frame);
 void complete_pending_client_capture_readback();
+void reset_post_present_capture_readiness();
+void cancel_post_present_capture();
+#if defined(RTVDB_ENABLE_VULKAN_RT) && \
+    (defined(_WIN32) || defined(__linux__) || defined(__FreeBSD__))
+bool recover_vulkan_native_renderer();
+#endif
+#if defined(_WIN32) && defined(RTVDB_ENABLE_D3D12_DXR)
+bool recover_d3d12_native_renderer();
+#endif
+bool recover_active_native_renderer();
 std::wstring join_capture_path(const std::wstring &directory, const std::wstring &filename);
 std::wstring default_manual_png_path();
 std::string wide_to_utf8_lossy(const std::wstring &text);
@@ -910,8 +925,14 @@ void complete_pending_client_capture_readback() {
     if (!rtvdb::viewer_backend::readback_current_frame_to_bgra(
             render_width,
             render_height,
-            &pixels) ||
-        pixels.empty()) {
+            &pixels)) {
+        cancel_post_present_capture();
+        (void)recover_active_native_renderer();
+        g_client_capture_readback_pending = false;
+        rtvdb::viewer_shell::request_repaint();
+        return;
+    }
+    if (pixels.empty()) {
         rtvdb::viewer_shell::request_repaint();
         return;
     }
@@ -1347,6 +1368,8 @@ void process_pending_manual_png_capture(bool has_frame)
             render_width,
             render_height,
             &pixels)) {
+        cancel_post_present_capture();
+        (void)recover_active_native_renderer();
         append_manual_png_save_log(true, g_manual_png_capture_path, "render capture failed");
         g_manual_png_capture_pending = false;
         g_manual_png_capture_path.clear();
@@ -2149,7 +2172,121 @@ rtvdb::vec3 rotate_about_axis(const rtvdb::vec3 &v, const rtvdb::vec3 &axis, flo
     return v * c + cross(unit_axis, v) * s + unit_axis * (dot(unit_axis, v) * (1.0f - c));
 }
 
-void show_scene_in_shell(
+void reset_post_present_capture_readiness() {
+    std::scoped_lock lock(g_present_update_mutex);
+    g_post_present_capture_display_ready = false;
+    g_post_present_capture_delivery_tracking_required = g_pending_post_present_capture;
+    g_last_submitted_frame_serial = 0;
+    g_last_submitted_view_revision = 0;
+}
+
+void cancel_post_present_capture() {
+    std::scoped_lock lock(g_present_update_mutex);
+    g_pending_post_present_capture = false;
+    g_post_present_capture_display_ready = false;
+    g_post_present_capture_delivery_tracking_required = false;
+    g_last_submitted_frame_serial = 0;
+    g_last_submitted_view_revision = 0;
+}
+
+#if defined(RTVDB_ENABLE_VULKAN_RT) && \
+    (defined(_WIN32) || defined(__linux__) || defined(__FreeBSD__))
+bool recover_vulkan_native_renderer() {
+    cancel_post_present_capture();
+    rtvdb::viewer_shell::reset_native_frame_target();
+    rtvdb::viewer_shell::shutdown_renderer();
+    if (!rtvdb::viewer_backend::recover_backend()) {
+        std::fputs("rtvdb_viewer: Vulkan backend recovery failed\n", stderr);
+        rtvdb::viewer_shell::request_shutdown();
+        return false;
+    }
+
+    rtvdb::viewer_backend::vulkan_renderer_interop vulkan_interop{};
+    if (!rtvdb::viewer_backend::get_vulkan_renderer_interop(&vulkan_interop)) {
+        std::fputs("rtvdb_viewer: Vulkan renderer interop recovery failed\n", stderr);
+        rtvdb::viewer_backend::shutdown_backend();
+        rtvdb::viewer_shell::request_shutdown();
+        return false;
+    }
+
+    rtvdb::viewer_shell::renderer_config renderer_config{};
+    renderer_config.preference = rtvdb::viewer_shell::renderer_preference::vulkan;
+    renderer_config.vulkan_instance = vulkan_interop.instance;
+    renderer_config.vulkan_physical_device = vulkan_interop.physical_device;
+    renderer_config.vulkan_device = vulkan_interop.device;
+    renderer_config.vulkan_graphics_queue_family_index = vulkan_interop.graphics_queue_family_index;
+    renderer_config.vulkan_present_queue_family_index = vulkan_interop.present_queue_family_index;
+    if (!rtvdb::viewer_shell::initialize_renderer(renderer_config)) {
+        std::fputs("rtvdb_viewer: Vulkan renderer recovery failed\n", stderr);
+        rtvdb::viewer_backend::shutdown_backend();
+        rtvdb::viewer_shell::request_shutdown();
+        return false;
+    }
+    rtvdb::viewer_shell::request_repaint();
+    return true;
+}
+#endif
+
+#if defined(_WIN32) && defined(RTVDB_ENABLE_D3D12_DXR)
+bool recover_d3d12_native_renderer() {
+    cancel_post_present_capture();
+    rtvdb::viewer_shell::reset_native_frame_target();
+    rtvdb::viewer_shell::shutdown_renderer();
+
+    rtvdb::viewer_shell::renderer_config renderer_config{};
+    renderer_config.preference = rtvdb::viewer_shell::renderer_preference::direct3d12;
+    if (!rtvdb::viewer_shell::initialize_renderer(renderer_config)) {
+        std::fputs("rtvdb_viewer: D3D12 renderer recovery failed\n", stderr);
+        rtvdb::viewer_backend::shutdown_backend();
+        rtvdb::viewer_shell::request_shutdown();
+        return false;
+    }
+
+    rtvdb::viewer_shell::d3d12_renderer_interop shell_d3d12{};
+    if (!rtvdb::viewer_shell::get_d3d12_renderer_interop(&shell_d3d12) ||
+        shell_d3d12.device == nullptr || shell_d3d12.command_queue == nullptr) {
+        std::fputs("rtvdb_viewer: D3D12 renderer interop recovery failed\n", stderr);
+        rtvdb::viewer_shell::shutdown_renderer();
+        rtvdb::viewer_backend::shutdown_backend();
+        rtvdb::viewer_shell::request_shutdown();
+        return false;
+    }
+
+    const rtvdb::viewer_backend::d3d12_interop_config d3d12{
+        shell_d3d12.device,
+        shell_d3d12.command_queue,
+    };
+    if (!rtvdb::viewer_backend::recover_backend_with_d3d12_interop(d3d12)) {
+        std::fputs("rtvdb_viewer: DXR backend recovery failed\n", stderr);
+        rtvdb::viewer_shell::shutdown_renderer();
+        rtvdb::viewer_backend::shutdown_backend();
+        rtvdb::viewer_shell::request_shutdown();
+        return false;
+    }
+    rtvdb::viewer_shell::request_repaint();
+    return true;
+}
+#endif
+
+bool recover_active_native_renderer() {
+    const rtvdb::viewer_backend::backend_kind kind =
+        rtvdb::viewer_backend::current_backend().kind;
+#if defined(RTVDB_ENABLE_VULKAN_RT) && \
+    (defined(_WIN32) || defined(__linux__) || defined(__FreeBSD__))
+    if (kind == rtvdb::viewer_backend::backend_kind::vulkan_rt) {
+        return recover_vulkan_native_renderer();
+    }
+#endif
+#if defined(_WIN32) && defined(RTVDB_ENABLE_D3D12_DXR)
+    if (kind == rtvdb::viewer_backend::backend_kind::d3d12_dxr) {
+        return recover_d3d12_native_renderer();
+    }
+#endif
+    (void)kind;
+    return false;
+}
+
+bool show_scene_in_shell(
     const rtvdb::viewer_backend::frame_scene &scene,
     bool has_frame,
     int* out_render_width,
@@ -2159,11 +2296,12 @@ void show_scene_in_shell(
 bool poll_completed_debug_render_capture(
     const rtvdb::viewer_backend::frame_scene &scene,
     bool has_frame);
-void capture_window_to_files(std::uint64_t frame_serial);
+void capture_window_to_files(std::uint64_t frame_serial, std::uint64_t view_revision);
 void capture_build_info_to_files(std::uint64_t frame_serial);
 void maybe_refresh_runtime_build_info_file(std::uint64_t frame_serial);
 void cache_render_capture(
     std::uint64_t frame_serial,
+    std::uint64_t view_revision,
     int render_width,
     int render_height,
     const std::vector<std::uint8_t> &pixels);
@@ -2172,7 +2310,10 @@ void write_render_capture_files(
     int render_width,
     int render_height,
     const std::vector<std::uint8_t> &pixels);
-void schedule_post_present_capture(std::uint64_t frame_serial, bool has_frame);
+void schedule_post_present_capture(
+    std::uint64_t frame_serial,
+    std::uint64_t view_revision,
+    bool has_frame);
 void process_pending_present_update();
 void process_pending_pre_present_capture();
 void update_present_timing();
@@ -3875,13 +4016,15 @@ void draw_scene_to_paint_context(void*) {
         const auto render_start = std::chrono::steady_clock::now();
         paint_timing.viewer_pre_render_ms = std::chrono::duration<double, std::milli>(
             render_start - start).count();
-        show_scene_in_shell(
+        if (!show_scene_in_shell(
             *render_input,
             has_frame,
             nullptr,
             nullptr,
             nullptr,
-            &paint_timing);
+            &paint_timing)) {
+            return;
+        }
         const auto readback_start = std::chrono::steady_clock::now();
         process_pending_manual_png_capture(has_frame);
         process_pending_client_capture(has_frame);
@@ -3895,13 +4038,19 @@ void draw_scene_to_paint_context(void*) {
         if (has_frame && accumulation_was_in_progress && !accumulation_is_in_progress) {
             g_pending_completed_scene_capture = auto_capture_enabled;
         }
-        if (has_frame && g_pending_completed_scene_capture && auto_capture_enabled) {
+        if (has_frame &&
+            !accumulation_is_in_progress &&
+            g_pending_completed_scene_capture &&
+            auto_capture_enabled) {
             paint_timing.viewer_post_render_ms += std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - viewer_post_render_start).count();
             const auto debug_readback_start = std::chrono::steady_clock::now();
             if (poll_completed_debug_render_capture(*render_input, true)) {
                 g_pending_completed_scene_capture = false;
-                schedule_post_present_capture(scene->frame_serial, true);
+                schedule_post_present_capture(
+                    render_input->frame_serial,
+                    render_input->view_revision,
+                    true);
             } else {
                 request_repaint_traced("completed_scene_capture_readback", scene->frame_serial);
             }
@@ -3909,7 +4058,12 @@ void draw_scene_to_paint_context(void*) {
                 std::chrono::steady_clock::now() - debug_readback_start).count();
             viewer_post_render_start = std::chrono::steady_clock::now();
         }
-        if (has_frame && continuous_render_enabled()) {
+        bool post_present_capture_pending = false;
+        {
+            std::scoped_lock lock(g_present_update_mutex);
+            post_present_capture_pending = g_pending_post_present_capture;
+        }
+        if (has_frame && continuous_render_enabled() && !post_present_capture_pending) {
             request_repaint_traced("continuous_render", scene->frame_serial);
         } else if (camera_animation_active) {
             request_repaint_traced("camera_animation", scene->frame_serial);
@@ -3947,7 +4101,7 @@ void draw_scene_to_paint_context(void*) {
     }
 }
 
-void show_scene_in_shell(
+bool show_scene_in_shell(
     const rtvdb::viewer_backend::frame_scene &scene,
     bool has_frame,
     int* out_render_width,
@@ -3963,7 +4117,7 @@ void show_scene_in_shell(
             out_timing->viewer_post_render_ms += std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - viewer_post_render_start).count();
         }
-        return;
+        return true;
     }
     auto native_target_setup_start = std::chrono::steady_clock::now();
     int render_width = 0;
@@ -3973,6 +4127,7 @@ void show_scene_in_shell(
     void* native_texture_resource = nullptr;
     bool native_target_ready = false;
     bool native_rendered = false;
+    bool vulkan_render_failed = false;
     const auto record_native_target_setup = [&]() {
         if (out_timing != nullptr) {
             out_timing->native_target_setup_ms += std::chrono::duration<double, std::milli>(
@@ -4008,7 +4163,13 @@ void show_scene_in_shell(
         out_timing->rt_accumulation_finalize_ms +=
             after_build_info.paint_rt_accumulation_finalize_ms;
     };
+    const bool active_vulkan_backend =
+        rtvdb::viewer_backend::current_backend().kind ==
+        rtvdb::viewer_backend::backend_kind::vulkan_rt;
     native_target_ready = rtvdb::viewer_shell::prepare_vulkan_frame_target(render_width, render_height);
+    if (active_vulkan_backend && !native_target_ready) {
+        vulkan_render_failed = true;
+    }
     if (native_target_ready) {
         record_native_target_setup();
         native_rendered = render_native([&]() {
@@ -4019,6 +4180,7 @@ void show_scene_in_shell(
                 true,
                 &native_texture_resource);
         });
+        vulkan_render_failed = !native_rendered;
         if (native_rendered) {
             const auto native_publish_start = std::chrono::steady_clock::now();
             native_rendered = rtvdb::viewer_shell::set_vulkan_frame_target(
@@ -4030,8 +4192,16 @@ void show_scene_in_shell(
                     std::chrono::steady_clock::now() - native_publish_start).count();
             }
         }
+        vulkan_render_failed = !native_rendered;
     }
-    if (!native_rendered) {
+#if defined(RTVDB_ENABLE_VULKAN_RT) && \
+    (defined(_WIN32) || defined(__linux__) || defined(__FreeBSD__))
+    if (vulkan_render_failed) {
+        (void)recover_active_native_renderer();
+        return false;
+    }
+#endif
+    if (!native_rendered && !vulkan_render_failed) {
 #if defined(__APPLE__)
         native_target_ready =
             rtvdb::viewer_shell::acquire_metal_frame_target(render_width, render_height, &native_texture_resource);
@@ -4047,7 +4217,12 @@ void show_scene_in_shell(
             });
         }
 #else
-        if (rtvdb::viewer_backend::native_d3d12_texture_present_supported()) {
+        const bool active_dxr_backend =
+            rtvdb::viewer_backend::current_backend().kind ==
+            rtvdb::viewer_backend::backend_kind::d3d12_dxr;
+        const bool d3d12_present_supported =
+            rtvdb::viewer_backend::native_d3d12_texture_present_supported();
+        if (d3d12_present_supported) {
             native_target_ready =
                 rtvdb::viewer_shell::acquire_d3d12_frame_target(render_width, render_height, &native_texture_resource);
             if (native_target_ready && native_texture_resource != nullptr) {
@@ -4062,7 +4237,19 @@ void show_scene_in_shell(
                 });
             }
         }
+        if (active_dxr_backend &&
+            (!d3d12_present_supported || !native_target_ready || !native_rendered)) {
+            cancel_post_present_capture();
+            (void)recover_active_native_renderer();
+            return false;
+        }
 #endif
+    }
+    if (native_target_ready &&
+        native_texture_resource != nullptr &&
+        !native_rendered) {
+        cancel_post_present_capture();
+        return false;
     }
     if (native_target_ready &&
         native_texture_resource != nullptr &&
@@ -4073,10 +4260,14 @@ void show_scene_in_shell(
         record_render_submit(scene.frame_serial, render_width, render_height, true);
         {
             std::scoped_lock lock(g_present_update_mutex);
-            g_last_submitted_frame_serial = scene.frame_serial;
             if (g_pending_post_present_capture) {
-                g_post_present_capture_display_ready = true;
+                g_pending_post_present_capture = false;
+                g_post_present_capture_display_ready = false;
+                g_post_present_capture_delivery_tracking_required = false;
+                g_pending_completed_scene_capture = true;
             }
+            g_last_submitted_frame_serial = scene.frame_serial;
+            g_last_submitted_view_revision = scene.view_revision;
         }
         if (out_render_width != nullptr) {
             *out_render_width = render_width;
@@ -4094,6 +4285,9 @@ void show_scene_in_shell(
                     out_pixels,
                     false)) {
                 out_pixels->clear();
+                cancel_post_present_capture();
+                (void)recover_active_native_renderer();
+                return false;
             }
         }
         if (rtvdb::viewer_backend::accumulation_in_progress()) {
@@ -4103,7 +4297,7 @@ void show_scene_in_shell(
             out_timing->viewer_post_render_ms += std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - viewer_post_render_start).count();
         }
-        return;
+        return true;
     }
     if (out_timing != nullptr && !native_target_ready) {
         record_native_target_setup();
@@ -4114,6 +4308,7 @@ void show_scene_in_shell(
         out_timing->viewer_post_render_ms += std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - viewer_post_render_start).count();
     }
+    return true;
 }
 
 void on_shell_shutdown(void*) {
@@ -4138,23 +4333,34 @@ bool poll_completed_debug_render_capture(
     if (!rtvdb::viewer_backend::readback_current_frame_to_bgra(
             render_width,
             render_height,
-            &pixels) ||
-        pixels.empty()) {
+            &pixels)) {
+        cancel_post_present_capture();
+        (void)recover_active_native_renderer();
+        return false;
+    }
+    if (pixels.empty()) {
         return false;
     }
 
-    cache_render_capture(scene.frame_serial, render_width, render_height, pixels);
+    cache_render_capture(
+        scene.frame_serial,
+        scene.view_revision,
+        render_width,
+        render_height,
+        pixels);
     return true;
 }
 
 void cache_render_capture(
     std::uint64_t frame_serial,
+    std::uint64_t view_revision,
     int render_width,
     int render_height,
     const std::vector<std::uint8_t> &pixels)
 {
     std::scoped_lock lock(g_capture_cache_mutex);
     g_cached_render_frame_serial = frame_serial;
+    g_cached_render_view_revision = view_revision;
     g_cached_render_width = render_width;
     g_cached_render_height = render_height;
     g_cached_render_pixels = pixels;
@@ -4193,13 +4399,18 @@ void write_render_capture_files(
     }
 }
 
-void ensure_render_capture_files_for_frame(std::uint64_t frame_serial) {
+void ensure_render_capture_files_for_frame(
+    std::uint64_t frame_serial,
+    std::uint64_t view_revision)
+{
     std::vector<std::uint8_t> cached_pixels;
     int cached_width = 0;
     int cached_height = 0;
     {
         std::scoped_lock lock(g_capture_cache_mutex);
-        if (g_cached_render_valid && g_cached_render_frame_serial == frame_serial) {
+        if (g_cached_render_valid &&
+            g_cached_render_frame_serial == frame_serial &&
+            g_cached_render_view_revision == view_revision) {
             cached_width = g_cached_render_width;
             cached_height = g_cached_render_height;
             cached_pixels = g_cached_render_pixels;
@@ -4212,7 +4423,7 @@ void ensure_render_capture_files_for_frame(std::uint64_t frame_serial) {
 
 }
 
-void capture_window_to_files(std::uint64_t frame_serial) {
+void capture_window_to_files(std::uint64_t frame_serial, std::uint64_t view_revision) {
     const std::wstring base_dir = capture_directory();
 
     int shell_width = 0;
@@ -4292,7 +4503,9 @@ void capture_window_to_files(std::uint64_t frame_serial) {
     int render_height = 0;
     {
         std::scoped_lock lock(g_capture_cache_mutex);
-        if (g_cached_render_valid && g_cached_render_frame_serial == frame_serial) {
+        if (g_cached_render_valid &&
+            g_cached_render_frame_serial == frame_serial &&
+            g_cached_render_view_revision == view_revision) {
             render_width = g_cached_render_width;
             render_height = g_cached_render_height;
             render_pixels = g_cached_render_pixels;
@@ -4430,7 +4643,8 @@ void capture_build_info_to_files(std::uint64_t frame_serial) {
         const int length = std::snprintf(
             buffer,
             sizeof(buffer),
-            "backend_name=%s\nrevision=%llu\ntriangle_count=%llu\npoint_count=%llu\nline_count=%llu\n"
+            "backend_name=%s\nbackend_recovery_count=%llu\nrevision=%llu\n"
+            "triangle_count=%llu\npoint_count=%llu\nline_count=%llu\n"
             "triangle_chunk_count=%llu\nreused_triangle_chunk_count=%llu\nrebuilt_triangle_chunk_count=%llu\n"
             "point_chunk_count=%llu\nline_chunk_count=%llu\n"
             "triangle_blas_group_count=%llu\npoint_blas_group_count=%llu\nline_blas_group_count=%llu\n"
@@ -4477,6 +4691,7 @@ void capture_build_info_to_files(std::uint64_t frame_serial) {
             "last_render_frame_serial=%llu\nlast_repaint_frame_serial=%llu\n"
             "last_render_width=%d\nlast_render_height=%d\nlast_render_used_native=%u\n",
             backend.name != nullptr ? backend.name : "unknown",
+            static_cast<unsigned long long>(build_info.backend_recovery_count),
             static_cast<unsigned long long>(build_info.revision),
             static_cast<unsigned long long>(build_info.triangle_count),
             static_cast<unsigned long long>(build_info.point_count),
@@ -4647,47 +4862,55 @@ void process_pending_present_update() {
     }
 }
 
-void schedule_post_present_capture(std::uint64_t frame_serial, bool has_frame) {
+void schedule_post_present_capture(
+    std::uint64_t frame_serial,
+    std::uint64_t view_revision,
+    bool has_frame)
+{
     std::scoped_lock lock(g_present_update_mutex);
     g_pending_post_present_capture = has_frame;
     g_pending_capture_frame_serial = frame_serial;
-    g_post_present_capture_display_ready =
-        has_frame && frame_serial != 0 && frame_serial == g_last_submitted_frame_serial;
-    if (has_frame) {
-        rtvdb::viewer_shell::request_repaint();
-    }
+    g_pending_capture_view_revision = view_revision;
+    g_post_present_capture_display_ready = false;
+    g_post_present_capture_delivery_tracking_required = has_frame;
 }
 void process_pending_pre_present_capture() {
     try {
         std::uint64_t frame_serial = 0;
+        std::uint64_t view_revision = 0;
         bool should_capture = false;
         bool display_ready = false;
         {
             std::scoped_lock lock(g_present_update_mutex);
             should_capture = g_pending_post_present_capture;
             frame_serial = g_pending_capture_frame_serial;
+            view_revision = g_pending_capture_view_revision;
             display_ready = g_post_present_capture_display_ready;
             if (display_ready) {
                 g_pending_post_present_capture = false;
                 g_post_present_capture_display_ready = false;
+                g_post_present_capture_delivery_tracking_required = false;
             }
         }
         if (!should_capture) {
             return;
         }
         if (!display_ready) {
-            request_repaint_traced("pre_present_capture_wait", frame_serial);
             return;
         }
-        ensure_render_capture_files_for_frame(frame_serial);
+        ensure_render_capture_files_for_frame(frame_serial, view_revision);
         if (rtvdb::viewer_shell::native_window().kind != rtvdb::viewer_shell::native_window_kind::none) {
-            capture_window_to_files(frame_serial);
+            capture_window_to_files(frame_serial, view_revision);
         }
         capture_build_info_to_files(frame_serial);
+        if (continuous_render_enabled()) {
+            request_repaint_traced("post_present_capture_complete", frame_serial);
+        }
     } catch (const std::exception &exception) {
         std::scoped_lock lock(g_present_update_mutex);
         g_pending_post_present_capture = false;
         g_post_present_capture_display_ready = false;
+        g_post_present_capture_delivery_tracking_required = false;
 #if defined(_WIN32)
         append_runtime_exception_line("process_pending_pre_present_capture", exception.what());
 #endif
@@ -4695,6 +4918,7 @@ void process_pending_pre_present_capture() {
         std::scoped_lock lock(g_present_update_mutex);
         g_pending_post_present_capture = false;
         g_post_present_capture_display_ready = false;
+        g_post_present_capture_delivery_tracking_required = false;
 #if defined(_WIN32)
         append_runtime_exception_line("process_pending_pre_present_capture", "unknown");
 #endif
@@ -4702,9 +4926,15 @@ void process_pending_pre_present_capture() {
 }
 
 void update_present_timing() {
-    if (rtvdb::viewer_backend::accumulation_in_progress()) {
+    const bool accumulation_in_progress = rtvdb::viewer_backend::accumulation_in_progress();
+    if (accumulation_in_progress) {
         request_repaint_traced("update_present_timing", 0);
+    } else if (g_post_present_accumulation_in_progress &&
+        auto_capture_on_accumulation_complete_enabled()) {
+        g_pending_completed_scene_capture = true;
+        request_repaint_traced("accumulation_completed", 0);
     }
+    g_post_present_accumulation_in_progress = accumulation_in_progress;
 }
 void request_present_refresh() {
     std::shared_ptr<const rtvdb::viewer_backend::frame_scene> scene;
@@ -5963,29 +6193,58 @@ int viewer_main(rtvdb::viewer_shell::platform_app_instance instance, int show_co
         return 0;
     }
 #endif
+#if defined(__APPLE__)
+    const std::wstring imgui_ini_path;
+#else
     const std::wstring imgui_ini_path = (viewer_executable_directory() / L"imgui.ini").wstring();
+#endif
     const rtvdb::viewer_shell::shell_config config{
         kViewerWindowTitle,
         kDefaultCaptureWidth,
         kDefaultCaptureHeight,
         launch_config.recreate_native_target_each_frame,
         launch_config.backend == rtvdb::viewer_backend::backend_preference::vulkan_rt,
-        imgui_ini_path.c_str(),
+        imgui_ini_path.empty() ? nullptr : imgui_ini_path.c_str(),
     };
     const rtvdb::viewer_shell::render_callbacks shell_callbacks{
         draw_scene_to_paint_context,
         [](void*) { process_pending_pre_present_capture(); },
-        [](void*) {
+        [](bool present_succeeded, void*) {
             record_post_present();
+            bool track_latest_delivery = false;
+            {
+                std::scoped_lock lock(g_present_update_mutex);
+                track_latest_delivery = g_pending_post_present_capture &&
+                    g_post_present_capture_delivery_tracking_required;
+            }
+            const bool tracking_succeeded =
+                !track_latest_delivery || rtvdb::viewer_backend::track_latest_native_delivery();
+            if (tracking_succeeded && track_latest_delivery) {
+                std::scoped_lock lock(g_present_update_mutex);
+                g_post_present_capture_delivery_tracking_required = false;
+            }
+            bool tracked_delivery_complete = false;
+            const bool backend_succeeded = tracking_succeeded &&
+                rtvdb::viewer_backend::notify_shell_post_present(&tracked_delivery_complete);
+            if (!present_succeeded || !backend_succeeded) {
+                if (backend_succeeded) {
+                    reset_post_present_capture_readiness();
+                } else {
+                    cancel_post_present_capture();
+                }
+                (void)recover_active_native_renderer();
+                return;
+            }
             {
                 std::scoped_lock lock(g_present_update_mutex);
                 if (g_pending_post_present_capture &&
+                    tracked_delivery_complete &&
                     g_pending_capture_frame_serial != 0 &&
-                    g_pending_capture_frame_serial == g_last_submitted_frame_serial) {
+                    g_pending_capture_frame_serial == g_last_submitted_frame_serial &&
+                    g_pending_capture_view_revision == g_last_submitted_view_revision) {
                     g_post_present_capture_display_ready = true;
                 }
             }
-            rtvdb::viewer_backend::notify_shell_post_present();
             update_present_timing();
             if (update_keyboard_camera()) {
                 request_camera_repaint();

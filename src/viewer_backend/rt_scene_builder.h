@@ -1,6 +1,7 @@
 ﻿#pragma once
 
 #include "viewer_backend/backend.h"
+#include "viewer_backend/rt_rhi.h"
 
 #include <array>
 #include <cstddef>
@@ -9,13 +10,7 @@
 
 namespace rtvdb::viewer_backend {
 
-constexpr std::size_t kRtBlasChunkSetChunkCount = 4;
-
-struct scene_bounds {
-    rtvdb::vec3 min{};
-    rtvdb::vec3 max{};
-    bool valid = false;
-};
+constexpr std::size_t kRtBlasChunkSetChunkCount = kRtMaxBlasGeometryCount;
 
 struct rt_scene_vertex {
     rtvdb::vec3 position{};

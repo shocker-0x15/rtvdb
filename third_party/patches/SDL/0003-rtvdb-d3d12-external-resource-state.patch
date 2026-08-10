@@ -1,0 +1,64 @@
+From: rtvdb maintainers
+Subject: [rtvdb] Allow a D3D12 external texture state override
+
+rtvdb publishes its RT output into a D3D12 resource before SDL samples that
+same external texture. Let the creator declare the resource state that SDL
+should track, while preserving COPY_DEST as the default for existing callers
+and for textures allocated by SDL.
+
+Upstream baseline: SDL release-3.4.12, commit
+f87239e71e42da91ca317a12eefb82cfbf3393eb.
+
+---
+ include/SDL3/SDL_render.h                  | 4 ++++
+ src/render/direct3d12/SDL_render_d3d12.c | 8 +++++++-
+ 2 files changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/include/SDL3/SDL_render.h b/include/SDL3/SDL_render.h
+index 986130ce4..2627c6147 100644
+--- a/include/SDL3/SDL_render.h
++++ b/include/SDL3/SDL_render.h
+@@ -729,6 +729,9 @@ extern SDL_DECLSPEC SDL_Texture * SDLCALL SDL_CreateTextureFromSurface(SDL_Rende
+  * - `SDL_PROP_TEXTURE_CREATE_D3D12_TEXTURE_V_POINTER`: the ID3D12Resource
+  *   associated with the V plane of a YUV texture, if you want to wrap an
+  *   existing texture.
++ * - `SDL_PROP_TEXTURE_CREATE_D3D12_RESOURCE_STATE_NUMBER`: the
++ *   D3D12_RESOURCE_STATES value of the wrapped main texture. This defaults to
++ *   D3D12_RESOURCE_STATE_COPY_DEST.
+  *
+  * With the metal renderer:
+  *
+@@ -817,6 +820,7 @@ extern SDL_DECLSPEC SDL_Texture * SDLCALL SDL_CreateTextureWithProperties(SDL_Re
+ #define SDL_PROP_TEXTURE_CREATE_D3D12_TEXTURE_POINTER           "SDL.texture.create.d3d12.texture"
+ #define SDL_PROP_TEXTURE_CREATE_D3D12_TEXTURE_U_POINTER         "SDL.texture.create.d3d12.texture_u"
+ #define SDL_PROP_TEXTURE_CREATE_D3D12_TEXTURE_V_POINTER         "SDL.texture.create.d3d12.texture_v"
++#define SDL_PROP_TEXTURE_CREATE_D3D12_RESOURCE_STATE_NUMBER     "SDL.texture.create.d3d12.resource_state"
+ #define SDL_PROP_TEXTURE_CREATE_METAL_PIXELBUFFER_POINTER       "SDL.texture.create.metal.pixelbuffer"
+ #define SDL_PROP_TEXTURE_CREATE_OPENGL_TEXTURE_NUMBER           "SDL.texture.create.opengl.texture"
+ #define SDL_PROP_TEXTURE_CREATE_OPENGL_TEXTURE_UV_NUMBER        "SDL.texture.create.opengl.texture_uv"
+diff --git a/src/render/direct3d12/SDL_render_d3d12.c b/src/render/direct3d12/SDL_render_d3d12.c
+index d743804b0..548afcee4 100644
+--- a/src/render/direct3d12/SDL_render_d3d12.c
++++ b/src/render/direct3d12/SDL_render_d3d12.c
+@@ -1700,6 +1700,7 @@ static bool D3D12_CreateTexture(SDL_Renderer *renderer, SDL_Texture *texture, SD
+     if (!GetTextureProperty(create_props, SDL_PROP_TEXTURE_CREATE_D3D12_TEXTURE_POINTER, &textureData->mainTexture)) {
+         return false;
+     }
++    const bool hasExternalMainTexture = textureData->mainTexture != NULL;
+     if (!textureData->mainTexture) {
+         result = ID3D12Device1_CreateCommittedResource(rendererData->d3dDevice,
+                           &heapProps,
+@@ -1713,7 +1714,12 @@ static bool D3D12_CreateTexture(SDL_Renderer *renderer, SDL_Texture *texture, SD
+             return WIN_SetErrorFromHRESULT("ID3D12Device::CreateCommittedResource [texture]", result);
+         }
+     }
+-    textureData->mainResourceState = D3D12_RESOURCE_STATE_COPY_DEST;
++    textureData->mainResourceState = hasExternalMainTexture
++        ? (D3D12_RESOURCE_STATES)SDL_GetNumberProperty(
++            create_props,
++            SDL_PROP_TEXTURE_CREATE_D3D12_RESOURCE_STATE_NUMBER,
++            D3D12_RESOURCE_STATE_COPY_DEST)
++        : D3D12_RESOURCE_STATE_COPY_DEST;
+     SDL_SetPointerProperty(SDL_GetTextureProperties(texture), SDL_PROP_TEXTURE_D3D12_TEXTURE_POINTER, textureData->mainTexture);
+
+ #ifdef SDL_HAVE_YUV

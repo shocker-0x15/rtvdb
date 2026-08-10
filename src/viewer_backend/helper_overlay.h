@@ -1,6 +1,6 @@
 #pragma once
 
-#include "viewer_backend/rt_scene_builder.h"
+#include "viewer_backend/backend.h"
 
 namespace rtvdb::viewer_backend {
 

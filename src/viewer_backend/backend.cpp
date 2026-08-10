@@ -1,5 +1,6 @@
 ﻿#include "viewer_backend/backend_internal.h"
 #include "viewer_backend/helper_overlay.h"
+#include "viewer_backend/rt_diagnostics.h"
 #include "viewer_backend/rt_scene_builder.h"
 #include "viewer_capture/png.h"
 
@@ -50,6 +51,7 @@ struct backend_state {
     display_mode display = display_mode::client_color;
     hover_highlight highlight{};
     bool recovery_in_progress = false;
+    std::uint64_t recovery_count = 0;
 } g_backend;
 
 struct scene_build_cancel_context {
@@ -91,18 +93,18 @@ const backend_ops* select_backend_ops(backend_preference preference) {
         return select_rt_rhi(preference) ? rt_backend_ops() : nullptr;
     case backend_preference::metal_rt:
 #if defined(__APPLE__)
-        return metal_rt_backend_ops();
+        return select_rt_rhi(preference) ? rt_backend_ops() : nullptr;
 #else
         return nullptr;
 #endif
     case backend_preference::automatic:
     default:
-#if defined(__APPLE__)
-        return metal_rt_backend_ops();
-#else
         return select_rt_rhi(backend_preference::automatic) ? rt_backend_ops() : nullptr;
-#endif
     }
+}
+
+bool backend_uses_shell_coordinated_recovery(backend_kind kind) {
+    return kind == backend_kind::d3d12_dxr || kind == backend_kind::vulkan_rt;
 }
 
 const backend_ops* select_backend_ops() {
@@ -358,8 +360,11 @@ void backend_worker() {
     }
 }
 
-bool try_recover_backend(const frame_scene &scene, bool has_frame) {
+bool try_recover_backend(const d3d12_interop_config* replacement_d3d12 = nullptr) {
     backend_config config{};
+    frame_scene recovery_scene{};
+    bool recovery_has_frame = false;
+    bool recovery_allow_auto_frame = false;
     bool auto_frame = true;
     bool helper_overlay = true;
     helper_plane helper_overlay_plane = helper_plane::xy;
@@ -367,36 +372,65 @@ bool try_recover_backend(const frame_scene &scene, bool has_frame) {
     hover_highlight highlight{};
     {
         std::scoped_lock lock(g_backend.mutex);
-        if (g_backend.recovery_in_progress) {
+        if (!g_backend.initialized || g_backend.ops == nullptr || g_backend.recovery_in_progress ||
+            (replacement_d3d12 != nullptr &&
+             g_backend.ops->info().kind != backend_kind::d3d12_dxr)) {
             return false;
         }
         g_backend.recovery_in_progress = true;
         config = g_backend.config;
+        if (replacement_d3d12 != nullptr) {
+            config.d3d12 = *replacement_d3d12;
+        }
         auto_frame = g_backend.auto_frame;
         helper_overlay = g_backend.helper_overlay;
         helper_overlay_plane = g_backend.helper_overlay_plane;
         display = g_backend.display;
         highlight = g_backend.highlight;
+        if (g_backend.pending_revision != 0) {
+            recovery_scene = g_backend.pending_client_scene;
+            recovery_has_frame = g_backend.pending_has_frame;
+            recovery_allow_auto_frame = g_backend.pending_allow_auto_frame;
+        } else {
+            recovery_scene = g_backend.present_client_scene;
+            recovery_has_frame = g_backend.present_client_has_frame;
+        }
     }
 
+    append_rt_diagnostics_log_line("backend_recovery.log", "RT backend recovery begin");
     shutdown_backend();
     const bool initialized = initialize_backend(config);
+    bool scene_queued = initialized;
     if (initialized) {
         set_auto_frame_enabled(auto_frame);
         set_helper_overlay_enabled(helper_overlay);
         set_helper_overlay_plane(helper_overlay_plane);
         set_display_mode(display);
         set_hover_highlight(highlight);
-        if (has_frame) {
-            submit_scene_build(scene, true);
+        if (recovery_has_frame) {
+            scene_queued = submit_scene_build(
+                recovery_scene,
+                true,
+                recovery_allow_auto_frame);
+        }
+        if (!scene_queued) {
+            shutdown_backend();
         }
     }
 
+    const bool recovered = initialized && scene_queued;
+
     {
         std::scoped_lock lock(g_backend.mutex);
+        if (recovered) {
+            ++g_backend.recovery_count;
+        }
         g_backend.recovery_in_progress = false;
     }
-    return initialized;
+    append_rt_diagnostics_log_line(
+        "backend_recovery.log",
+        recovered ? "RT backend recovery succeeded" : "RT backend recovery failed");
+    return recovered;
 }
 
 } // namespace
@@ -479,6 +513,9 @@ bool initialize_backend(const backend_config &config) {
         return true;
     }
 
+    if (!g_backend.recovery_in_progress) {
+        g_backend.recovery_count = 0;
+    }
     g_backend.ops = select_backend_ops(config.preferred_backend);
     g_backend.config = config;
     if (g_backend.ops == nullptr || !g_backend.ops->initialize(config)) {
@@ -536,6 +573,23 @@ void shutdown_backend() {
     g_backend.helper_overlay_plane = helper_plane::xy;
     g_backend.display = display_mode::triangle_normal;
     g_backend.highlight = {};
+}
+
+bool recover_backend() {
+    {
+        std::scoped_lock lock(g_backend.mutex);
+        if (!g_backend.initialized || g_backend.ops == nullptr) {
+            return false;
+        }
+    }
+    return try_recover_backend();
+}
+
+bool recover_backend_with_d3d12_interop(const d3d12_interop_config &d3d12) {
+    if (d3d12.device == nullptr || d3d12.command_queue == nullptr) {
+        return false;
+    }
+    return try_recover_backend(&d3d12);
 }
 
 bool submit_scene_build(const frame_scene &scene, bool has_frame, bool allow_auto_frame) {
@@ -641,8 +695,10 @@ void copy_present_build_info(scene_build_info* out_info) {
     }
 
     void (*fill_build_info)(scene_build_info*) = nullptr;
+    std::uint64_t recovery_count = 0;
     {
         std::scoped_lock lock(g_backend.mutex);
+        recovery_count = g_backend.recovery_count;
         out_info->revision = g_backend.present_client_rt_build.revision;
         out_info->triangle_count = g_backend.present_client_rt_build.triangle_count;
         out_info->point_count = g_backend.present_client_rt_build.point_count;
@@ -665,6 +721,7 @@ void copy_present_build_info(scene_build_info* out_info) {
     if (fill_build_info != nullptr) {
         fill_build_info(out_info);
     }
+    out_info->backend_recovery_count = recovery_count;
 }
 
 bool copy_present_client_scene_bounds(rtvdb::vec3* out_min, rtvdb::vec3* out_max) {
@@ -860,11 +917,28 @@ bool get_vulkan_renderer_interop(vulkan_renderer_interop* out_interop) {
     return g_backend.ops->get_vulkan_renderer_interop(out_interop);
 }
 
-void notify_shell_post_present() {
-    if (!g_backend.initialized || g_backend.ops == nullptr || g_backend.ops->notify_shell_post_present == nullptr) {
-        return;
+bool track_latest_native_delivery() {
+    return g_backend.initialized &&
+        g_backend.ops != nullptr &&
+        g_backend.ops->track_latest_native_delivery != nullptr &&
+        g_backend.ops->track_latest_native_delivery();
+}
+
+bool notify_shell_post_present(bool* out_tracked_delivery_complete) {
+    if (out_tracked_delivery_complete != nullptr) {
+        *out_tracked_delivery_complete = false;
     }
-    g_backend.ops->notify_shell_post_present();
+    if (!g_backend.initialized || g_backend.ops == nullptr ||
+        g_backend.ops->notify_shell_post_present == nullptr || out_tracked_delivery_complete == nullptr) {
+        return false;
+    }
+    if (g_backend.ops->notify_shell_post_present(out_tracked_delivery_complete)) {
+        return true;
+    }
+    if (!backend_uses_shell_coordinated_recovery(g_backend.ops->info().kind)) {
+        (void)try_recover_backend();
+    }
+    return false;
 }
 
 bool render_frame_to_native_d3d12_texture(
@@ -875,19 +949,18 @@ bool render_frame_to_native_d3d12_texture(
     void* texture_resource)
 {
     const rt_render_request request{width, height, &scene, has_frame};
-    if (!g_backend.initialized || g_backend.ops == nullptr || g_backend.ops->render_to_native_d3d12_texture == nullptr) {
+    if (!g_backend.initialized ||
+        g_backend.ops == nullptr ||
+        g_backend.ops->render_to_native_d3d12_texture == nullptr) {
         return false;
     }
     if (g_backend.ops->render_to_native_d3d12_texture(request, texture_resource)) {
         return true;
     }
-    if (!try_recover_backend(scene, has_frame)) {
-        return false;
+    if (!backend_uses_shell_coordinated_recovery(g_backend.ops->info().kind)) {
+        (void)try_recover_backend();
     }
-    if (!g_backend.initialized || g_backend.ops == nullptr || g_backend.ops->render_to_native_d3d12_texture == nullptr) {
-        return false;
-    }
-    return g_backend.ops->render_to_native_d3d12_texture(request, texture_resource);
+    return false;
 }
 
 bool render_frame_to_native_metal_texture(
@@ -898,10 +971,18 @@ bool render_frame_to_native_metal_texture(
     void* pixel_buffer)
 {
     const rt_render_request request{width, height, &scene, has_frame};
-    if (!g_backend.initialized || g_backend.ops == nullptr || g_backend.ops->render_to_native_metal_texture == nullptr) {
+    if (!g_backend.initialized ||
+        g_backend.ops == nullptr ||
+        g_backend.ops->render_to_native_metal_texture == nullptr) {
         return false;
     }
-    return g_backend.ops->render_to_native_metal_texture(request, pixel_buffer);
+    if (g_backend.ops->render_to_native_metal_texture(request, pixel_buffer)) {
+        return true;
+    }
+    if (!backend_uses_shell_coordinated_recovery(g_backend.ops->info().kind)) {
+        (void)try_recover_backend();
+    }
+    return false;
 }
 
 bool render_frame_to_native_vulkan_texture(
@@ -936,13 +1017,10 @@ bool capture_frame_to_bgra(
     if (g_backend.ops->capture_to_bgra(request, out_pixels, update_build_info)) {
         return true;
     }
-    if (!try_recover_backend(scene, has_frame)) {
-        return false;
+    if (!backend_uses_shell_coordinated_recovery(g_backend.ops->info().kind)) {
+        (void)try_recover_backend();
     }
-    if (!g_backend.initialized || g_backend.ops == nullptr || g_backend.ops->capture_to_bgra == nullptr) {
-        return false;
-    }
-    return g_backend.ops->capture_to_bgra(request, out_pixels, update_build_info);
+    return false;
 }
 
 bool readback_current_frame_to_bgra(
@@ -954,23 +1032,28 @@ bool readback_current_frame_to_bgra(
         g_backend.ops->readback_current_frame_to_bgra == nullptr) {
         return false;
     }
-    return g_backend.ops->readback_current_frame_to_bgra(width, height, out_pixels);
+    if (g_backend.ops->readback_current_frame_to_bgra(width, height, out_pixels)) {
+        return true;
+    }
+    if (!backend_uses_shell_coordinated_recovery(g_backend.ops->info().kind)) {
+        (void)try_recover_backend();
+    }
+    return false;
 }
 
 bool capture_frame_to_png(const wchar_t* path, int width, int height, const frame_scene &scene, bool has_frame) {
-    if (!g_backend.initialized || g_backend.ops == nullptr || path == nullptr) {
+    if (!g_backend.initialized || g_backend.ops == nullptr ||
+        g_backend.ops->capture_to_png == nullptr || path == nullptr) {
         return false;
     }
-    const backend_kind kind = g_backend.ops->info().kind;
-    if (kind == backend_kind::d3d12_dxr || kind == backend_kind::vulkan_rt) {
-        std::vector<std::uint8_t> pixels;
-        if (!capture_frame_to_bgra(width, height, scene, has_frame, &pixels, false)) {
-            return false;
-        }
-        return viewer_capture::write_png_bgra8(path, pixels.data(), width, height, width * 4);
-    }
     const rt_render_request request{width, height, &scene, has_frame};
-    return g_backend.ops->capture_to_png != nullptr && g_backend.ops->capture_to_png(path, request);
+    if (g_backend.ops->capture_to_png(path, request)) {
+        return true;
+    }
+    if (!backend_uses_shell_coordinated_recovery(g_backend.ops->info().kind)) {
+        (void)try_recover_backend();
+    }
+    return false;
 }
 
 } // namespace rtvdb::viewer_backend

@@ -6,9 +6,22 @@
 
 namespace rtvdb::viewer_backend {
 
+constexpr std::size_t kRtMaxBlasGeometryCount = 4;
+constexpr std::uint32_t kRtCommandSlotCount = 3;
+constexpr std::uint32_t kRtTimestampQueryCountPerRegion = 2;
+constexpr std::uint32_t kRtTimestampQueryRegionCount = 2;
+constexpr std::uint32_t kRtTimestampQueryCountPerCommandSlot =
+    kRtTimestampQueryCountPerRegion * kRtTimestampQueryRegionCount;
+
+enum class rt_timestamp_query_region : std::uint32_t {
+    acceleration = 0,
+    dispatch = kRtTimestampQueryCountPerRegion,
+};
+
 enum class rt_rhi_backend_kind : std::uint8_t {
     d3d12_dxr,
-    vulkan_rt
+    vulkan_rt,
+    metal_rt,
 };
 
 struct rt_rhi_device_info {
@@ -43,7 +56,6 @@ using rt_blas_handle = rt_typed_handle<struct rt_blas_handle_tag>;
 using rt_tlas_handle = rt_typed_handle<struct rt_tlas_handle_tag>;
 using rt_shader_module_handle = rt_typed_handle<struct rt_shader_module_handle_tag>;
 using rt_pipeline_handle = rt_typed_handle<struct rt_pipeline_handle_tag>;
-using rt_shader_table_handle = rt_typed_handle<struct rt_shader_table_handle_tag>;
 using rt_timestamp_query_handle = rt_typed_handle<struct rt_timestamp_query_handle_tag>;
 
 struct rt_submission_token {
@@ -119,10 +131,15 @@ struct rt_rhi_diagnostics {
     std::size_t scene_buffer_peak_capacity_bytes = 0;
 };
 
+enum class rt_logical_dispatch_entry : std::uint8_t {
+    render,
+    pick,
+    count,
+};
+
 struct rt_trace_rays_desc {
     rt_pipeline_handle pipeline{};
-    rt_shader_table_handle shader_table{};
-    std::uint32_t ray_generation_record = 0;
+    rt_logical_dispatch_entry entry = rt_logical_dispatch_entry::render;
     std::uint32_t width = 0;
     std::uint32_t height = 0;
     std::uint32_t depth = 1;
@@ -227,6 +244,7 @@ struct rt_binding_layout_desc {
 };
 
 enum class rt_shader_stage : std::uint8_t {
+    compute,
     ray_generation,
     miss,
     closest_hit,
@@ -238,12 +256,39 @@ enum class rt_shader_stage : std::uint8_t {
 enum class rt_shader_binary_format : std::uint8_t {
     dxil_library,
     spirv,
+    metallib,
+};
+
+enum class rt_pipeline_model : std::uint8_t {
+    native_ray_tracing,
+    compute_intersector,
+};
+
+enum class rt_logical_shader_entry : std::uint8_t {
+    render,
+    pick,
+    miss,
+    triangle_closest_hit,
+    point_closest_hit,
+    point_intersection,
+    line_closest_hit,
+    line_intersection,
+    count,
 };
 
 struct rt_shader_module_desc {
     rt_shader_binary_format format = rt_shader_binary_format::spirv;
     const void* data = nullptr;
     std::size_t size = 0;
+};
+
+struct rt_shader_package_desc {
+    rt_pipeline_model pipeline_model = rt_pipeline_model::native_ray_tracing;
+    const rt_shader_module_desc* modules = nullptr;
+    std::size_t module_count = 0;
+    const std::uint32_t* entry_module_indices = nullptr;
+    const rt_logical_shader_entry* logical_entries = nullptr;
+    std::size_t entry_count = 0;
 };
 
 struct rt_shader_entry_desc {
@@ -269,29 +314,24 @@ struct rt_shader_group_desc {
     std::uint32_t intersection_shader = kRtUnusedShaderIndex;
 };
 
+struct rt_pipeline_dispatch_entry_desc {
+    rt_logical_dispatch_entry logical_entry = rt_logical_dispatch_entry::render;
+    std::uint32_t shader_or_group_index = kRtUnusedShaderIndex;
+};
+
 struct rt_pipeline_desc {
+    rt_pipeline_model model = rt_pipeline_model::native_ray_tracing;
     const rt_binding_layout_desc* bindings = nullptr;
     std::size_t binding_count = 0;
     const rt_shader_entry_desc* shaders = nullptr;
     std::size_t shader_count = 0;
     const rt_shader_group_desc* groups = nullptr;
     std::size_t group_count = 0;
+    const rt_pipeline_dispatch_entry_desc* dispatch_entries = nullptr;
+    std::size_t dispatch_entry_count = 0;
     std::uint32_t max_recursion_depth = 1;
     std::uint32_t max_payload_size = 0;
     std::uint32_t max_attribute_size = 0;
-};
-
-struct rt_shader_table_section_desc {
-    const std::uint32_t* groups = nullptr;
-    std::size_t group_count = 0;
-};
-
-struct rt_shader_table_desc {
-    rt_pipeline_handle pipeline{};
-    rt_shader_table_section_desc ray_generation{};
-    rt_shader_table_section_desc miss{};
-    rt_shader_table_section_desc hit{};
-    rt_shader_table_section_desc callable{};
 };
 
 enum class rt_resource_usage : std::uint8_t {
@@ -400,5 +440,23 @@ struct rt_tlas_build_desc {
     std::size_t instance_count = 0;
     std::uint32_t flags = rt_acceleration_build_prefer_fast_trace;
 };
+
+struct rt_blas_geometry_counts {
+    std::size_t actual = 0;
+    std::size_t allocation = 0;
+};
+
+bool get_rt_blas_geometry_counts(
+    const rt_blas_build_desc &desc,
+    std::size_t geometry_index,
+    rt_blas_geometry_counts* out_counts);
+bool validate_rt_blas_build_desc(const rt_blas_build_desc &desc);
+bool validate_rt_tlas_build_desc(const rt_tlas_build_desc &desc);
+bool validate_rt_shader_package_desc(const rt_shader_package_desc &desc);
+bool validate_rt_pipeline_desc(const rt_pipeline_desc &desc);
+bool get_rt_pipeline_dispatch_entry_index(
+    const rt_pipeline_desc &desc,
+    rt_logical_dispatch_entry logical_entry,
+    std::uint32_t* out_index);
 
 } // namespace rtvdb::viewer_backend
