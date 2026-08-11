@@ -36,6 +36,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <system_error>
@@ -68,10 +69,15 @@ constexpr float kOrthographicHeightUiMin = 0.01f;
 constexpr float kOrthographicHeightUiMax = 1.0e6f;
 constexpr float kOverlayRightPadding = 20.0f;
 constexpr float kHoverOverlayPadding = 16.0f;
+constexpr float kHoverLayerRightPadding = 12.0f;
+constexpr std::size_t kHoverLayerDisplayLineCount = 2;
 constexpr float kCaptureOverlayLeftPadding = 16.0f;
 constexpr float kCaptureOverlayBottomPadding = 16.0f;
 constexpr float kStatusOverlayRightPadding = kOverlayRightPadding;
 constexpr float kStatusOverlayBottomPadding = 16.0f;
+constexpr float kStatusOverlayCollisionGap = 12.0f;
+constexpr float kOverlayTextShadowOffset = 1.0f;
+constexpr float kStatusTreeNodeArrowScale = 0.70f;
 constexpr float kViewerWindowWidth = 368.0f;
 constexpr float kViewerLogWindowWidth = kViewerWindowWidth * 2.0f;
 constexpr float kSceneTabLayersHeight = 180.0f;
@@ -300,6 +306,7 @@ constexpr helper_plane_option kHelperPlaneOptions[] = {
 
 hover_state g_hover{};
 bool g_hover_pick_pending = false;
+bool g_imgui_mouse_capture_active = false;
 bool g_keyboard_camera_input_active = false;
 camera_override_state g_camera_override{};
 camera_focus_state g_camera_focus{};
@@ -337,6 +344,17 @@ std::uint64_t g_last_runtime_build_info_post_present_count = 0;
 std::uint64_t g_last_runtime_build_info_paint_count = 0;
 std::uint64_t g_last_present_ready_frame_serial = 0;
 std::uint64_t g_view_revision = 0;
+
+struct status_tree_state {
+    bool display_cadence_open = false;
+    bool paint_cpu_work_open = false;
+    bool rt_frame_preparation_open = false;
+    bool rt_output_open = false;
+    bool last_as_build_open = false;
+    bool scene_build_open = false;
+};
+
+status_tree_state g_status_tree_state{};
 
 bool g_pending_present_update = false;
 bool g_pending_post_present_capture = false;
@@ -2189,6 +2207,21 @@ void append_hover_user_data_lines(std::vector<std::string> &lines, std::uint32_t
     lines.emplace_back(buffer);
 }
 
+const std::string &hover_primitive_layer() {
+    switch (g_hover.primitive_kind) {
+    case hover_primitive_kind::triangle:
+        return g_hover.triangle.layer;
+    case hover_primitive_kind::point:
+        return g_hover.point.layer;
+    case hover_primitive_kind::line:
+        return g_hover.line.layer;
+    default: {
+        static const std::string empty_layer;
+        return empty_layer;
+    }
+    }
+}
+
 rtvdb::vec3 rotate_about_axis(const rtvdb::vec3 &v, const rtvdb::vec3 &axis, float radians) {
     const rtvdb::vec3 unit_axis = normalize_or(axis, {0.0f, 1.0f, 0.0f});
     const float c = std::cos(radians);
@@ -2485,10 +2518,10 @@ std::vector<std::string> build_hover_overlay_lines() {
     return lines;
 }
 
-void draw_hover_overlay() {
+float draw_hover_overlay() {
     const std::vector<std::string> lines = build_hover_overlay_lines();
     if (lines.empty()) {
-        return;
+        return 0.0f;
     }
 
     ImDrawList* draw_list = ImGui::GetForegroundDrawList();
@@ -2498,27 +2531,142 @@ void draw_hover_overlay() {
     for (const std::string &line : lines) {
         overlay_width = (std::max)(overlay_width, ImGui::CalcTextSize(line.c_str()).x);
     }
-
     ImVec2 position(
         viewport->WorkPos.x + viewport->WorkSize.x - kOverlayRightPadding - overlay_width,
         viewport->WorkPos.y + kHoverOverlayPadding
     );
     const ImU32 shadow_color = IM_COL32(0, 0, 0, 200);
     const ImU32 text_color = IM_COL32(255, 255, 255, 255);
-    for (std::size_t index = 0; index < lines.size(); ++index) {
-        const ImVec2 line_position(position.x, position.y + static_cast<float>(index) * line_height);
-        draw_list->AddText(ImVec2(line_position.x + 1.0f, line_position.y + 1.0f), shadow_color, lines[index].c_str());
-        draw_list->AddText(line_position, text_color, lines[index].c_str());
+    const auto draw_text = [&](const ImVec2 &text_position, const char* text) {
+        draw_list->AddText(ImVec2(text_position.x + 1.0f, text_position.y + 1.0f), shadow_color, text);
+        draw_list->AddText(text_position, text_color, text);
+    };
+    const std::size_t layer_insert_index = (std::min)(std::size_t{3}, lines.size());
+    std::size_t display_line_index = 0;
+    for (std::size_t index = 0; index < layer_insert_index; ++index, ++display_line_index) {
+        const ImVec2 line_position(position.x, position.y + static_cast<float>(display_line_index) * line_height);
+        draw_text(line_position, lines[index].c_str());
     }
+
+    std::string layer_line = "Layer: ";
+    layer_line += g_hover.has_hit ? hover_primitive_layer() : "-";
+    const ImVec2 layer_position(
+        position.x,
+        position.y + static_cast<float>(display_line_index) * line_height);
+    const float layer_width = (std::max)(kHoverLayerRightPadding, overlay_width - kHoverLayerRightPadding);
+    const float layer_height = line_height * static_cast<float>(kHoverLayerDisplayLineCount);
+    const ImVec4 layer_clip_rect(
+        layer_position.x,
+        layer_position.y,
+        layer_position.x + overlay_width,
+        layer_position.y + layer_height);
+    const ImVec2 wrapped_layer_size = ImGui::CalcTextSize(
+        layer_line.c_str(),
+        nullptr,
+        false,
+        layer_width);
+    draw_list->AddText(
+        nullptr,
+        0.0f,
+        ImVec2(layer_position.x + 1.0f, layer_position.y + 1.0f),
+        shadow_color,
+        layer_line.c_str(),
+        nullptr,
+        layer_width,
+        &layer_clip_rect);
+    draw_list->AddText(
+        nullptr,
+        0.0f,
+        layer_position,
+        text_color,
+        layer_line.c_str(),
+        nullptr,
+        layer_width,
+        &layer_clip_rect);
+    if (wrapped_layer_size.y > layer_height) {
+        const ImVec2 ellipsis_size = ImGui::CalcTextSize("...");
+        const ImVec2 ellipsis_position(
+            layer_position.x + overlay_width - ellipsis_size.x,
+            layer_position.y + layer_height - line_height);
+        draw_text(ellipsis_position, "...");
+    }
+    display_line_index += kHoverLayerDisplayLineCount;
+
+    for (std::size_t index = layer_insert_index; index < lines.size(); ++index, ++display_line_index) {
+        const ImVec2 line_position(position.x, position.y + static_cast<float>(display_line_index) * line_height);
+        draw_text(line_position, lines[index].c_str());
+    }
+
+    return position.y + static_cast<float>(display_line_index) * line_height;
 }
 
 constexpr float kStatusDetailsValueColumn = 220.0f;
 constexpr float kStatusSummaryValueColumn = 130.0f;
 
+void add_status_text_shadow(const ImVec2 &text_position, const char* text) {
+    ImGui::GetWindowDrawList()->AddText(
+        ImVec2(
+            text_position.x + kOverlayTextShadowOffset,
+            text_position.y + kOverlayTextShadowOffset),
+        IM_COL32(0, 0, 0, 200),
+        text);
+}
+
+void draw_status_text_unformatted(const char* text) {
+    add_status_text_shadow(ImGui::GetCursorScreenPos(), text);
+    ImGui::TextUnformatted(text);
+}
+
+template <typename... Args>
+void draw_status_text(const char* format, Args... args) {
+    char text[128]{};
+    std::snprintf(text, sizeof(text), format, args...);
+    draw_status_text_unformatted(text);
+}
+
+void add_status_tree_node_shadow(const char* label, bool open) {
+    const ImVec2 cursor_position = ImGui::GetCursorScreenPos();
+    add_status_text_shadow(
+        ImVec2(cursor_position.x + ImGui::GetTreeNodeToLabelSpacing(), cursor_position.y),
+        label);
+
+    const float font_size = ImGui::GetFontSize();
+    const float arrow_radius = font_size * 0.40f * kStatusTreeNodeArrowScale;
+    const ImVec2 arrow_position(
+        cursor_position.x + ImGui::GetStyle().FramePadding.x,
+        cursor_position.y + font_size * 0.15f);
+    const ImVec2 arrow_center(
+        arrow_position.x + font_size * 0.50f + kOverlayTextShadowOffset,
+        arrow_position.y + font_size * 0.50f * kStatusTreeNodeArrowScale + kOverlayTextShadowOffset);
+    const ImU32 shadow_color = IM_COL32(0, 0, 0, 200);
+    ImDrawList* const draw_list = ImGui::GetWindowDrawList();
+    if (open) {
+        draw_list->AddTriangleFilled(
+            ImVec2(arrow_center.x, arrow_center.y + 0.750f * arrow_radius),
+            ImVec2(
+                arrow_center.x - 0.866f * arrow_radius,
+                arrow_center.y - 0.750f * arrow_radius),
+            ImVec2(
+                arrow_center.x + 0.866f * arrow_radius,
+                arrow_center.y - 0.750f * arrow_radius),
+            shadow_color);
+    } else {
+        draw_list->AddTriangleFilled(
+            ImVec2(arrow_center.x + 0.750f * arrow_radius, arrow_center.y),
+            ImVec2(
+                arrow_center.x - 0.750f * arrow_radius,
+                arrow_center.y + 0.866f * arrow_radius),
+            ImVec2(
+                arrow_center.x - 0.750f * arrow_radius,
+                arrow_center.y - 0.866f * arrow_radius),
+            shadow_color);
+    }
+}
+
 float draw_status_leaf_label(const char* label) {
     const float tree_label_spacing = ImGui::GetTreeNodeToLabelSpacing();
     ImGui::Indent(tree_label_spacing);
-    ImGui::TextUnformatted(label);
+    draw_status_text_unformatted(label);
     return tree_label_spacing;
 }
 
@@ -2537,7 +2685,7 @@ void draw_status_value(const char* label, double value_ms, float value_column, c
     const float tree_label_spacing = draw_status_leaf_label(label);
     const bool label_hovered = ImGui::IsItemHovered();
     ImGui::SameLine(value_column);
-    ImGui::Text("%7.2f ms", value_ms);
+    draw_status_text("%7.2f ms", value_ms);
     const bool value_hovered = ImGui::IsItemHovered();
     ImGui::Unindent(tree_label_spacing);
     show_status_tooltip(tooltip, label_hovered || value_hovered);
@@ -2565,7 +2713,7 @@ void draw_status_summary_rate(
     const float tree_label_spacing = draw_status_leaf_label(label);
     const bool label_hovered = ImGui::IsItemHovered();
     ImGui::SameLine(value_column);
-    ImGui::Text("%7.1f fps", frames_per_second);
+    draw_status_text("%7.1f fps", frames_per_second);
     const bool value_hovered = ImGui::IsItemHovered();
     ImGui::Unindent(tree_label_spacing);
     show_status_tooltip(tooltip, label_hovered || value_hovered);
@@ -2575,7 +2723,7 @@ void draw_status_detail_rate(const char* label, double frames_per_second, const 
     const float tree_label_spacing = draw_status_leaf_label(label);
     const bool label_hovered = ImGui::IsItemHovered();
     ImGui::SameLine(kStatusDetailsValueColumn);
-    ImGui::Text("%7.1f fps", frames_per_second);
+    draw_status_text("%7.1f fps", frames_per_second);
     const bool value_hovered = ImGui::IsItemHovered();
     ImGui::Unindent(tree_label_spacing);
     show_status_tooltip(tooltip, label_hovered || value_hovered);
@@ -2596,7 +2744,7 @@ void draw_status_summary_count(
         value_column + ImGui::CalcTextSize("0000.00 ms").x;
     ImGui::SameLine();
     ImGui::SetCursorPosX(timing_value_right_edge - ImGui::CalcTextSize(value).x);
-    ImGui::TextUnformatted(value);
+    draw_status_text_unformatted(value);
     const bool value_hovered = ImGui::IsItemHovered();
     ImGui::Unindent(tree_label_spacing);
     show_status_tooltip(tooltip, label_hovered || value_hovered);
@@ -2606,7 +2754,7 @@ void draw_status_detail_count(const char* label, std::size_t value, const char* 
     const float tree_label_spacing = draw_status_leaf_label(label);
     const bool label_hovered = ImGui::IsItemHovered();
     ImGui::SameLine(kStatusDetailsValueColumn);
-    ImGui::Text("%8llu", static_cast<unsigned long long>(value));
+    draw_status_text("%8llu", static_cast<unsigned long long>(value));
     const bool value_hovered = ImGui::IsItemHovered();
     ImGui::Unindent(tree_label_spacing);
     show_status_tooltip(tooltip, label_hovered || value_hovered);
@@ -2617,34 +2765,58 @@ bool begin_status_detail_group(
     const char* label,
     double value_ms,
     float value_column,
-    const char* tooltip)
+    const char* tooltip,
+    bool* open_state)
 {
+    ImGui::SetNextItemOpen(*open_state, ImGuiCond_Always);
+    add_status_tree_node_shadow(label, *open_state);
     const bool open = ImGui::TreeNodeEx(id, 0, "%s", label);
+    if (ImGui::IsItemToggledOpen()) {
+        *open_state = open;
+    }
     const bool label_hovered = ImGui::IsItemHovered();
     ImGui::SameLine(value_column);
-    ImGui::Text("%7.2f ms", value_ms);
+    draw_status_text("%7.2f ms", value_ms);
     const bool value_hovered = ImGui::IsItemHovered();
     show_status_tooltip(tooltip, label_hovered || value_hovered);
     return open;
 }
 
-bool status_tree_group_is_open(const char* label) {
-    ImGuiStorage* const state_storage = ImGui::GetStateStorage();
-    return state_storage != nullptr && state_storage->GetInt(ImGui::GetID(label), 0) != 0;
+bool begin_status_tree_group(const char* label, bool* open_state) {
+    ImGui::SetNextItemOpen(*open_state, ImGuiCond_Always);
+    add_status_tree_node_shadow(label, *open_state);
+    const bool open = ImGui::TreeNodeEx(label, 0);
+    if (ImGui::IsItemToggledOpen()) {
+        *open_state = open;
+    }
+    return open;
 }
 
-void draw_status_overlay(const rtvdb::viewer_backend::scene_build_info &build_info) {
+void draw_status_overlay(
+    const rtvdb::viewer_backend::scene_build_info &build_info,
+    float hover_overlay_bottom)
+{
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     if (viewport == nullptr) {
         return;
     }
 
+    const float status_bottom = viewport->WorkPos.y + viewport->WorkSize.y - kStatusOverlayBottomPadding;
+    float max_status_height = std::numeric_limits<float>::max();
+    if (hover_overlay_bottom > viewport->WorkPos.y) {
+        max_status_height = (std::max)(
+            1.0f,
+            status_bottom - hover_overlay_bottom - kStatusOverlayCollisionGap);
+    }
     ImGui::SetNextWindowPos(
         ImVec2(
             viewport->WorkPos.x + viewport->WorkSize.x - kStatusOverlayRightPadding,
-            viewport->WorkPos.y + viewport->WorkSize.y - kStatusOverlayBottomPadding),
+            status_bottom),
         ImGuiCond_Always,
         ImVec2(1.0f, 1.0f));
+    ImGui::SetNextWindowSizeConstraints(
+        ImVec2(0.0f, 0.0f),
+        ImVec2(std::numeric_limits<float>::max(), max_status_height));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
     if (ImGui::Begin(
             "Frame timing details",
@@ -2666,10 +2838,10 @@ void draw_status_overlay(const rtvdb::viewer_backend::scene_build_info &build_in
                 paint_cpu_work_ms -
                 shell_timing.idle_sleep_ms);
         const bool details_open =
-            status_tree_group_is_open("Display cadence") ||
-            status_tree_group_is_open("Paint CPU Work") ||
-            status_tree_group_is_open("Last AS build") ||
-            status_tree_group_is_open("Scene build");
+            g_status_tree_state.display_cadence_open ||
+            g_status_tree_state.paint_cpu_work_open ||
+            g_status_tree_state.last_as_build_open ||
+            g_status_tree_state.scene_build_open;
         const float summary_value_column =
             details_open ? kStatusDetailsValueColumn : kStatusSummaryValueColumn;
 
@@ -2691,7 +2863,8 @@ void draw_status_overlay(const rtvdb::viewer_backend::scene_build_info &build_in
             "Display cadence",
             shell_timing.frame_interval_ms,
             summary_value_column,
-            "The completed-present interval. Its children explain where the frame time is spent.");
+            "The completed-present interval. Its children explain where the frame time is spent.",
+            &g_status_tree_state.display_cadence_open);
         if (frame_pacing_open) {
             draw_status_detail_rate(
                 "Display rate",
@@ -2724,7 +2897,8 @@ void draw_status_overlay(const rtvdb::viewer_backend::scene_build_info &build_in
             "Paint CPU Work",
             paint_cpu_work_ms,
             summary_value_column,
-            "CPU work performed by the viewer paint callback. This excludes SDL/ImGui composition and present.");
+            "CPU work performed by the viewer paint callback. This excludes SDL/ImGui composition and present.",
+            &g_status_tree_state.paint_cpu_work_open);
         if (cpu_work_open) {
             draw_status_detail_value(
                 "Viewer pre-render",
@@ -2752,7 +2926,8 @@ void draw_status_overlay(const rtvdb::viewer_backend::scene_build_info &build_in
                 "RT frame prep.",
                 rt_frame_preparation_ms,
                 kStatusDetailsValueColumn,
-                "Resource prep., optional AS work, and post-AS bindings/pipeline prep.");
+                "Resource prep., optional AS work, and post-AS bindings/pipeline prep.",
+                &g_status_tree_state.rt_frame_preparation_open);
             if (rt_frame_preparation_open) {
                 draw_status_detail_value(
                     "RT pre-AS prep.",
@@ -2781,7 +2956,8 @@ void draw_status_overlay(const rtvdb::viewer_backend::scene_build_info &build_in
                 "RT render output",
                 rt_output_ms,
                 kStatusDetailsValueColumn,
-                "Output trace or reuse work recorded and submitted through the graphics encoder.");
+                "Output trace or reuse work recorded and submitted through the graphics encoder.",
+                &g_status_tree_state.rt_output_open);
             if (rt_output_open) {
                 draw_status_detail_value(
                     "Command-slot wait",
@@ -2819,7 +2995,9 @@ void draw_status_overlay(const rtvdb::viewer_backend::scene_build_info &build_in
                 "Remaining paint-callback work after the timed render stages, such as capture bookkeeping and repaint scheduling.");
             ImGui::TreePop();
         }
-        const bool last_as_build_open = ImGui::TreeNodeEx("Last AS build", 0);
+        const bool last_as_build_open = begin_status_tree_group(
+            "Last AS build",
+            &g_status_tree_state.last_as_build_open);
         show_status_tooltip(
             "Timing from the most recent acceleration-structure build. "
             "It is retained after the build and is not a per-frame render metric.",
@@ -2844,7 +3022,9 @@ void draw_status_overlay(const rtvdb::viewer_backend::scene_build_info &build_in
                 "GPU timestamp duration of the most recent acceleration-structure build.");
             ImGui::TreePop();
         }
-        const bool scene_build_open = ImGui::TreeNodeEx("Scene build", 0);
+        const bool scene_build_open = begin_status_tree_group(
+            "Scene build",
+            &g_status_tree_state.scene_build_open);
         show_status_tooltip(
             "Primitive counts of the scene used by the current build.",
             ImGui::IsItemHovered());
@@ -3874,15 +4054,20 @@ bool intersect_line(
     return true;
 }
 
+void clear_hover_pick_state() {
+    g_hover.has_hit = false;
+    g_hover.has_normal = false;
+    g_hover_pick_pending = false;
+    rtvdb::viewer_backend::set_hover_highlight({});
+}
+
 void update_hover_state() {
-    if (g_camera_animation.active ||
+    if (g_imgui_mouse_capture_active ||
+        g_camera_animation.active ||
         g_drag.orbiting ||
         g_drag.panning ||
         g_keyboard_camera_input_active) {
-        g_hover.has_hit = false;
-        g_hover.has_normal = false;
-        g_hover_pick_pending = false;
-        rtvdb::viewer_backend::set_hover_highlight({});
+        clear_hover_pick_state();
         return;
     }
     std::shared_ptr<const rtvdb::viewer_backend::frame_scene> scene_snapshot;
@@ -4002,6 +4187,38 @@ void update_hover_state() {
     }
     rtvdb::viewer_backend::set_hover_highlight(hover_backend_highlight());
     rtvdb::viewer_shell::request_repaint();
+}
+
+void sync_hover_mouse_position_from_imgui() {
+    const ImVec2 mouse_position = ImGui::GetIO().MousePos;
+    const bool valid_mouse_position =
+        std::isfinite(mouse_position.x) &&
+        std::isfinite(mouse_position.y) &&
+        mouse_position.x > -std::numeric_limits<float>::max() * 0.5f &&
+        mouse_position.y > -std::numeric_limits<float>::max() * 0.5f;
+    if (!valid_mouse_position) {
+        g_hover.mouse_valid = false;
+        return;
+    }
+
+    g_hover.mouse_valid = true;
+    g_hover.mouse_x = static_cast<int>(std::lround(mouse_position.x));
+    g_hover.mouse_y = static_cast<int>(std::lround(mouse_position.y));
+}
+
+void update_imgui_mouse_capture_state() {
+    const bool mouse_capture_active = ImGui::GetIO().WantCaptureMouse;
+    if (mouse_capture_active) {
+        if (!g_imgui_mouse_capture_active) {
+            clear_hover_pick_state();
+            rtvdb::viewer_shell::request_repaint();
+        }
+    } else if (g_imgui_mouse_capture_active) {
+        g_imgui_mouse_capture_active = false;
+        sync_hover_mouse_position_from_imgui();
+        update_hover_state();
+    }
+    g_imgui_mouse_capture_active = mouse_capture_active;
 }
 
 void draw_scene_to_paint_context(void*) {
@@ -5853,11 +6070,12 @@ void on_mouse_wheel(float delta, void*) {
 }
 
 void on_ui(void*) {
+    update_imgui_mouse_capture_state();
     rtvdb::viewer_session::copy_recent_logs(&g_recent_session_logs);
     rtvdb::viewer_backend::scene_build_info build_info{};
     rtvdb::viewer_backend::copy_present_build_info(&build_info);
-    draw_hover_overlay();
-    draw_status_overlay(build_info);
+    const float hover_overlay_bottom = draw_hover_overlay();
+    draw_status_overlay(build_info, hover_overlay_bottom);
     g_frame_pacing.paint_callback_completed_since_ui = false;
 
     const float window_height = g_viewer_window_height > 0.0f
