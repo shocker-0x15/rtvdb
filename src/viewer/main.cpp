@@ -388,7 +388,21 @@ std::uint64_t g_layer_rebuild_generation = 0;
 bool g_layer_rebuild_stop = false;
 float g_viewer_window_height = 0.0f;
 float g_camera_speed_log10 = 0.0f;
+bool g_display_background_enabled = true;
 float g_display_background_color[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+
+float effective_display_background_alpha() {
+    return g_display_background_enabled ? g_display_background_color[3] : 0.0f;
+}
+
+void apply_display_background_color() {
+    rtvdb::viewer_shell::set_background_color(
+        g_display_background_color[0],
+        g_display_background_color[1],
+        g_display_background_color[2],
+        effective_display_background_alpha());
+}
+
 std::wstring g_last_manual_png_directory;
 struct client_capture_request {
     // Capture requests retain control metadata only; rendering uses the current viewer scene.
@@ -4630,7 +4644,7 @@ bool prepare_png_save_pixels(
         to_byte(g_display_background_color[0]),
         to_byte(g_display_background_color[1]),
         to_byte(g_display_background_color[2]),
-        to_byte(g_display_background_color[3]),
+        to_byte(effective_display_background_alpha()),
         out_pixels);
 }
 
@@ -6245,15 +6259,16 @@ void on_ui(void*) {
             ImGui::Separator();
 
             ImGui::TextUnformatted("Display Background");
-            if (ImGui::ColorEdit4(
-                    "##DisplayBackground",
-                    g_display_background_color,
-                    ImGuiColorEditFlags_NoInputs)) {
-                rtvdb::viewer_shell::set_background_color(
-                    g_display_background_color[0],
-                    g_display_background_color[1],
-                    g_display_background_color[2],
-                    g_display_background_color[3]);
+            bool display_background_changed = ImGui::ColorEdit4(
+                "##DisplayBackground",
+                g_display_background_color,
+                ImGuiColorEditFlags_NoInputs);
+            ImGui::SameLine();
+            display_background_changed |= ImGui::Checkbox(
+                "Enable",
+                &g_display_background_enabled);
+            if (display_background_changed) {
+                apply_display_background_color();
                 rtvdb::viewer_shell::request_repaint();
             }
 

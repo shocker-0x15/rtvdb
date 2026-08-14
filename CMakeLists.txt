@@ -2,7 +2,15 @@
 
 project(rtvdb VERSION 0.1.0 LANGUAGES CXX)
 
-include(CTest)
+set(RTVDB_PRIVATE_PROJECTS_ENABLED OFF)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR AND
+    EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/private/CMakeLists.txt")
+    set(RTVDB_PRIVATE_PROJECTS_ENABLED ON)
+endif()
+
+if(RTVDB_PRIVATE_PROJECTS_ENABLED)
+    include(CTest)
+endif()
 
 set_property(GLOBAL PROPERTY USE_FOLDERS ON)
 
@@ -687,7 +695,6 @@ else()
 endif()
 include(CPack)
 
-if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR AND
-    EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/private/CMakeLists.txt")
+if(RTVDB_PRIVATE_PROJECTS_ENABLED)
     add_subdirectory(private)
 endif()
