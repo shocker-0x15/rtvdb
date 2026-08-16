@@ -112,6 +112,8 @@ struct rt_viewer_constants {
     std::uint32_t scene_bounds_valid = 0;
     std::uint32_t hover_highlight_kind = 0;
     std::uint32_t hover_primitive_index = 0;
+    std::uint32_t selection_highlight_kind = 0;
+    std::uint32_t selection_primitive_index = 0;
     std::uint32_t pick_pixel_x = 0;
     std::uint32_t pick_pixel_y = 0;
     std::uint32_t is_pick_pass = 0;
@@ -149,6 +151,8 @@ rt_viewer_constants make_rt_viewer_constants(
     std::uint32_t accumulation_sample_index,
     std::uint32_t hover_highlight_kind,
     std::uint32_t hover_primitive_index,
+    std::uint32_t selection_highlight_kind,
+    std::uint32_t selection_primitive_index,
     bool is_pick_pass = false,
     int pick_pixel_x = 0,
     int pick_pixel_y = 0);
@@ -162,6 +166,8 @@ struct rt_accumulation_key {
     std::uint32_t has_frame = 0;
     std::uint32_t hover_highlight_kind = 0;
     std::uint32_t hover_primitive_index = 0;
+    std::uint32_t selection_highlight_kind = 0;
+    std::uint32_t selection_primitive_index = 0;
     float camera_origin[3]{};
     float camera_target[3]{};
     float camera_up[3]{};

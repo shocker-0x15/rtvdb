@@ -88,6 +88,8 @@ float2 shared_accumulation_jitter() { return g_view.blend_and_jitter.yz; }
 uint32_t shared_hover_highlight_kind() { return g_view.projection_modes.z; }
 uint32_t shared_hover_primitive_index() { return g_view.projection_modes.w; }
 float shared_hover_highlight_mix() { return g_view.blend_and_jitter.w; }
+uint32_t shared_selection_highlight_kind() { return g_view.pick_and_flags.w; }
+uint32_t shared_selection_primitive_index() { return g_view.pick_params.w; }
 uint32_t shared_is_pick_pass() { return g_view.pick_params.z; }
 
 #include "../shaders/rt_logic_shared_impl.h"

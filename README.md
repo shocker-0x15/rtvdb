@@ -211,8 +211,8 @@ Running the Windows DXR viewer requires a DXR-capable GPU and a compatible drive
 Running a Vulkan RT viewer requires a GPU and driver supporting Vulkan 1.3 and the ray tracing extensions.
 - 非RT環境向けfallback backendは提供しません。\
 No fallback backend is provided for non-RT environments.
-- macOS Metal RT backendはnative presentに対応していますが、実験的な位置付けです。\
-The macOS Metal RT backend supports native presentation but remains experimental.
+- macOS Metal RT backendは実験的な位置付けです。\
+The macOS Metal RT backend remains experimental.
 - CIによる全プラットフォームの継続検証はまだ整備されていません。\
 Continuous CI validation across all platforms is not yet in place.
 

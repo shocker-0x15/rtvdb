@@ -116,6 +116,8 @@ rt_viewer_constants make_rt_viewer_constants(
     std::uint32_t accumulation_sample_index,
     std::uint32_t hover_highlight_kind,
     std::uint32_t hover_primitive_index,
+    std::uint32_t selection_highlight_kind,
+    std::uint32_t selection_primitive_index,
     bool is_pick_pass,
     int pick_pixel_x,
     int pick_pixel_y)
@@ -128,6 +130,8 @@ rt_viewer_constants make_rt_viewer_constants(
     constants.accumulation_sample_index = accumulation_sample_index;
     constants.hover_highlight_kind = hover_highlight_kind;
     constants.hover_primitive_index = hover_primitive_index;
+    constants.selection_highlight_kind = selection_highlight_kind;
+    constants.selection_primitive_index = selection_primitive_index;
     constants.is_pick_pass = is_pick_pass ? 1u : 0u;
     constants.pick_pixel_x = static_cast<std::uint32_t>((std::max)(pick_pixel_x, 0));
     constants.pick_pixel_y = static_cast<std::uint32_t>((std::max)(pick_pixel_y, 0));
@@ -224,10 +228,11 @@ rt_viewer_constants_gpu pack_rt_viewer_constants(const rt_viewer_constants &sour
     constants.pick_and_flags[0] = source.triangle_count;
     constants.pick_and_flags[1] = source.point_count;
     constants.pick_and_flags[2] = source.line_count;
-    constants.pick_and_flags[3] = source.has_frame;
+    constants.pick_and_flags[3] = source.selection_highlight_kind;
     constants.pick_params[0] = source.pick_pixel_x;
     constants.pick_params[1] = source.pick_pixel_y;
     constants.pick_params[2] = source.is_pick_pass;
+    constants.pick_params[3] = source.selection_primitive_index;
     return constants;
 }
 
@@ -250,6 +255,8 @@ bool rt_accumulation_key_equals(const rt_accumulation_key &a, const rt_accumulat
         a.has_frame == b.has_frame &&
         a.hover_highlight_kind == b.hover_highlight_kind &&
         a.hover_primitive_index == b.hover_primitive_index &&
+        a.selection_highlight_kind == b.selection_highlight_kind &&
+        a.selection_primitive_index == b.selection_primitive_index &&
         float3_equals(a.camera_origin, b.camera_origin) &&
         float3_equals(a.camera_target, b.camera_target) &&
         float3_equals(a.camera_up, b.camera_up) &&
@@ -359,6 +366,8 @@ rt_accumulation_key make_rt_accumulation_key(
     rt_accumulation_key key{};
     hover_highlight highlight{};
     get_hover_highlight(&highlight);
+    selection_highlight selection{};
+    get_selection_highlight(&selection);
     key.build_revision = build.revision;
     key.width = static_cast<std::uint32_t>(width);
     key.height = static_cast<std::uint32_t>(height);
@@ -366,6 +375,8 @@ rt_accumulation_key make_rt_accumulation_key(
     key.has_frame = has_frame ? 1u : 0u;
     key.hover_highlight_kind = static_cast<std::uint32_t>(highlight.kind);
     key.hover_primitive_index = highlight.primitive_index;
+    key.selection_highlight_kind = static_cast<std::uint32_t>(selection.kind);
+    key.selection_primitive_index = selection.primitive_index;
     key.camera_origin[0] = scene.camera.origin.x;
     key.camera_origin[1] = scene.camera.origin.y;
     key.camera_origin[2] = scene.camera.origin.z;

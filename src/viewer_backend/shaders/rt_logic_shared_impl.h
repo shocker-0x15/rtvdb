@@ -70,11 +70,36 @@ float4 apply_hover_highlight(float4 color, uint32_t primitive_kind, uint32_t pri
         shared_hover_highlight_mix());
 }
 
+float4 apply_selection_highlight(float4 color, uint32_t primitive_kind, uint32_t primitive_index)
+{
+    return core::apply_selection_highlight(
+        color,
+        primitive_kind,
+        primitive_index,
+        shared_selection_highlight_kind(),
+        shared_selection_primitive_index());
+}
+
+float4 apply_highlights(float4 color, uint32_t primitive_kind, uint32_t primitive_index)
+{
+    if (shared_is_pick_pass() != 0u)
+    {
+        return color;
+    }
+    if (shared_selection_highlight_kind() != 0u &&
+        primitive_kind == shared_selection_highlight_kind() &&
+        primitive_index == shared_selection_primitive_index())
+    {
+        return apply_selection_highlight(color, primitive_kind, primitive_index);
+    }
+    return apply_hover_highlight(color, primitive_kind, primitive_index);
+}
+
 float4 triangle_surface_rgba(
   uint32_t triangle_index, uint32_t index_offset,
   uint32_t geometry_index, uint32_t instance_index)
 {
-    return apply_hover_highlight(
+    return apply_highlights(
         apply_display_mode(
             shared_triangle_color(triangle_index),
             triangle_normal(index_offset),
@@ -88,7 +113,7 @@ float4 triangle_surface_rgba(
 float4 point_surface_rgba(uint32_t point_index, float3 hit_position, uint32_t instance_index)
 {
     const SharedPointPrimitive point_primitive = shared_point_primitive(point_index);
-    return apply_hover_highlight(
+    return apply_highlights(
         apply_display_mode(
             point_primitive.color,
             point_normal(point_primitive, hit_position),
@@ -104,9 +129,9 @@ float4 line_surface_rgba(uint32_t line_index, float3 hit_position, uint32_t inst
     const SharedLinePrimitive line_primitive = shared_line_primitive(line_index);
     if ((line_primitive.flags & kLineFlagFixedColor) != 0u)
     {
-        return line_primitive.color;
+        return apply_selection_highlight(line_primitive.color, 3u, line_index);
     }
-    return apply_hover_highlight(
+    return apply_highlights(
         apply_display_mode(
             line_primitive.color,
             line_normal(line_primitive, hit_position),

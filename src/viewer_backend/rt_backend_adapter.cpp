@@ -183,6 +183,8 @@ bool execute_present(const rt_present_request &request, rt_present_result* out_r
 
     hover_highlight highlight{};
     get_hover_highlight(&highlight);
+    selection_highlight selection{};
+    get_selection_highlight(&selection);
     native_request.build = &build;
     native_request.constants = make_rt_viewer_constants(
         *request.scene,
@@ -194,6 +196,8 @@ bool execute_present(const rt_present_request &request, rt_present_result* out_r
         accumulation_sample_index,
         static_cast<std::uint32_t>(highlight.kind),
         highlight.primitive_index,
+        static_cast<std::uint32_t>(selection.kind),
+        selection.primitive_index,
         false,
         0,
         0);
@@ -467,6 +471,8 @@ bool pick(const rt_pick_request &request, pick_result* out_result) {
     get_display_mode(&mode);
     hover_highlight highlight{};
     get_hover_highlight(&highlight);
+    selection_highlight selection{};
+    get_selection_highlight(&selection);
     rt_pick_dispatch_request dispatch_request{
         build.revision,
         request.render.width,
@@ -484,6 +490,8 @@ bool pick(const rt_pick_request &request, pick_result* out_result) {
         renderer->accumulation_state.sample_count,
         static_cast<std::uint32_t>(highlight.kind),
         highlight.primitive_index,
+        static_cast<std::uint32_t>(selection.kind),
+        selection.primitive_index,
         true,
         request.pixel_x,
         request.pixel_y);

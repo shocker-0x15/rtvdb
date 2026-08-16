@@ -51,6 +51,7 @@ struct backend_state {
     helper_plane helper_overlay_plane = helper_plane::xy;
     display_mode display = display_mode::client_color;
     hover_highlight highlight{};
+    selection_highlight selection{};
     bool recovery_in_progress = false;
     std::uint64_t recovery_count = 0;
 } g_backend;
@@ -387,6 +388,7 @@ bool try_recover_backend(const d3d12_interop_config* replacement_d3d12 = nullptr
     helper_plane helper_overlay_plane = helper_plane::xy;
     display_mode display = display_mode::client_color;
     hover_highlight highlight{};
+    selection_highlight selection{};
     {
         std::scoped_lock lock(g_backend.mutex);
         if (!g_backend.initialized || g_backend.ops == nullptr || g_backend.recovery_in_progress ||
@@ -404,6 +406,7 @@ bool try_recover_backend(const d3d12_interop_config* replacement_d3d12 = nullptr
         helper_overlay_plane = g_backend.helper_overlay_plane;
         display = g_backend.display;
         highlight = g_backend.highlight;
+        selection = g_backend.selection;
         if (g_backend.pending_revision != 0) {
             recovery_scene = g_backend.pending_helper_overlay_update
                 ? g_backend.present_client_scene
@@ -426,6 +429,7 @@ bool try_recover_backend(const d3d12_interop_config* replacement_d3d12 = nullptr
         set_helper_overlay_plane(helper_overlay_plane);
         set_display_mode(display);
         set_hover_highlight(highlight);
+        set_selection_highlight(selection);
         if (recovery_has_frame) {
             scene_queued = submit_scene_build(
                 recovery_scene,
@@ -593,6 +597,7 @@ void shutdown_backend() {
     g_backend.helper_overlay_plane = helper_plane::xy;
     g_backend.display = display_mode::triangle_normal;
     g_backend.highlight = {};
+    g_backend.selection = {};
 }
 
 bool recover_backend() {
@@ -881,6 +886,20 @@ bool get_hover_highlight(hover_highlight* out_highlight) {
     std::scoped_lock lock(g_backend.mutex);
     if (out_highlight != nullptr) {
         *out_highlight = g_backend.highlight;
+        return true;
+    }
+    return false;
+}
+
+void set_selection_highlight(const selection_highlight &highlight) {
+    std::scoped_lock lock(g_backend.mutex);
+    g_backend.selection = highlight;
+}
+
+bool get_selection_highlight(selection_highlight* out_highlight) {
+    std::scoped_lock lock(g_backend.mutex);
+    if (out_highlight != nullptr) {
+        *out_highlight = g_backend.selection;
         return true;
     }
     return false;

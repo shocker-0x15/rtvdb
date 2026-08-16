@@ -71,6 +71,11 @@ constexpr float kOverlayRightPadding = 20.0f;
 constexpr float kHoverOverlayPadding = 16.0f;
 constexpr float kHoverLayerRightPadding = 12.0f;
 constexpr std::size_t kHoverLayerDisplayLineCount = 2;
+constexpr float kHoverCardCursorOffset = 18.0f;
+constexpr float kHoverCardPadding = 7.0f;
+constexpr float kHoverCardViewportPadding = 8.0f;
+constexpr float kHoverCardHintGap = 18.0f;
+constexpr const char* kHoverCardDetailsHint = "Alt: ...";
 constexpr float kCaptureOverlayLeftPadding = 16.0f;
 constexpr float kCaptureOverlayBottomPadding = 16.0f;
 constexpr float kStatusOverlayRightPadding = kOverlayRightPadding;
@@ -305,6 +310,7 @@ constexpr helper_plane_option kHelperPlaneOptions[] = {
 };
 
 hover_state g_hover{};
+hover_state g_selection{};
 bool g_hover_pick_pending = false;
 bool g_imgui_mouse_capture_active = false;
 bool g_keyboard_camera_input_active = false;
@@ -2150,13 +2156,13 @@ const char* hover_primitive_label(hover_primitive_kind kind) {
     }
 }
 
-rtvdb::viewer_backend::hover_highlight hover_backend_highlight() {
+rtvdb::viewer_backend::hover_highlight pick_backend_highlight(const hover_state &state) {
     rtvdb::viewer_backend::hover_highlight highlight{};
-    if (!g_hover.has_hit) {
+    if (!state.has_hit) {
         return highlight;
     }
 
-    switch (g_hover.primitive_kind) {
+    switch (state.primitive_kind) {
     case hover_primitive_kind::triangle:
         highlight.kind = rtvdb::viewer_backend::hover_highlight_kind::triangle;
         break;
@@ -2167,31 +2173,36 @@ rtvdb::viewer_backend::hover_highlight hover_backend_highlight() {
         highlight.kind = rtvdb::viewer_backend::hover_highlight_kind::line;
         break;
     }
-    highlight.primitive_index = static_cast<std::uint32_t>(g_hover.primitive_index);
+    highlight.primitive_index = static_cast<std::uint32_t>(state.primitive_index);
     return highlight;
 }
 
-rtvdb::rgba hover_primitive_color() {
-    switch (g_hover.primitive_kind) {
+rtvdb::viewer_backend::selection_highlight selection_backend_highlight(const hover_state &state) {
+    const rtvdb::viewer_backend::hover_highlight hover = pick_backend_highlight(state);
+    return {hover.kind, hover.primitive_index};
+}
+
+rtvdb::rgba pick_primitive_color(const hover_state &state) {
+    switch (state.primitive_kind) {
     case hover_primitive_kind::triangle:
-        return g_hover.triangle.color;
+        return state.triangle.color;
     case hover_primitive_kind::point:
-        return g_hover.point.color;
+        return state.point.color;
     case hover_primitive_kind::line:
-        return g_hover.line.color;
+        return state.line.color;
     default:
         return {};
     }
 }
 
-std::uint32_t hover_primitive_user_data() {
-    switch (g_hover.primitive_kind) {
+std::uint32_t pick_primitive_user_data(const hover_state &state) {
+    switch (state.primitive_kind) {
     case hover_primitive_kind::triangle:
-        return g_hover.triangle.user_data;
+        return state.triangle.user_data;
     case hover_primitive_kind::point:
-        return g_hover.point.user_data;
+        return state.point.user_data;
     case hover_primitive_kind::line:
-        return g_hover.line.user_data;
+        return state.line.user_data;
     default:
         return 0;
     }
@@ -2221,19 +2232,34 @@ void append_hover_user_data_lines(std::vector<std::string> &lines, std::uint32_t
     lines.emplace_back(buffer);
 }
 
-const std::string &hover_primitive_layer() {
-    switch (g_hover.primitive_kind) {
+const std::string &pick_primitive_layer(const hover_state &state) {
+    switch (state.primitive_kind) {
     case hover_primitive_kind::triangle:
-        return g_hover.triangle.layer;
+        return state.triangle.layer;
     case hover_primitive_kind::point:
-        return g_hover.point.layer;
+        return state.point.layer;
     case hover_primitive_kind::line:
-        return g_hover.line.layer;
+        return state.line.layer;
     default: {
         static const std::string empty_layer;
         return empty_layer;
     }
     }
+}
+
+void clear_selection_state() {
+    g_selection = {};
+    rtvdb::viewer_backend::set_selection_highlight({});
+}
+
+void select_hovered_primitive() {
+    if (!g_hover.has_hit) {
+        clear_selection_state();
+        return;
+    }
+    g_selection = g_hover;
+    g_selection.mouse_valid = false;
+    rtvdb::viewer_backend::set_selection_highlight(selection_backend_highlight(g_selection));
 }
 
 rtvdb::vec3 rotate_about_axis(const rtvdb::vec3 &v, const rtvdb::vec3 &axis, float radians) {
@@ -2406,134 +2432,251 @@ void current_render_size(int* out_width, int* out_height) {
     }
 }
 
-std::vector<std::string> build_hover_overlay_lines() {
+std::vector<std::string> build_full_pick_overlay_lines(const hover_state &state, bool selection) {
     std::vector<std::string> lines;
-    if (!g_hover.has_frame) {
+    if (!state.has_hit) {
         return lines;
     }
 
     char buffer[256]{};
-    std::snprintf(buffer, sizeof(buffer), "Mouse: %4d, %4d", g_hover.mouse_x, g_hover.mouse_y);
-    lines.emplace_back(buffer);
-    if (g_hover.has_hit) {
-        const rtvdb::rgba color = hover_primitive_color();
-        std::snprintf(buffer, sizeof(buffer), "Kind:  %8s", hover_primitive_label(g_hover.primitive_kind));
-        lines.emplace_back(buffer);
-        std::snprintf(buffer, sizeof(buffer), "Idx:   %8llu", static_cast<unsigned long long>(g_hover.primitive_index));
-        lines.emplace_back(buffer);
-        std::snprintf(buffer, sizeof(buffer), "Dist:  %8.4f", g_hover.distance);
-        lines.emplace_back(buffer);
-        std::snprintf(
-            buffer,
-            sizeof(buffer),
-            "Hit:   %8.3f %8.3f %8.3f",
-            g_hover.hit_position.x,
-            g_hover.hit_position.y,
-            g_hover.hit_position.z);
-        lines.emplace_back(buffer);
-        if (g_hover.has_normal) {
-            std::snprintf(
-                buffer,
-                sizeof(buffer),
-                "N:     %8.3f %8.3f %8.3f",
-                g_hover.normal.x,
-                g_hover.normal.y,
-                g_hover.normal.z);
-            lines.emplace_back(buffer);
-        } else {
-            lines.emplace_back("N:            -        -        -");
-        }
-        std::snprintf(
-            buffer,
-            sizeof(buffer),
-            "Color: %8.3f %8.3f %8.3f %8.3f",
-            color.r,
-            color.g,
-            color.b,
-            color.a
-        );
-        lines.emplace_back(buffer);
-        switch (g_hover.primitive_kind) {
-        case hover_primitive_kind::triangle:
-            std::snprintf(
-                buffer,
-                sizeof(buffer),
-                "A:     %8.3f %8.3f %8.3f",
-                g_hover.triangle.a.x,
-                g_hover.triangle.a.y,
-                g_hover.triangle.a.z);
-            lines.emplace_back(buffer);
-            std::snprintf(
-                buffer,
-                sizeof(buffer),
-                "B:     %8.3f %8.3f %8.3f",
-                g_hover.triangle.b.x,
-                g_hover.triangle.b.y,
-                g_hover.triangle.b.z);
-            lines.emplace_back(buffer);
-            std::snprintf(
-                buffer,
-                sizeof(buffer),
-                "C:     %8.3f %8.3f %8.3f",
-                g_hover.triangle.c.x,
-                g_hover.triangle.c.y,
-                g_hover.triangle.c.z);
-            lines.emplace_back(buffer);
-            break;
-        case hover_primitive_kind::point:
-            std::snprintf(
-                buffer,
-                sizeof(buffer),
-                "Pos:   %8.3f %8.3f %8.3f",
-                g_hover.point.position.x,
-                g_hover.point.position.y,
-                g_hover.point.position.z);
-            lines.emplace_back(buffer);
-            std::snprintf(buffer, sizeof(buffer), "Rad:   %8.4f", g_hover.point.radius);
-            lines.emplace_back(buffer);
-            break;
-        case hover_primitive_kind::line:
-            std::snprintf(
-                buffer,
-                sizeof(buffer),
-                "A:     %8.3f %8.3f %8.3f",
-                g_hover.line.a.x,
-                g_hover.line.a.y,
-                g_hover.line.a.z);
-            lines.emplace_back(buffer);
-            std::snprintf(
-                buffer,
-                sizeof(buffer),
-                "B:     %8.3f %8.3f %8.3f",
-                g_hover.line.b.x,
-                g_hover.line.b.y,
-                g_hover.line.b.z);
-            lines.emplace_back(buffer);
-            std::snprintf(buffer, sizeof(buffer), "Rad:   %8.4f", g_hover.line.radius);
-            lines.emplace_back(buffer);
-            break;
-        }
-        append_hover_user_data_lines(lines, hover_primitive_user_data());
+    if (selection) {
+        lines.emplace_back("Selected");
     } else {
-        lines.emplace_back("Kind:         -");
-        lines.emplace_back("Idx:          -");
-        lines.emplace_back("Dist:         -");
-        lines.emplace_back("Hit:          -        -        -");
-        lines.emplace_back("N:            -        -        -");
-        lines.emplace_back("Color:        -        -        -        -");
-        lines.emplace_back("A:            -        -        -");
-        lines.emplace_back("B:            -        -        -");
-        lines.emplace_back("C/Rad:        -");
-        lines.emplace_back("User i32: -");
-        lines.emplace_back("     u32: -");
-        lines.emplace_back("     f32: -");
-        lines.emplace_back("     hex: -");
+        std::snprintf(buffer, sizeof(buffer), "Mouse: %4d, %4d", state.mouse_x, state.mouse_y);
+        lines.emplace_back(buffer);
     }
+    const rtvdb::rgba color = pick_primitive_color(state);
+    std::snprintf(buffer, sizeof(buffer), "Kind:  %8s", hover_primitive_label(state.primitive_kind));
+    lines.emplace_back(buffer);
+    std::snprintf(buffer, sizeof(buffer), "Idx:   %8llu", static_cast<unsigned long long>(state.primitive_index));
+    lines.emplace_back(buffer);
+    if (!selection) {
+        std::snprintf(buffer, sizeof(buffer), "Dist:  %8.4f", state.distance);
+        lines.emplace_back(buffer);
+    }
+    std::snprintf(
+        buffer,
+        sizeof(buffer),
+        "Hit:   %8.3f %8.3f %8.3f",
+        state.hit_position.x,
+        state.hit_position.y,
+        state.hit_position.z);
+    lines.emplace_back(buffer);
+    if (state.has_normal) {
+        std::snprintf(
+            buffer,
+            sizeof(buffer),
+            "N:     %8.3f %8.3f %8.3f",
+            state.normal.x,
+            state.normal.y,
+            state.normal.z);
+        lines.emplace_back(buffer);
+    } else {
+        lines.emplace_back("N:            -        -        -");
+    }
+    std::snprintf(
+        buffer,
+        sizeof(buffer),
+        "Color: %8.3f %8.3f %8.3f %8.3f",
+        color.r,
+        color.g,
+        color.b,
+        color.a
+    );
+    lines.emplace_back(buffer);
+    switch (state.primitive_kind) {
+    case hover_primitive_kind::triangle:
+        std::snprintf(
+            buffer,
+            sizeof(buffer),
+            "A:     %8.3f %8.3f %8.3f",
+            state.triangle.a.x,
+            state.triangle.a.y,
+            state.triangle.a.z);
+        lines.emplace_back(buffer);
+        std::snprintf(
+            buffer,
+            sizeof(buffer),
+            "B:     %8.3f %8.3f %8.3f",
+            state.triangle.b.x,
+            state.triangle.b.y,
+            state.triangle.b.z);
+        lines.emplace_back(buffer);
+        std::snprintf(
+            buffer,
+            sizeof(buffer),
+            "C:     %8.3f %8.3f %8.3f",
+            state.triangle.c.x,
+            state.triangle.c.y,
+            state.triangle.c.z);
+        lines.emplace_back(buffer);
+        break;
+    case hover_primitive_kind::point:
+        std::snprintf(
+            buffer,
+            sizeof(buffer),
+            "Pos:   %8.3f %8.3f %8.3f",
+            state.point.position.x,
+            state.point.position.y,
+            state.point.position.z);
+        lines.emplace_back(buffer);
+        std::snprintf(buffer, sizeof(buffer), "Rad:   %8.4f", state.point.radius);
+        lines.emplace_back(buffer);
+        break;
+    case hover_primitive_kind::line:
+        std::snprintf(
+            buffer,
+            sizeof(buffer),
+            "A:     %8.3f %8.3f %8.3f",
+            state.line.a.x,
+            state.line.a.y,
+            state.line.a.z);
+        lines.emplace_back(buffer);
+        std::snprintf(
+            buffer,
+            sizeof(buffer),
+            "B:     %8.3f %8.3f %8.3f",
+            state.line.b.x,
+            state.line.b.y,
+            state.line.b.z);
+        lines.emplace_back(buffer);
+        std::snprintf(buffer, sizeof(buffer), "Rad:   %8.4f", state.line.radius);
+        lines.emplace_back(buffer);
+        break;
+    }
+    append_hover_user_data_lines(lines, pick_primitive_user_data(state));
     return lines;
 }
 
-float draw_hover_overlay() {
-    const std::vector<std::string> lines = build_hover_overlay_lines();
+std::vector<std::string> build_compact_hover_overlay_lines() {
+    std::vector<std::string> lines;
+    if (!g_hover.has_hit) {
+        return lines;
+    }
+    char buffer[256]{};
+    std::snprintf(
+        buffer,
+        sizeof(buffer),
+        "%s #%llu",
+        hover_primitive_label(g_hover.primitive_kind),
+        static_cast<unsigned long long>(g_hover.primitive_index));
+    lines.emplace_back(buffer);
+    lines.emplace_back("Layer: " + pick_primitive_layer(g_hover));
+    std::snprintf(
+        buffer,
+        sizeof(buffer),
+        "Hit: %.3f  %.3f  %.3f",
+        g_hover.hit_position.x,
+        g_hover.hit_position.y,
+        g_hover.hit_position.z);
+    lines.emplace_back(buffer);
+    const std::uint32_t user_data = pick_primitive_user_data(g_hover);
+    std::snprintf(buffer, sizeof(buffer), "User: %u / 0x%08x", user_data, user_data);
+    lines.emplace_back(buffer);
+    return lines;
+}
+
+ImVec2 hover_card_text_position(float text_width, float text_height) {
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    const ImVec2 mouse = ImGui::GetIO().MousePos;
+    const float card_width = text_width + kHoverCardPadding * 2.0f;
+    const float card_height = text_height + kHoverCardPadding * 2.0f;
+    const float viewport_right = viewport->WorkPos.x + viewport->WorkSize.x;
+    const float viewport_bottom = viewport->WorkPos.y + viewport->WorkSize.y;
+    float card_x = mouse.x + kHoverCardCursorOffset;
+    float card_y = mouse.y + kHoverCardCursorOffset;
+    if (card_x + card_width > viewport_right - kHoverCardViewportPadding) {
+        card_x = mouse.x - kHoverCardCursorOffset - card_width;
+    }
+    if (card_y + card_height > viewport_bottom - kHoverCardViewportPadding) {
+        card_y = mouse.y - kHoverCardCursorOffset - card_height;
+    }
+    card_x = std::clamp(
+        card_x,
+        viewport->WorkPos.x + kHoverCardViewportPadding,
+        (std::max)(
+            viewport->WorkPos.x + kHoverCardViewportPadding,
+            viewport_right - card_width - kHoverCardViewportPadding));
+    card_y = std::clamp(
+        card_y,
+        viewport->WorkPos.y + kHoverCardViewportPadding,
+        (std::max)(
+            viewport->WorkPos.y + kHoverCardViewportPadding,
+            viewport_bottom - card_height - kHoverCardViewportPadding));
+    return ImVec2(card_x + kHoverCardPadding, card_y + kHoverCardPadding);
+}
+
+void draw_overlay_background(ImDrawList* draw_list, const ImVec2 &text_position, float width, float height) {
+    const ImVec2 min(text_position.x - kHoverCardPadding, text_position.y - kHoverCardPadding);
+    const ImVec2 max(text_position.x + width + kHoverCardPadding, text_position.y + height + kHoverCardPadding);
+    draw_list->AddRectFilled(min, max, IM_COL32(18, 18, 18, 220), 4.0f);
+    draw_list->AddRect(min, max, IM_COL32(255, 255, 255, 72), 4.0f);
+}
+
+void draw_compact_hover_overlay() {
+    const std::vector<std::string> lines = build_compact_hover_overlay_lines();
+    if (lines.empty()) {
+        return;
+    }
+
+    ImDrawList* draw_list = ImGui::GetForegroundDrawList();
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    const float line_height = ImGui::GetTextLineHeightWithSpacing();
+    float overlay_width = 0.0f;
+    for (const std::string &line : lines) {
+        overlay_width = (std::max)(overlay_width, ImGui::CalcTextSize(line.c_str()).x);
+    }
+    const float details_hint_width = ImGui::CalcTextSize(kHoverCardDetailsHint).x;
+    overlay_width = (std::max)(
+        overlay_width,
+        ImGui::CalcTextSize(lines.front().c_str()).x + kHoverCardHintGap + details_hint_width);
+    overlay_width = (std::min)(
+        overlay_width,
+        (std::max)(0.0f, viewport->WorkSize.x - (kHoverCardViewportPadding + kHoverCardPadding) * 2.0f));
+    const float overlay_height = line_height * static_cast<float>(lines.size());
+    const ImVec2 position = hover_card_text_position(overlay_width, overlay_height);
+    draw_overlay_background(draw_list, position, overlay_width, overlay_height);
+    const ImU32 shadow_color = IM_COL32(0, 0, 0, 200);
+    const ImU32 text_color = IM_COL32(255, 255, 255, 255);
+    const ImVec4 clip_rect(position.x, position.y, position.x + overlay_width, position.y + overlay_height);
+    for (std::size_t index = 0; index < lines.size(); ++index) {
+        const ImVec2 line_position(position.x, position.y + static_cast<float>(index) * line_height);
+        draw_list->AddText(
+            nullptr,
+            0.0f,
+            ImVec2(line_position.x + 1.0f, line_position.y + 1.0f),
+            shadow_color,
+            lines[index].c_str(),
+            nullptr,
+            0.0f,
+            &clip_rect);
+        draw_list->AddText(nullptr, 0.0f, line_position, text_color, lines[index].c_str(), nullptr, 0.0f, &clip_rect);
+        if (index == 0) {
+            const ImVec2 hint_position(position.x + overlay_width - details_hint_width, line_position.y);
+            draw_list->AddText(
+                nullptr,
+                0.0f,
+                ImVec2(hint_position.x + 1.0f, hint_position.y + 1.0f),
+                shadow_color,
+                kHoverCardDetailsHint,
+                nullptr,
+                0.0f,
+                &clip_rect);
+            draw_list->AddText(
+                nullptr,
+                0.0f,
+                hint_position,
+                text_color,
+                kHoverCardDetailsHint,
+                nullptr,
+                0.0f,
+                &clip_rect);
+        }
+    }
+}
+
+float draw_full_pick_overlay(const hover_state &state, bool selection, bool near_cursor) {
+    const std::vector<std::string> lines = build_full_pick_overlay_lines(state, selection);
     if (lines.empty()) {
         return 0.0f;
     }
@@ -2545,10 +2688,16 @@ float draw_hover_overlay() {
     for (const std::string &line : lines) {
         overlay_width = (std::max)(overlay_width, ImGui::CalcTextSize(line.c_str()).x);
     }
-    ImVec2 position(
-        viewport->WorkPos.x + viewport->WorkSize.x - kOverlayRightPadding - overlay_width,
-        viewport->WorkPos.y + kHoverOverlayPadding
-    );
+    const std::size_t display_line_count = lines.size() + kHoverLayerDisplayLineCount;
+    const float overlay_height = line_height * static_cast<float>(display_line_count);
+    const ImVec2 position = near_cursor
+        ? hover_card_text_position(overlay_width, overlay_height)
+        : ImVec2(
+            viewport->WorkPos.x + viewport->WorkSize.x - kOverlayRightPadding - overlay_width,
+            viewport->WorkPos.y + kHoverOverlayPadding);
+    if (near_cursor) {
+        draw_overlay_background(draw_list, position, overlay_width, overlay_height);
+    }
     const ImU32 shadow_color = IM_COL32(0, 0, 0, 200);
     const ImU32 text_color = IM_COL32(255, 255, 255, 255);
     const auto draw_text = [&](const ImVec2 &text_position, const char* text) {
@@ -2563,7 +2712,7 @@ float draw_hover_overlay() {
     }
 
     std::string layer_line = "Layer: ";
-    layer_line += g_hover.has_hit ? hover_primitive_layer() : "-";
+    layer_line += pick_primitive_layer(state);
     const ImVec2 layer_position(
         position.x,
         position.y + static_cast<float>(display_line_index) * line_height);
@@ -2612,6 +2761,21 @@ float draw_hover_overlay() {
     }
 
     return position.y + static_cast<float>(display_line_index) * line_height;
+}
+
+void draw_hover_overlay() {
+    if (!g_hover.has_hit) {
+        return;
+    }
+    if (ImGui::GetIO().KeyAlt) {
+        draw_full_pick_overlay(g_hover, false, true);
+        return;
+    }
+    draw_compact_hover_overlay();
+}
+
+float draw_selection_overlay() {
+    return draw_full_pick_overlay(g_selection, true, false);
 }
 
 constexpr float kStatusDetailsValueColumn = 220.0f;
@@ -2808,7 +2972,7 @@ bool begin_status_tree_group(const char* label, bool* open_state) {
 
 void draw_status_overlay(
     const rtvdb::viewer_backend::scene_build_info &build_info,
-    float hover_overlay_bottom)
+    float selection_overlay_bottom)
 {
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     if (viewport == nullptr) {
@@ -2817,10 +2981,10 @@ void draw_status_overlay(
 
     const float status_bottom = viewport->WorkPos.y + viewport->WorkSize.y - kStatusOverlayBottomPadding;
     float max_status_height = std::numeric_limits<float>::max();
-    if (hover_overlay_bottom > viewport->WorkPos.y) {
+    if (selection_overlay_bottom > viewport->WorkPos.y) {
         max_status_height = (std::max)(
             1.0f,
-            status_bottom - hover_overlay_bottom - kStatusOverlayCollisionGap);
+            status_bottom - selection_overlay_bottom - kStatusOverlayCollisionGap);
     }
     ImGui::SetNextWindowPos(
         ImVec2(
@@ -3661,9 +3825,17 @@ void enable_auto_frame() {
 
 void reset_view_for_new_connection(std::uint64_t connection_serial) {
     stop_camera_animation();
-    g_camera_override.active = false;
-    clear_camera_focus();
+    g_camera_override = {};
+    g_camera_focus = {};
+    g_camera_animation = {};
+    g_camera_control_mode = camera_control_mode::orbit;
+    g_camera_speed_log10 = 0.0f;
+    g_keyboard_camera_input_active = false;
+    g_last_keyboard_navigation_tick = {};
+    g_drag = {};
     g_hover = {};
+    clear_selection_state();
+    g_hover_pick_pending = false;
     ++g_view_revision;
     g_pending_auto_frame_connection_serial = connection_serial;
     rtvdb::viewer_backend::set_auto_frame_enabled(true);
@@ -4199,7 +4371,7 @@ void update_hover_state() {
         g_hover.has_hit = false;
         break;
     }
-    rtvdb::viewer_backend::set_hover_highlight(hover_backend_highlight());
+    rtvdb::viewer_backend::set_hover_highlight(pick_backend_highlight(g_hover));
     rtvdb::viewer_shell::request_repaint();
 }
 
@@ -5835,6 +6007,7 @@ void on_frame_ready(const rtvdb::viewer_backend::frame_scene* scene, void*) {
     if (g_launch_config.deterministic_benchmark && !has_primitives) {
         return;
     }
+    clear_selection_state();
     bool force_connection_auto_frame = false;
     bool requires_layer_filter = false;
     {
@@ -6046,11 +6219,16 @@ void on_mouse_button_down(rtvdb::viewer_shell::mouse_button button, int x, int y
 
 void on_mouse_button_up(rtvdb::viewer_shell::mouse_button button, int, int, void*) {
     bool changed = false;
+    bool selection_changed = false;
     switch (button) {
     case rtvdb::viewer_shell::mouse_button::left:
-        if (g_drag.left_pressed && !g_drag.orbiting && g_drag.focus_double_click_armed) {
-            focus_camera_on_hovered_primitive();
-            request_camera_repaint();
+        if (g_drag.left_pressed && !g_drag.orbiting && !g_imgui_mouse_capture_active) {
+            select_hovered_primitive();
+            selection_changed = true;
+            if (g_drag.focus_double_click_armed) {
+                focus_camera_on_hovered_primitive();
+                request_camera_repaint();
+            }
         }
         changed = g_drag.orbiting;
         g_drag.left_pressed = false;
@@ -6068,6 +6246,9 @@ void on_mouse_button_up(rtvdb::viewer_shell::mouse_button button, int, int, void
     if (changed) {
         update_hover_state();
         request_present_refresh();
+    }
+    if (selection_changed) {
+        rtvdb::viewer_shell::request_repaint();
     }
 }
 
@@ -6088,8 +6269,9 @@ void on_ui(void*) {
     rtvdb::viewer_session::copy_recent_logs(&g_recent_session_logs);
     rtvdb::viewer_backend::scene_build_info build_info{};
     rtvdb::viewer_backend::copy_present_build_info(&build_info);
-    const float hover_overlay_bottom = draw_hover_overlay();
-    draw_status_overlay(build_info, hover_overlay_bottom);
+    draw_hover_overlay();
+    const float selection_overlay_bottom = draw_selection_overlay();
+    draw_status_overlay(build_info, selection_overlay_bottom);
     g_frame_pacing.paint_callback_completed_since_ui = false;
 
     const float window_height = g_viewer_window_height > 0.0f
@@ -6132,7 +6314,7 @@ void on_ui(void*) {
         keyboard_move_speed = current_keyboard_move_speed(effective_camera);
     }
     ImGui::Text("T/G speed (%.3f)", keyboard_move_speed);
-    ImGui::Text("Double-click: focus");
+    ImGui::Text("Click: select, Double-click: focus");
     ImGui::Separator();
 
     bool log_tab_selected = false;
@@ -6238,6 +6420,7 @@ void on_ui(void*) {
                     if (visibility_changed) {
                         clear_camera_focus();
                         g_hover = {};
+                        clear_selection_state();
                         schedule_layer_rebuild();
                     }
                 }

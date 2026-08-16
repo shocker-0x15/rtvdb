@@ -220,6 +220,11 @@ struct hover_highlight {
     std::uint32_t primitive_index = 0;
 };
 
+struct selection_highlight {
+    hover_highlight_kind kind = hover_highlight_kind::none;
+    std::uint32_t primitive_index = 0;
+};
+
 struct pick_result {
     hover_highlight_kind kind = hover_highlight_kind::none;
     std::uint32_t primitive_index = 0;
@@ -290,6 +295,8 @@ void set_display_mode(display_mode mode);
 bool get_display_mode(display_mode* out_mode);
 void set_hover_highlight(const hover_highlight &highlight);
 bool get_hover_highlight(hover_highlight* out_highlight);
+void set_selection_highlight(const selection_highlight &highlight);
+bool get_selection_highlight(selection_highlight* out_highlight);
 bool pick(
     int width,
     int height,

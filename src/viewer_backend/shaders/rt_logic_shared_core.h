@@ -224,12 +224,33 @@ float4 apply_hover_highlight(
     }
 
     const float luminance = dot(color.rgb, float3(0.299, 0.587, 0.114));
-    const float3 complement = 1.0 - color.rgb;
-    const float3 bias = luminance >= 0.45
-        ? float3(0.15, 0.15, 0.15)
-        : float3(0.35, 0.35, 0.35);
-    const float3 target = clamp(complement + bias, 0.0, 1.0);
+    const float3 target = luminance >= 0.5
+        ? float3(0.08, 0.08, 0.08)
+        : float3(0.95, 0.95, 0.95);
     color.rgb = color.rgb + (target - color.rgb) * clamp(hover_mix, 0.0, 1.0);
+    return color;
+}
+
+float4 apply_selection_highlight(
+    float4 color,
+    uint32_t primitive_kind,
+    uint32_t primitive_index,
+    uint32_t selection_kind,
+    uint32_t selection_primitive_index)
+{
+    if (selection_kind == 0u ||
+        primitive_kind != selection_kind ||
+        primitive_index != selection_primitive_index)
+    {
+        return color;
+    }
+
+    const float3 amber = float3(1.0, 0.55, 0.08);
+    const float3 cyan = float3(0.05, 0.85, 1.0);
+    const float amber_distance = dot(abs(color.rgb - amber), float3(1.0, 1.0, 1.0));
+    const float cyan_distance = dot(abs(color.rgb - cyan), float3(1.0, 1.0, 1.0));
+    const float3 target = amber_distance >= cyan_distance ? amber : cyan;
+    color.rgb = color.rgb + (target - color.rgb) * 0.85;
     return color;
 }
 

@@ -122,6 +122,37 @@ float scene_length_sq_epsilon(constant viewer_constants_gpu &view) {
     return core::scene_length_sq_epsilon(scene_scale(view));
 }
 
+float4 apply_highlights(
+    float4 color,
+    uint primitive_kind,
+    uint primitive_index,
+    constant viewer_constants_gpu &view,
+    bool allow_hover)
+{
+    if (view.pick_and_flags.w != 0u &&
+        primitive_kind == view.pick_and_flags.w &&
+        primitive_index == view.pick_params.w)
+    {
+        return core::apply_selection_highlight(
+            color,
+            primitive_kind,
+            primitive_index,
+            view.pick_and_flags.w,
+            view.pick_params.w);
+    }
+    if (!allow_hover)
+    {
+        return color;
+    }
+    return core::apply_hover_highlight(
+        color,
+        primitive_kind,
+        primitive_index,
+        view.projection_modes.z,
+        view.projection_modes.w,
+        view.blend_and_jitter.w);
+}
+
 bool resolve_local_primitive(
     geometry_metadata_gpu metadata,
     uint native_primitive_index,
@@ -214,7 +245,8 @@ float3 transform_normal_to_world_space(float3 object_normal, float4x3 world_to_o
 
 float4 shade_hit(const thread hit_info &hit, constant viewer_constants_gpu &view) {
     float4 color = hit.color;
-    if ((hit.flags & kLineFlagFixedColor) == 0u) {
+    const bool allow_hover = (hit.flags & kLineFlagFixedColor) == 0u;
+    if (allow_hover) {
         const uint primitive_seed = hit.kind == kInstanceKindTriangle
             ? hit.primitive_id
             : hit.kind == kInstanceKindPoint
@@ -227,15 +259,8 @@ float4 shade_hit(const thread hit_info &hit, constant viewer_constants_gpu &view
             hit.geometry_index,
             hit.instance_index,
             view_display_mode(view));
-        color = core::apply_hover_highlight(
-            color,
-            hit.kind + 1u,
-            hit.primitive_id,
-            view.projection_modes.z,
-            view.projection_modes.w,
-            view.blend_and_jitter.w);
     }
-    return color;
+    return apply_highlights(color, hit.kind + 1u, hit.primitive_id, view, allow_hover);
 }
 
 hit_info trace_nearest_hit(

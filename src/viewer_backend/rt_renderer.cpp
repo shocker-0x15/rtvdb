@@ -1775,6 +1775,10 @@ bool rt_pick_dispatch_request_matches_scene_and_view(
     right_constants.hover_highlight_kind = 0;
     left_constants.hover_primitive_index = 0;
     right_constants.hover_primitive_index = 0;
+    left_constants.selection_highlight_kind = 0;
+    right_constants.selection_highlight_kind = 0;
+    left_constants.selection_primitive_index = 0;
+    right_constants.selection_primitive_index = 0;
     left_constants.pick_pixel_x = 0;
     left_constants.pick_pixel_y = 0;
     right_constants.pick_pixel_x = 0;
