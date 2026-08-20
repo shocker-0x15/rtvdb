@@ -29,6 +29,7 @@ struct viewer_constants_gpu {
     float4 blend_and_jitter;
     uint4 pick_and_flags;
     uint4 pick_params;
+    float4 render_scale;
 };
 
 struct point_gpu {
@@ -66,7 +67,7 @@ struct hit_info {
 };
 
 static_assert(sizeof(geometry_metadata_gpu) == 16);
-static_assert(sizeof(viewer_constants_gpu) == 208);
+static_assert(sizeof(viewer_constants_gpu) == 224);
 static_assert(sizeof(point_gpu) == 32);
 static_assert(sizeof(line_gpu) == 64);
 static_assert(sizeof(pick_result_gpu) == 16);
@@ -99,6 +100,10 @@ uint view_accumulation_sample_index(constant viewer_constants_gpu &view) {
     return view.size_and_mode.w;
 }
 
+float2 view_render_scale(constant viewer_constants_gpu &view) {
+    return view.render_scale.xy;
+}
+
 uint view_scene_bounds_valid(constant viewer_constants_gpu &view) {
     return view.scene_bounds_max.w != 0.0f ? 1u : 0u;
 }
@@ -127,25 +132,31 @@ float4 apply_highlights(
     uint primitive_kind,
     uint primitive_index,
     constant viewer_constants_gpu &view,
-    bool allow_hover)
+    bool allow_hover,
+    uint2 pixel)
 {
+    float4 highlighted = color;
     if (view.pick_and_flags.w != 0u &&
         primitive_kind == view.pick_and_flags.w &&
         primitive_index == view.pick_params.w)
     {
-        return core::apply_selection_highlight(
-            color,
+        highlighted = core::apply_selection_highlight(
+            highlighted,
             primitive_kind,
             primitive_index,
             view.pick_and_flags.w,
-            view.pick_params.w);
+            view.pick_params.w,
+            pixel.x,
+            pixel.y,
+            view_render_scale(view).x,
+            view_render_scale(view).y);
     }
     if (!allow_hover)
     {
-        return color;
+        return highlighted;
     }
     return core::apply_hover_highlight(
-        color,
+        highlighted,
         primitive_kind,
         primitive_index,
         view.projection_modes.z,
@@ -243,7 +254,7 @@ float3 transform_normal_to_world_space(float3 object_normal, float4x3 world_to_o
     return normalize(normal_transform * object_normal);
 }
 
-float4 shade_hit(const thread hit_info &hit, constant viewer_constants_gpu &view) {
+float4 shade_hit(const thread hit_info &hit, constant viewer_constants_gpu &view, uint2 pixel) {
     float4 color = hit.color;
     const bool allow_hover = (hit.flags & kLineFlagFixedColor) == 0u;
     if (allow_hover) {
@@ -260,7 +271,7 @@ float4 shade_hit(const thread hit_info &hit, constant viewer_constants_gpu &view
             hit.instance_index,
             view_display_mode(view));
     }
-    return apply_highlights(color, hit.kind + 1u, hit.primitive_id, view, allow_hover);
+    return apply_highlights(color, hit.kind + 1u, hit.primitive_id, view, allow_hover, pixel);
 }
 
 hit_info trace_nearest_hit(
@@ -547,7 +558,7 @@ kernel void rtvdb_trace_kernel(
             break;
         }
 
-        const float4 shaded = shade_hit(hit, view);
+        const float4 shaded = shade_hit(hit, view, tid);
         const float alpha = clamp(shaded.a, 0.0f, 1.0f);
         if (alpha >= kAlphaOpaqueThreshold) {
             accumulated_color += throughput * shaded.rgb;

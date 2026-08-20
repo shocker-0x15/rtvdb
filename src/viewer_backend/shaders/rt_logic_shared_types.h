@@ -117,22 +117,24 @@ struct ViewerConstants
     float4 blend_and_jitter;
     uint4 pick_and_flags;
     uint4 pick_params;
+    float4 render_scale;
 };
 
-struct SharedPointPrimitive
+struct PointPrimitive
 {
-    float3 position;
-    float radius;
+    float4 position_radius;
     float4 color;
 };
 
-struct SharedLinePrimitive
+struct LinePrimitive
 {
-    float3 a;
-    float radius;
-    float3 b;
+    float4 a_radius;
+    float4 b_pad;
     float4 color;
     uint32_t flags;
+    float pad0;
+    float pad1;
+    float pad2;
 };
 
 struct ProceduralAttributes

@@ -519,6 +519,7 @@ private:
 
     bool initialized_ = false;
     bool hardware_raytracing_ = false;
+    std::string gpu_name_;
     metal_timestamp_mode timestamp_mode_ = metal_timestamp_mode::unsupported;
     bool owns_device_ = false;
     bool owns_command_queue_ = false;
@@ -553,6 +554,7 @@ rt_rhi_device_info metal_rhi_device::info() const {
     return {
         rt_rhi_backend_kind::metal_rt,
         "metal_rt",
+        gpu_name_.c_str(),
         hardware_raytracing_,
     };
 }
@@ -834,6 +836,7 @@ void metal_rhi_device::release_native_objects() {
     owns_command_queue_ = false;
     owns_device_ = false;
     initialized_ = false;
+    gpu_name_.clear();
     hardware_raytracing_ = false;
     timestamp_mode_ = metal_timestamp_mode::unsupported;
     next_encoder_id_ = 1;
@@ -880,6 +883,8 @@ bool metal_rhi_device::initialize(
         return false;
     }
     device_ = requested_device;
+    const char* const device_name = device_.name.UTF8String;
+    gpu_name_ = device_name != nullptr ? device_name : "Unknown GPU";
     if (!metal_device_supports_raytracing(device_)) {
         if (out_error != nullptr) {
             out_error->detail = "Metal RHI device does not support ray tracing";

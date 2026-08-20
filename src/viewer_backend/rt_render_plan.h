@@ -99,6 +99,8 @@ struct rt_viewer_constants {
     float projection_from[2]{};
     float projection_to[2]{};
     float accumulation_jitter[2]{};
+    float render_scale_x = 1.0f;
+    float render_scale_y = 1.0f;
     float aspect = 1.0f;
     float projection_blend_t = 1.0f;
     float hover_highlight_mix = 0.85f;
@@ -137,9 +139,10 @@ struct rt_viewer_constants_gpu {
     float blend_and_jitter[4]{};
     std::uint32_t pick_and_flags[4]{};
     std::uint32_t pick_params[4]{};
+    float render_scale[4]{1.0f, 1.0f, 0.0f, 0.0f};
 };
 
-static_assert(sizeof(rt_viewer_constants_gpu) == 208);
+static_assert(sizeof(rt_viewer_constants_gpu) == 224);
 
 rt_viewer_constants make_rt_viewer_constants(
     const frame_scene &scene,
@@ -155,7 +158,9 @@ rt_viewer_constants make_rt_viewer_constants(
     std::uint32_t selection_primitive_index,
     bool is_pick_pass = false,
     int pick_pixel_x = 0,
-    int pick_pixel_y = 0);
+    int pick_pixel_y = 0,
+    float render_scale_x = 1.0f,
+    float render_scale_y = 1.0f);
 rt_viewer_constants_gpu pack_rt_viewer_constants(const rt_viewer_constants &source);
 
 struct rt_accumulation_key {
@@ -168,6 +173,8 @@ struct rt_accumulation_key {
     std::uint32_t hover_primitive_index = 0;
     std::uint32_t selection_highlight_kind = 0;
     std::uint32_t selection_primitive_index = 0;
+    float render_scale_x = 1.0f;
+    float render_scale_y = 1.0f;
     float camera_origin[3]{};
     float camera_target[3]{};
     float camera_up[3]{};
@@ -215,7 +222,9 @@ rt_accumulation_key make_rt_accumulation_key(
     const rt_scene_build &build,
     int width,
     int height,
-    std::uint32_t display_mode);
+    std::uint32_t display_mode,
+    float render_scale_x = 1.0f,
+    float render_scale_y = 1.0f);
 void fill_rt_accumulation_jitter(std::uint32_t sample_index, float out_jitter[2]);
 void fill_rt_projection_parameters(
     const rtvdb::camera &camera,

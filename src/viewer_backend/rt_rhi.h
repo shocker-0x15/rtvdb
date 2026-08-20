@@ -27,6 +27,7 @@ enum class rt_rhi_backend_kind : std::uint8_t {
 struct rt_rhi_device_info {
     rt_rhi_backend_kind kind = rt_rhi_backend_kind::d3d12_dxr;
     const char* name = "";
+    const char* gpu_name = "";
     bool hardware_ray_tracing = false;
 };
 

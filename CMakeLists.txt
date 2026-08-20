@@ -308,6 +308,21 @@ source_group("CMake Files" FILES
 set(SDL_SHARED OFF CACHE BOOL "Build SDL shared library" FORCE)
 set(SDL_STATIC ON CACHE BOOL "Build SDL static library" FORCE)
 set(SDL_TEST_LIBRARY OFF CACHE BOOL "Build SDL test library" FORCE)
+set(SDL_GPU OFF CACHE BOOL "Build SDL GPU subsystem" FORCE)
+set(SDL_RENDER_GPU OFF CACHE BOOL "Build SDL GPU renderer" FORCE)
+if(WIN32)
+    set(SDL_DIRECTX ${RTVDB_ENABLE_D3D12_DXR} CACHE BOOL "Use DirectX for SDL Windows audio/video" FORCE)
+    set(SDL_RENDER_D3D OFF CACHE BOOL "Build SDL D3D renderer" FORCE)
+    set(SDL_RENDER_D3D11 OFF CACHE BOOL "Build SDL D3D11 renderer" FORCE)
+    set(SDL_RENDER_D3D12 ${RTVDB_ENABLE_D3D12_DXR} CACHE BOOL "Build SDL D3D12 renderer" FORCE)
+endif()
+if(RTVDB_ENABLE_VULKAN_RT)
+    set(SDL_VULKAN ON CACHE BOOL "Enable SDL Vulkan support" FORCE)
+    set(SDL_RENDER_VULKAN ON CACHE BOOL "Build SDL Vulkan renderer" FORCE)
+else()
+    set(SDL_VULKAN OFF CACHE BOOL "Enable SDL Vulkan support" FORCE)
+    set(SDL_RENDER_VULKAN OFF CACHE BOOL "Build SDL Vulkan renderer" FORCE)
+endif()
 if((WIN32 AND RTVDB_ENABLE_D3D12_DXR) OR RTVDB_ENABLE_VULKAN_RT)
     include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/apply_sdl_patches.cmake)
 endif()
@@ -419,26 +434,25 @@ target_include_directories(rtvdb_viewer_backend PUBLIC
 if(WIN32 AND RTVDB_ENABLE_D3D12_DXR)
     target_sources(
         rtvdb_viewer_backend PRIVATE
-            ${RTVDB_D3D12_RAYTRACING_HLSL}
-            ${RTVDB_SHADER_SHARED_HEADERS})
+            ${RTVDB_D3D12_RAYTRACING_HLSL})
 endif()
 if(RTVDB_ENABLE_VULKAN_RT)
     target_sources(
         rtvdb_viewer_backend PRIVATE
-            ${RTVDB_VULKAN_RT_HLSL}
-            ${RTVDB_SHADER_SHARED_HEADERS})
+            ${RTVDB_VULKAN_RT_HLSL})
 endif()
-if(WIN32 AND RTVDB_ENABLE_D3D12_DXR)
-    target_include_directories(rtvdb_viewer_backend PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
+if((WIN32 AND RTVDB_ENABLE_D3D12_DXR) OR RTVDB_ENABLE_VULKAN_RT)
+    target_sources(
+        rtvdb_viewer_backend PRIVATE
+            ${RTVDB_SHADER_SHARED_HEADERS})
 endif()
 if(APPLE)
     target_sources(
         rtvdb_viewer_backend PRIVATE
             ${RTVDB_METAL_RT_GENERATED_HEADERS}
             ${RTVDB_METAL_SHADER_SHARED_HEADERS})
-    target_include_directories(rtvdb_viewer_backend PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 endif()
-if(RTVDB_ENABLE_VULKAN_RT)
+if((WIN32 AND RTVDB_ENABLE_D3D12_DXR) OR APPLE OR RTVDB_ENABLE_VULKAN_RT)
     target_include_directories(rtvdb_viewer_backend PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 endif()
 if(WIN32 AND RTVDB_ENABLE_D3D12_DXR)
@@ -447,18 +461,14 @@ endif()
 if(RTVDB_ENABLE_VULKAN_RT)
     target_compile_definitions(rtvdb_viewer_backend PUBLIC RTVDB_ENABLE_VULKAN_RT=1)
 endif()
-if(WIN32)
-    target_link_libraries(rtvdb_viewer_backend PUBLIC dxgi)
-    if(RTVDB_ENABLE_D3D12_DXR)
-        target_link_libraries(rtvdb_viewer_backend PUBLIC d3d12)
-    endif()
-    if(RTVDB_ENABLE_VULKAN_RT)
-        target_link_libraries(rtvdb_viewer_backend PUBLIC Vulkan::Vulkan)
-    endif()
-elseif(APPLE)
-    target_link_libraries(rtvdb_viewer_backend PUBLIC "-framework Metal" "-framework QuartzCore" "-framework Foundation" "-framework AppKit" "-framework CoreVideo")
-elseif(RTVDB_ENABLE_VULKAN_RT)
+if(WIN32 AND RTVDB_ENABLE_D3D12_DXR)
+    target_link_libraries(rtvdb_viewer_backend PUBLIC dxgi d3d12)
+endif()
+if(RTVDB_ENABLE_VULKAN_RT)
     target_link_libraries(rtvdb_viewer_backend PUBLIC Vulkan::Vulkan)
+endif()
+if(APPLE)
+    target_link_libraries(rtvdb_viewer_backend PUBLIC "-framework Metal" "-framework QuartzCore" "-framework Foundation" "-framework AppKit" "-framework CoreVideo")
 endif()
 
 set(RTVDB_VIEWER_CAPTURE_SOURCES
@@ -541,13 +551,16 @@ add_library(rtvdb_viewer_shell
 if(APPLE)
     target_sources(rtvdb_viewer_shell PRIVATE src/viewer_shell/png_save_dialog_mac.mm)
 endif()
-target_include_directories(rtvdb_viewer_shell PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_include_directories(rtvdb_viewer_shell PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/fpng/src
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui/backends
 )
 target_link_libraries(rtvdb_viewer_shell PUBLIC SDL3::SDL3)
+if(WIN32 AND RTVDB_ENABLE_D3D12_DXR)
+    target_compile_definitions(rtvdb_viewer_shell PUBLIC RTVDB_ENABLE_D3D12_DXR=1)
+endif()
 if(RTVDB_ENABLE_VULKAN_RT)
     target_compile_definitions(rtvdb_viewer_shell PUBLIC RTVDB_ENABLE_VULKAN_RT=1)
     target_link_libraries(rtvdb_viewer_shell PUBLIC Vulkan::Vulkan)

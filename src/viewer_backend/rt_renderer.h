@@ -73,6 +73,8 @@ struct rt_present_request {
     void** out_native_target = nullptr;
     std::vector<std::uint8_t>* out_pixels = nullptr;
     bool update_build_info = false;
+    float render_scale_x = 1.0f;
+    float render_scale_y = 1.0f;
 };
 
 struct rt_present_result {
@@ -109,6 +111,8 @@ struct rt_native_frame_request {
     void* native_target = nullptr;
     void** out_native_target = nullptr;
     std::vector<std::uint8_t>* out_pixels = nullptr;
+    float render_scale_x = 1.0f;
+    float render_scale_y = 1.0f;
 };
 
 struct rt_pick_dispatch_request {

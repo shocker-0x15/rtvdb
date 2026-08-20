@@ -23,6 +23,7 @@
 
 #include <chrono>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <condition_variable>
 #include <cstdlib>
@@ -46,6 +47,8 @@
 #include <vector>
 
 namespace {
+
+void sync_backend_render_scale();
 
 constexpr int kDefaultCaptureWidth = 1280;
 constexpr int kDefaultCaptureHeight = 720;
@@ -100,6 +103,7 @@ constexpr wchar_t kViewerWindowTitleVulkan[] = L"rtvdb viewer - Vulkan";
 constexpr wchar_t kViewerWindowTitleMetal[] = L"rtvdb viewer - Metal";
 #if defined(_WIN32)
 constexpr wchar_t kViewerSingleInstanceMutexName[] = L"Local\\rtvdb_viewer_single_instance";
+constexpr wchar_t kViewerActivationEventName[] = L"Local\\rtvdb_viewer_activate";
 #endif
 
 enum class hover_primitive_kind {
@@ -427,6 +431,9 @@ std::filesystem::path g_client_capture_path;
 std::uint32_t g_client_capture_sequence = 0;
 #if defined(_WIN32)
 HANDLE g_viewer_single_instance_mutex = nullptr;
+HANDLE g_viewer_activation_event = nullptr;
+std::atomic_bool g_viewer_activation_listener_running = false;
+std::thread g_viewer_activation_listener;
 #endif
 
 struct viewer_launch_config {
@@ -443,6 +450,22 @@ struct viewer_launch_config {
     rtvdb::viewer_backend::backend_preference backend = rtvdb::viewer_backend::backend_preference::automatic;
 };
 viewer_launch_config g_launch_config{};
+
+rtvdb::viewer_backend::backend_preference resolve_automatic_backend_preference(
+    rtvdb::viewer_backend::backend_preference preference)
+{
+    if (preference != rtvdb::viewer_backend::backend_preference::automatic) {
+        return preference;
+    }
+#if defined(_WIN32) && defined(RTVDB_ENABLE_D3D12_DXR)
+    return rtvdb::viewer_backend::backend_preference::automatic;
+#elif defined(RTVDB_ENABLE_VULKAN_RT) && \
+    (defined(_WIN32) || defined(__linux__) || defined(__FreeBSD__))
+    return rtvdb::viewer_backend::backend_preference::vulkan_rt;
+#else
+    return rtvdb::viewer_backend::backend_preference::automatic;
+#endif
+}
 
 constexpr const char* kViewerUsage =
     "Usage: rtvdb_viewer [options]\n"
@@ -487,6 +510,7 @@ bool recover_active_native_renderer();
 std::wstring join_capture_path(const std::wstring &directory, const std::wstring &filename);
 std::wstring default_manual_png_path();
 std::string wide_to_utf8_lossy(const std::wstring &text);
+std::wstring utf8_to_wide_lossy(const std::string &text);
 void append_manual_png_save_log(bool is_error, const std::wstring &path, const char* detail = nullptr);
 void complete_manual_png_save(bool accepted, const std::wstring &path, void* user_data);
 bool begin_render_png_save_interactive();
@@ -513,29 +537,91 @@ void append_render_stall_trace_line(const char* text);
 void record_repaint_request(const char* reason, std::uint64_t frame_serial);
 void record_paint_started();
 void record_post_present();
-const wchar_t* viewer_window_title(rtvdb::viewer_backend::backend_kind kind);
+std::wstring viewer_window_title(const rtvdb::viewer_backend::backend_info &backend);
 #if defined(_WIN32)
-bool focus_existing_viewer_window() {
-    constexpr const wchar_t* kViewerWindowTitles[] = {
-        kViewerWindowTitle,
-        kViewerWindowTitleD3D,
-        kViewerWindowTitleVulkan,
-        kViewerWindowTitleMetal,
-    };
-    for (int attempt = 0; attempt < 20; ++attempt) {
-        for (const wchar_t* title : kViewerWindowTitles) {
-            HWND hwnd = FindWindowW(nullptr, title);
-            if (hwnd == nullptr) {
-                continue;
+void focus_viewer_window() {
+    const rtvdb::viewer_shell::native_window_handle native_window =
+        rtvdb::viewer_shell::native_window();
+    if (native_window.kind != rtvdb::viewer_shell::native_window_kind::win32_hwnd ||
+        native_window.value == nullptr) {
+        return;
+    }
+
+    const HWND hwnd = static_cast<HWND>(native_window.value);
+    if (!IsWindow(hwnd)) {
+        return;
+    }
+    if (IsIconic(hwnd)) {
+        ShowWindow(hwnd, SW_RESTORE);
+    } else {
+        ShowWindow(hwnd, SW_SHOW);
+    }
+    BringWindowToTop(hwnd);
+    if (!SetForegroundWindow(hwnd)) {
+        FLASHWINFO flash_info{
+            sizeof(FLASHWINFO),
+            hwnd,
+            FLASHW_TRAY,
+            3,
+            0,
+        };
+        FlashWindowEx(&flash_info);
+    }
+}
+
+void viewer_activation_listener_main() {
+    while (g_viewer_activation_listener_running.load(std::memory_order_acquire)) {
+        const DWORD wait_result = WaitForSingleObject(g_viewer_activation_event, INFINITE);
+        if (!g_viewer_activation_listener_running.load(std::memory_order_acquire) ||
+            wait_result != WAIT_OBJECT_0) {
+            return;
+        }
+
+        for (int attempt = 0; attempt < 100; ++attempt) {
+            if (!g_viewer_activation_listener_running.load(std::memory_order_acquire)) {
+                return;
             }
-            if (IsIconic(hwnd)) {
-                ShowWindow(hwnd, SW_RESTORE);
-            } else {
-                ShowWindow(hwnd, SW_SHOW);
+            const rtvdb::viewer_shell::native_window_handle native_window =
+                rtvdb::viewer_shell::native_window();
+            if (native_window.kind == rtvdb::viewer_shell::native_window_kind::win32_hwnd &&
+                native_window.value != nullptr) {
+                focus_viewer_window();
+                break;
             }
-            SetForegroundWindow(hwnd);
-            BringWindowToTop(hwnd);
-            return true;
+            Sleep(50);
+        }
+    }
+}
+
+void start_viewer_activation_listener() {
+    if (g_viewer_activation_event == nullptr || g_viewer_activation_listener.joinable()) {
+        return;
+    }
+    g_viewer_activation_listener_running.store(true, std::memory_order_release);
+    g_viewer_activation_listener = std::thread(viewer_activation_listener_main);
+}
+
+void stop_viewer_activation_listener() {
+    g_viewer_activation_listener_running.store(false, std::memory_order_release);
+    if (g_viewer_activation_event != nullptr) {
+        SetEvent(g_viewer_activation_event);
+    }
+    if (g_viewer_activation_listener.joinable()) {
+        g_viewer_activation_listener.join();
+    }
+    if (g_viewer_activation_event != nullptr) {
+        CloseHandle(g_viewer_activation_event);
+        g_viewer_activation_event = nullptr;
+    }
+}
+
+bool signal_existing_viewer_activation() {
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        HANDLE event = OpenEventW(EVENT_MODIFY_STATE, FALSE, kViewerActivationEventName);
+        if (event != nullptr) {
+            const bool signaled = SetEvent(event) != FALSE;
+            CloseHandle(event);
+            return signaled;
         }
         Sleep(50);
     }
@@ -548,16 +634,23 @@ bool acquire_single_instance_guard() {
         return true;
     }
     if (GetLastError() != ERROR_ALREADY_EXISTS) {
+        g_viewer_activation_event = CreateEventW(
+            nullptr,
+            FALSE,
+            FALSE,
+            kViewerActivationEventName);
+        start_viewer_activation_listener();
         return true;
     }
 
-    focus_existing_viewer_window();
+    signal_existing_viewer_activation();
     CloseHandle(g_viewer_single_instance_mutex);
     g_viewer_single_instance_mutex = nullptr;
     return false;
 }
 
 void release_single_instance_guard() {
+    stop_viewer_activation_listener();
     if (g_viewer_single_instance_mutex == nullptr) {
         return;
     }
@@ -567,18 +660,28 @@ void release_single_instance_guard() {
 }
 #endif
 
-const wchar_t* viewer_window_title(rtvdb::viewer_backend::backend_kind kind) {
-    switch (kind) {
+std::wstring viewer_window_title(const rtvdb::viewer_backend::backend_info &backend) {
+    const wchar_t* title = kViewerWindowTitle;
+    switch (backend.kind) {
     case rtvdb::viewer_backend::backend_kind::d3d12_dxr:
-        return kViewerWindowTitleD3D;
+        title = kViewerWindowTitleD3D;
+        break;
     case rtvdb::viewer_backend::backend_kind::vulkan_rt:
-        return kViewerWindowTitleVulkan;
+        title = kViewerWindowTitleVulkan;
+        break;
     case rtvdb::viewer_backend::backend_kind::metal_rt:
-        return kViewerWindowTitleMetal;
+        title = kViewerWindowTitleMetal;
+        break;
     case rtvdb::viewer_backend::backend_kind::unsupported:
     default:
-        return kViewerWindowTitle;
+        break;
     }
+    std::wstring result(title);
+    if (backend.gpu_name != nullptr && backend.gpu_name[0] != '\0') {
+        result += L" - ";
+        result += utf8_to_wide_lossy(backend.gpu_name);
+    }
+    return result;
 }
 void record_render_submit(std::uint64_t frame_serial, int width, int height, bool used_native_frame);
 void record_camera_update(const char* reason);
@@ -1335,6 +1438,67 @@ std::wstring default_manual_png_path() {
     return join_capture_path(base_dir, format_manual_png_name(client_name, sequence));
 }
 
+std::wstring utf8_to_wide_lossy(const std::string &text) {
+    std::wstring result;
+    result.reserve(text.size());
+    for (std::size_t index = 0; index < text.size();) {
+        const unsigned char first = static_cast<unsigned char>(text[index]);
+        std::uint32_t codepoint = 0;
+        std::size_t sequence_length = 0;
+        if (first <= 0x7Fu) {
+            codepoint = first;
+            sequence_length = 1;
+        } else if (first >= 0xC2u && first <= 0xDFu && index + 1 < text.size() &&
+            (static_cast<unsigned char>(text[index + 1]) & 0xC0u) == 0x80u) {
+            codepoint = (static_cast<std::uint32_t>(first & 0x1Fu) << 6) |
+                (static_cast<unsigned char>(text[index + 1]) & 0x3Fu);
+            sequence_length = 2;
+        } else if (first >= 0xE0u && first <= 0xEFu && index + 2 < text.size() &&
+            (static_cast<unsigned char>(text[index + 1]) & 0xC0u) == 0x80u &&
+            (static_cast<unsigned char>(text[index + 2]) & 0xC0u) == 0x80u) {
+            codepoint = (static_cast<std::uint32_t>(first & 0x0Fu) << 12) |
+                ((static_cast<unsigned char>(text[index + 1]) & 0x3Fu) << 6) |
+                (static_cast<unsigned char>(text[index + 2]) & 0x3Fu);
+            sequence_length = 3;
+            if (codepoint < 0x800u || (codepoint >= 0xD800u && codepoint <= 0xDFFFu)) {
+                sequence_length = 0;
+            }
+        } else if (first >= 0xF0u && first <= 0xF4u && index + 3 < text.size() &&
+            (static_cast<unsigned char>(text[index + 1]) & 0xC0u) == 0x80u &&
+            (static_cast<unsigned char>(text[index + 2]) & 0xC0u) == 0x80u &&
+            (static_cast<unsigned char>(text[index + 3]) & 0xC0u) == 0x80u) {
+            codepoint = (static_cast<std::uint32_t>(first & 0x07u) << 18) |
+                ((static_cast<unsigned char>(text[index + 1]) & 0x3Fu) << 12) |
+                ((static_cast<unsigned char>(text[index + 2]) & 0x3Fu) << 6) |
+                (static_cast<unsigned char>(text[index + 3]) & 0x3Fu);
+            sequence_length = 4;
+            if (codepoint < 0x10000u || codepoint > 0x10FFFFu) {
+                sequence_length = 0;
+            }
+        }
+
+        if (sequence_length == 0) {
+            result.push_back(L'?');
+            ++index;
+            continue;
+        }
+
+        if constexpr (sizeof(wchar_t) == 2) {
+            if (codepoint <= 0xFFFFu) {
+                result.push_back(static_cast<wchar_t>(codepoint));
+            } else {
+                const std::uint32_t surrogate = codepoint - 0x10000u;
+                result.push_back(static_cast<wchar_t>(0xD800u + (surrogate >> 10)));
+                result.push_back(static_cast<wchar_t>(0xDC00u + (surrogate & 0x3FFu)));
+            }
+        } else {
+            result.push_back(static_cast<wchar_t>(codepoint));
+        }
+        index += sequence_length;
+    }
+    return result;
+}
+
 std::string wide_to_utf8_lossy(const std::wstring &text) {
     std::string out;
     for (wchar_t ch : text) {
@@ -1401,6 +1565,7 @@ void complete_manual_png_save(bool accepted, const std::wstring &path, void*) {
     int render_width = kDefaultCaptureWidth;
     int render_height = kDefaultCaptureHeight;
     rtvdb::viewer_shell::render_window_size(&render_width, &render_height);
+    sync_backend_render_scale();
     rtvdb::viewer_backend::set_capture_size(render_width, render_height);
 
     g_manual_png_capture_path = path;
@@ -2417,7 +2582,16 @@ void update_present_timing();
 void request_present_refresh();
 std::size_t visible_display_mode_count();
 
+void sync_backend_render_scale() {
+    float scale_x = 1.0f;
+    float scale_y = 1.0f;
+    if (rtvdb::viewer_shell::render_scale(&scale_x, &scale_y)) {
+        rtvdb::viewer_backend::set_render_scale(scale_x, scale_y);
+    }
+}
+
 void current_render_size(int* out_width, int* out_height) {
+    sync_backend_render_scale();
     int width = 0;
     int height = 0;
     if (!rtvdb::viewer_shell::render_window_size(&width, &height) || width <= 0 || height <= 0) {
@@ -2453,26 +2627,26 @@ std::vector<std::string> build_full_pick_overlay_lines(const hover_state &state,
     if (!selection) {
         std::snprintf(buffer, sizeof(buffer), "Dist:  %8.4f", state.distance);
         lines.emplace_back(buffer);
-    }
-    std::snprintf(
-        buffer,
-        sizeof(buffer),
-        "Hit:   %8.3f %8.3f %8.3f",
-        state.hit_position.x,
-        state.hit_position.y,
-        state.hit_position.z);
-    lines.emplace_back(buffer);
-    if (state.has_normal) {
         std::snprintf(
             buffer,
             sizeof(buffer),
-            "N:     %8.3f %8.3f %8.3f",
-            state.normal.x,
-            state.normal.y,
-            state.normal.z);
+            "Hit:   %8.3f %8.3f %8.3f",
+            state.hit_position.x,
+            state.hit_position.y,
+            state.hit_position.z);
         lines.emplace_back(buffer);
-    } else {
-        lines.emplace_back("N:            -        -        -");
+        if (state.has_normal) {
+            std::snprintf(
+                buffer,
+                sizeof(buffer),
+                "N:     %8.3f %8.3f %8.3f",
+                state.normal.x,
+                state.normal.y,
+                state.normal.z);
+            lines.emplace_back(buffer);
+        } else {
+            lines.emplace_back("N:            -        -        -");
+        }
     }
     std::snprintf(
         buffer,
@@ -2510,6 +2684,21 @@ std::vector<std::string> build_full_pick_overlay_lines(const hover_state &state,
             state.triangle.c.y,
             state.triangle.c.z);
         lines.emplace_back(buffer);
+        if (selection) {
+            if (state.has_normal) {
+                std::snprintf(
+                    buffer,
+                    sizeof(buffer),
+                    "Normal:%8.3f %8.3f %8.3f",
+                    state.normal.x,
+                    state.normal.y,
+                    state.normal.z);
+                lines.emplace_back(buffer);
+            } else {
+                std::snprintf(buffer, sizeof(buffer), "Normal:%8s %8s %8s", "-", "-", "-");
+                lines.emplace_back(buffer);
+            }
+        }
         break;
     case hover_primitive_kind::point:
         std::snprintf(
@@ -4284,6 +4473,7 @@ void update_hover_state() {
     if (!rtvdb::viewer_shell::render_window_size(&width, &height) || width <= 0 || height <= 0) {
         return;
     }
+    sync_backend_render_scale();
 
     int mouse_pixel_x = g_hover.mouse_x;
     int mouse_pixel_y = g_hover.mouse_y;
@@ -4741,6 +4931,9 @@ bool show_scene_in_shell(
 }
 
 void on_shell_shutdown(void*) {
+#if defined(_WIN32)
+    stop_viewer_activation_listener();
+#endif
     stop_render_watchdog();
     stop_layer_rebuild_worker();
     rtvdb::viewer_backend::shutdown_backend();
@@ -6657,6 +6850,7 @@ int viewer_main(rtvdb::viewer_shell::platform_app_instance instance, int show_co
         report_viewer_launch_error(launch_config_error);
         return 1;
     }
+    launch_config.backend = resolve_automatic_backend_preference(launch_config.backend);
     g_launch_config = launch_config;
     rtvdb::viewer_diagnostics::set_output_enabled(
         launch_config.auto_capture ||
@@ -6760,6 +6954,8 @@ int viewer_main(rtvdb::viewer_shell::platform_app_instance instance, int show_co
         launch_config.backend,
         launch_config.continuous_render,
         {},
+        1.0f,
+        1.0f,
     };
 
     if (launch_config.backend == rtvdb::viewer_backend::backend_preference::vulkan_rt) {
@@ -6815,8 +7011,10 @@ int viewer_main(rtvdb::viewer_shell::platform_app_instance instance, int show_co
             }
         }
     }
-    rtvdb::viewer_shell::set_window_title(
-        viewer_window_title(rtvdb::viewer_backend::current_backend().kind));
+    const rtvdb::viewer_backend::backend_info active_backend =
+        rtvdb::viewer_backend::current_backend();
+    const std::wstring window_title = viewer_window_title(active_backend);
+    rtvdb::viewer_shell::set_window_title(window_title.c_str());
     if (!launch_config.display_mode.empty()) {
         apply_initial_display_mode_from_launch_config();
     }

@@ -576,7 +576,7 @@ bool create_default_renderer(const renderer_config &config) {
         return g_renderer != nullptr;
     }
 
-#if defined(_WIN32)
+#if defined(_WIN32) && defined(RTVDB_ENABLE_D3D12_DXR)
     if (config.preference == renderer_preference::automatic ||
         config.preference == renderer_preference::direct3d12) {
         g_renderer = SDL_CreateRenderer(g_window, "direct3d12");
@@ -622,7 +622,7 @@ void log_renderer_swapchain_configuration() {
         return;
     }
 
-#if defined(_WIN32)
+#if defined(_WIN32) && defined(RTVDB_ENABLE_D3D12_DXR)
     if (std::strcmp(renderer_name, "direct3d12") == 0) {
         IDXGISwapChain1* const swapchain = static_cast<IDXGISwapChain1*>(
             SDL_GetPointerProperty(props, SDL_PROP_RENDERER_D3D12_SWAPCHAIN_POINTER, nullptr));
@@ -666,7 +666,7 @@ void cache_renderer_interop() {
     g_d3d12_renderer_interop.command_queue =
         SDL_GetPointerProperty(props, SDL_PROP_RENDERER_D3D12_COMMAND_QUEUE_POINTER, nullptr);
 
-#if defined(_WIN32)
+#if defined(_WIN32) && defined(RTVDB_ENABLE_D3D12_DXR)
     const char* renderer_name = SDL_GetRendererName(g_renderer);
     if (renderer_name == nullptr || std::strcmp(renderer_name, "direct3d12") != 0) {
         return;
@@ -1202,6 +1202,24 @@ bool render_window_size(int* out_width, int* out_height) {
     return true;
 }
 
+bool render_scale(float* out_scale_x, float* out_scale_y) {
+    if (g_renderer == nullptr || out_scale_x == nullptr || out_scale_y == nullptr) {
+        return false;
+    }
+
+    float scale_x = 1.0f;
+    float scale_y = 1.0f;
+    if (!SDL_GetRenderScale(g_renderer, &scale_x, &scale_y) ||
+        !std::isfinite(scale_x) || scale_x <= 0.0f ||
+        !std::isfinite(scale_y) || scale_y <= 0.0f) {
+        return false;
+    }
+
+    *out_scale_x = scale_x;
+    *out_scale_y = scale_y;
+    return true;
+}
+
 bool render_coordinate_to_pixel(int x, int y, int* out_pixel_x, int* out_pixel_y) {
     if (g_renderer == nullptr || out_pixel_x == nullptr || out_pixel_y == nullptr) {
         return false;
@@ -1209,12 +1227,7 @@ bool render_coordinate_to_pixel(int x, int y, int* out_pixel_x, int* out_pixel_y
 
     float render_scale_x = 1.0f;
     float render_scale_y = 1.0f;
-    if (!SDL_GetRenderScale(g_renderer, &render_scale_x, &render_scale_y)) {
-        return false;
-    }
-
-    if (!std::isfinite(render_scale_x) || render_scale_x <= 0.0f ||
-        !std::isfinite(render_scale_y) || render_scale_y <= 0.0f) {
+    if (!render_scale(&render_scale_x, &render_scale_y)) {
         return false;
     }
 

@@ -56,6 +56,19 @@ struct backend_state {
     std::uint64_t recovery_count = 0;
 } g_backend;
 
+rt_render_request make_rt_render_request(
+    int width,
+    int height,
+    const frame_scene &scene,
+    bool has_frame)
+{
+    rt_render_request request{width, height, &scene, has_frame};
+    std::scoped_lock lock(g_backend.mutex);
+    request.render_scale_x = g_backend.config.render_scale_x;
+    request.render_scale_y = g_backend.config.render_scale_y;
+    return request;
+}
+
 struct scene_build_cancel_context {
     std::uint64_t revision = 0;
 };
@@ -84,7 +97,8 @@ backend_info unsupported_backend_info() {
     return {
         backend_kind::unsupported,
         "unsupported",
-        {false}
+        {false},
+        ""
     };
 }
 
@@ -863,6 +877,16 @@ void set_capture_size(int width, int height) {
     g_backend.config.capture_height = height;
 }
 
+void set_render_scale(float scale_x, float scale_y) {
+    if (!std::isfinite(scale_x) || scale_x <= 0.0f ||
+        !std::isfinite(scale_y) || scale_y <= 0.0f) {
+        return;
+    }
+    std::scoped_lock lock(g_backend.mutex);
+    g_backend.config.render_scale_x = scale_x;
+    g_backend.config.render_scale_y = scale_y;
+}
+
 void set_display_mode(display_mode mode) {
     std::scoped_lock lock(g_backend.mutex);
     g_backend.display = mode;
@@ -914,7 +938,10 @@ bool pick(
     bool has_frame,
     pick_result* out_result)
 {
-    const rt_pick_request request{{width, height, &scene, has_frame}, pixel_x, pixel_y};
+    rt_pick_request request{};
+    request.render = make_rt_render_request(width, height, scene, has_frame);
+    request.pixel_x = pixel_x;
+    request.pixel_y = pixel_y;
     if (!g_backend.initialized || g_backend.ops == nullptr || g_backend.ops->pick == nullptr) {
         return false;
     }
@@ -988,7 +1015,7 @@ bool render_frame_to_native_d3d12_texture(
     bool has_frame,
     void* texture_resource)
 {
-    const rt_render_request request{width, height, &scene, has_frame};
+    const rt_render_request request = make_rt_render_request(width, height, scene, has_frame);
     if (!g_backend.initialized ||
         g_backend.ops == nullptr ||
         g_backend.ops->render_to_native_d3d12_texture == nullptr) {
@@ -1010,7 +1037,7 @@ bool render_frame_to_native_metal_texture(
     bool has_frame,
     void* pixel_buffer)
 {
-    const rt_render_request request{width, height, &scene, has_frame};
+    const rt_render_request request = make_rt_render_request(width, height, scene, has_frame);
     if (!g_backend.initialized ||
         g_backend.ops == nullptr ||
         g_backend.ops->render_to_native_metal_texture == nullptr) {
@@ -1032,7 +1059,7 @@ bool render_frame_to_native_vulkan_texture(
     bool has_frame,
     void** out_image)
 {
-    const rt_render_request request{width, height, &scene, has_frame};
+    const rt_render_request request = make_rt_render_request(width, height, scene, has_frame);
     if (out_image == nullptr ||
         !g_backend.initialized ||
         g_backend.ops == nullptr ||
@@ -1050,7 +1077,7 @@ bool capture_frame_to_bgra(
     std::vector<std::uint8_t>* out_pixels,
     bool update_build_info)
 {
-    const rt_render_request request{width, height, &scene, has_frame};
+    const rt_render_request request = make_rt_render_request(width, height, scene, has_frame);
     if (!g_backend.initialized || g_backend.ops == nullptr || g_backend.ops->capture_to_bgra == nullptr) {
         return false;
     }
@@ -1086,7 +1113,7 @@ bool capture_frame_to_png(const wchar_t* path, int width, int height, const fram
         g_backend.ops->capture_to_png == nullptr || path == nullptr) {
         return false;
     }
-    const rt_render_request request{width, height, &scene, has_frame};
+    const rt_render_request request = make_rt_render_request(width, height, scene, has_frame);
     if (g_backend.ops->capture_to_png(path, request)) {
         return true;
     }

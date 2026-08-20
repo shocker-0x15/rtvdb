@@ -16,7 +16,6 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
-#include <dxgi1_6.h>
 #endif
 
 #include <algorithm>
@@ -43,91 +42,6 @@ constexpr std::array<const char*, 2> kRequiredInstanceExtensions = {
 constexpr std::array<const char*, 1> kRequiredInstanceExtensions = {
     "VK_KHR_surface",
 };
-#endif
-
-#if defined(_WIN32)
-bool query_dxgi_adapter_desc_from_luid(
-    const std::uint8_t luid_bytes[VK_LUID_SIZE],
-    DXGI_ADAPTER_DESC1* out_desc)
-{
-    if (luid_bytes == nullptr || out_desc == nullptr) {
-        return false;
-    }
-
-    LUID luid{};
-    std::memcpy(&luid, luid_bytes, VK_LUID_SIZE);
-
-    IDXGIFactory4* factory = nullptr;
-    IDXGIAdapter1* adapter = nullptr;
-    bool found = false;
-    HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
-    if (SUCCEEDED(hr) && factory != nullptr) {
-        hr = factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&adapter));
-        if (SUCCEEDED(hr) && adapter != nullptr && SUCCEEDED(adapter->GetDesc1(out_desc))) {
-            found = true;
-        }
-    }
-
-    if (adapter != nullptr) {
-        adapter->Release();
-    }
-    if (factory != nullptr) {
-        factory->Release();
-    }
-    return found;
-}
-
-bool query_preferred_dxgi_adapter(
-    LUID* out_luid,
-    DXGI_ADAPTER_DESC1* out_desc)
-{
-    if (out_luid == nullptr) {
-        return false;
-    }
-
-    *out_luid = {};
-    if (out_desc != nullptr) {
-        *out_desc = {};
-    }
-
-    IDXGIFactory6* factory = nullptr;
-    IDXGIAdapter1* adapter = nullptr;
-    bool found = false;
-    std::uint64_t best_score = 0;
-    const HRESULT factory_hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
-    if (SUCCEEDED(factory_hr) && factory != nullptr) {
-        for (UINT adapter_index = 0;
-             factory->EnumAdapters1(adapter_index, &adapter) != DXGI_ERROR_NOT_FOUND;
-             ++adapter_index) {
-            DXGI_ADAPTER_DESC1 desc{};
-            if (SUCCEEDED(adapter->GetDesc1(&desc)) && (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) == 0) {
-                std::uint64_t score = desc.DedicatedVideoMemory / (64ull * 1024ull * 1024ull);
-                if (desc.DedicatedVideoMemory > 0) {
-                    score += 100000ull;
-                }
-                if (!found || score > best_score) {
-                    *out_luid = desc.AdapterLuid;
-                    if (out_desc != nullptr) {
-                        *out_desc = desc;
-                    }
-                    best_score = score;
-                    found = true;
-                }
-            }
-            adapter->Release();
-            adapter = nullptr;
-        }
-    }
-
-    if (adapter != nullptr) {
-        adapter->Release();
-    }
-    if (factory != nullptr) {
-        factory->Release();
-    }
-    return found;
-}
-
 #endif
 
 static_assert(sizeof(rt_scene_gpu_aabb) == sizeof(VkAabbPositionsKHR));
@@ -202,6 +116,7 @@ struct vulkan_command_slot {
 struct vulkan_backend_state {
     bool initialized = false;
     bool hardware_ray_tracing = false;
+    std::string gpu_name;
     VkInstance instance = VK_NULL_HANDLE;
     VkPhysicalDevice physical_device = VK_NULL_HANDLE;
     VkDevice device = VK_NULL_HANDLE;
@@ -449,6 +364,7 @@ rt_rhi_device_info vulkan_backend_info_locked(const vulkan_backend_state &state)
     return {
         rt_rhi_backend_kind::vulkan_rt,
         "vulkan_rt",
+        state.gpu_name.c_str(),
         state.hardware_ray_tracing,
     };
 }
@@ -681,6 +597,7 @@ void reset_vulkan_state_locked(vulkan_backend_state &state) {
     }
     state.initialized = false;
     state.hardware_ray_tracing = false;
+    state.gpu_name.clear();
     state.physical_device = VK_NULL_HANDLE;
     state.graphics_queue = VK_NULL_HANDLE;
     state.graphics_queue_family = VK_QUEUE_FAMILY_IGNORED;
@@ -720,27 +637,7 @@ bool check_device_extension_support(VkPhysicalDevice physical_device) {
 }
 
 bool choose_physical_device(vulkan_backend_state &state) {
-    bool require_matching_adapter = false;
     const bool presentation_required = viewer_shell::native_window().value != nullptr;
-#if defined(_WIN32)
-    LUID target_adapter_luid{};
-    DXGI_ADAPTER_DESC1 preferred_adapter_desc{};
-    if (query_preferred_dxgi_adapter(&target_adapter_luid, &preferred_adapter_desc)) {
-        require_matching_adapter = true;
-        char line[512]{};
-        std::snprintf(
-            line,
-            sizeof(line),
-            "Vulkan startup preferred DXGI adapter: source=dxgi_preferred name=%ws "
-            "vendor=0x%04x device=0x%04x luid=%08x:%08x",
-            preferred_adapter_desc.Description,
-            static_cast<unsigned>(preferred_adapter_desc.VendorId),
-            static_cast<unsigned>(preferred_adapter_desc.DeviceId),
-            static_cast<unsigned>(preferred_adapter_desc.AdapterLuid.HighPart),
-            static_cast<unsigned>(preferred_adapter_desc.AdapterLuid.LowPart));
-        append_rt_startup_log(line);
-    }
-#endif
 
     VkPhysicalDevice best_physical_device = VK_NULL_HANDLE;
     std::uint32_t best_queue_family_index = VK_QUEUE_FAMILY_IGNORED;
@@ -748,7 +645,6 @@ bool choose_physical_device(vulkan_backend_state &state) {
     std::uint32_t best_timestamp_valid_bits = 0;
     int best_score = -1;
     bool found = false;
-    bool found_matching_adapter = false;
 
     const auto enumerate_candidates = [&]() -> bool {
         best_physical_device = VK_NULL_HANDLE;
@@ -756,7 +652,6 @@ bool choose_physical_device(vulkan_backend_state &state) {
         best_present_queue_family_index = VK_QUEUE_FAMILY_IGNORED;
         best_score = -1;
         found = false;
-        found_matching_adapter = false;
 
         std::uint32_t physical_device_count = 0;
         if (vkEnumeratePhysicalDevices(state.instance, &physical_device_count, nullptr) != VK_SUCCESS ||
@@ -772,27 +667,6 @@ bool choose_physical_device(vulkan_backend_state &state) {
         for (VkPhysicalDevice physical_device : physical_devices) {
             VkPhysicalDeviceProperties properties{};
             vkGetPhysicalDeviceProperties(physical_device, &properties);
-
-            VkPhysicalDeviceIDProperties id_properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
-            VkPhysicalDeviceProperties2 properties2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
-            properties2.pNext = &id_properties;
-            vkGetPhysicalDeviceProperties2(physical_device, &properties2);
-
-            bool adapter_matches = false;
-            bool adapter_visible_in_dxgi = true;
-#if defined(_WIN32)
-            if (require_matching_adapter && id_properties.deviceLUIDValid) {
-                adapter_matches =
-                    std::memcmp(id_properties.deviceLUID, &target_adapter_luid, VK_LUID_SIZE) == 0;
-            }
-            if (id_properties.deviceLUIDValid) {
-                DXGI_ADAPTER_DESC1 adapter_desc{};
-                adapter_visible_in_dxgi = query_dxgi_adapter_desc_from_luid(id_properties.deviceLUID, &adapter_desc);
-                if (adapter_visible_in_dxgi && (adapter_desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0) {
-                    adapter_visible_in_dxgi = false;
-                }
-            }
-#endif
             if (!check_device_extension_support(physical_device)) {
                 continue;
             }
@@ -820,10 +694,6 @@ bool choose_physical_device(vulkan_backend_state &state) {
             if (!accel_features.accelerationStructure ||
                 !rt_pipeline_features.rayTracingPipeline ||
                 !bda_features.bufferDeviceAddress) {
-                continue;
-            }
-
-            if (require_matching_adapter && (!adapter_visible_in_dxgi || !adapter_matches)) {
                 continue;
             }
 
@@ -877,9 +747,7 @@ bool choose_physical_device(vulkan_backend_state &state) {
                     " queue_family=" + std::to_string(queue_family_index) +
                     " present_queue_family=" + std::to_string(present_queue_family_index) +
                     " presentation_required=" + std::to_string(presentation_required ? 1 : 0) +
-                    " graphics_queue_presents=" + std::to_string(graphics_queue_presents ? 1 : 0) +
-                    " dxgi_visible=" + std::to_string(adapter_visible_in_dxgi ? 1 : 0) +
-                    " adapter_match=" + std::to_string(adapter_matches ? 1 : 0));
+                    " graphics_queue_presents=" + std::to_string(graphics_queue_presents ? 1 : 0));
 
                 int score = 0;
                 switch (properties.deviceType) {
@@ -901,10 +769,6 @@ bool choose_physical_device(vulkan_backend_state &state) {
                 if (graphics_queue_presents) {
                     score += 100;
                 }
-                if (adapter_matches) {
-                    score += 10000;
-                    found_matching_adapter = true;
-                }
                 if (!found || score > best_score) {
                     best_physical_device = physical_device;
                     best_queue_family_index = queue_family_index;
@@ -919,21 +783,14 @@ bool choose_physical_device(vulkan_backend_state &state) {
         return found;
     };
 
-    const bool initial_enumeration_found = enumerate_candidates();
-    if (!initial_enumeration_found && !require_matching_adapter) {
-        return false;
-    }
-    if (!found) {
-        if (require_matching_adapter) {
-            append_rt_startup_log(
-                "Vulkan startup failed: no RT-capable Vulkan device matched the preferred DXGI adapter");
-        }
+    if (!enumerate_candidates()) {
         return false;
     }
 
     VkPhysicalDeviceProperties best_properties{};
     vkGetPhysicalDeviceProperties(best_physical_device, &best_properties);
     state.physical_device = best_physical_device;
+    state.gpu_name = best_properties.deviceName;
     state.graphics_queue_family = best_queue_family_index;
     state.present_queue_family = best_present_queue_family_index;
     state.hardware_ray_tracing = true;

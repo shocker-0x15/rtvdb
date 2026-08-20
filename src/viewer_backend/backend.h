@@ -73,6 +73,7 @@ struct backend_info {
     backend_kind kind;
     const char* name;
     backend_caps caps;
+    const char* gpu_name;
 };
 
 struct triangle {
@@ -257,6 +258,8 @@ struct backend_config {
     backend_preference preferred_backend = backend_preference::automatic;
     bool continuous_render = false;
     d3d12_interop_config d3d12{};
+    float render_scale_x = 1.0f;
+    float render_scale_y = 1.0f;
 };
 
 backend_info select_planned_backend();
@@ -291,6 +294,7 @@ void set_helper_overlay_plane(helper_plane plane);
 helper_plane current_helper_overlay_plane();
 void apply_reference_grid_request(rtvdb::reference_grid value);
 void set_capture_size(int width, int height);
+void set_render_scale(float scale_x, float scale_y);
 void set_display_mode(display_mode mode);
 bool get_display_mode(display_mode* out_mode);
 void set_hover_highlight(const hover_highlight &highlight);

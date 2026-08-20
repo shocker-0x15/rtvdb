@@ -41,6 +41,30 @@ constexpr DXGI_FORMAT kOutputFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
 
 static_assert(sizeof(rt_scene_gpu_aabb) == sizeof(D3D12_RAYTRACING_AABB));
 
+std::string dxr_wide_to_utf8(const wchar_t* text) {
+    if (text == nullptr || text[0] == L'\0') {
+        return {};
+    }
+    const int size = WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0, nullptr, nullptr);
+    if (size <= 1) {
+        return {};
+    }
+    std::string result(static_cast<std::size_t>(size), '\0');
+    if (WideCharToMultiByte(
+            CP_UTF8,
+            0,
+            text,
+            -1,
+            result.data(),
+            size,
+            nullptr,
+            nullptr) <= 0) {
+        return {};
+    }
+    result.pop_back();
+    return result;
+}
+
 struct dxr_buffer {
     ID3D12Resource* resource = nullptr;
     D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
@@ -119,6 +143,7 @@ struct dxr_backend_state {
     IDXGIAdapter1* adapter = nullptr;
     ID3D12Device5* device = nullptr;
     ID3D12CommandQueue* queue = nullptr;
+    std::string gpu_name;
     std::array<dxr_command_slot, kRtCommandSlotCount> command_slots{};
     UINT command_slot_index = 0;
     UINT active_command_slot_index = 0;
@@ -614,10 +639,32 @@ std::size_t align_up(std::size_t value, std::size_t alignment) {
     return (value + alignment - 1u) / alignment * alignment;
 }
 
+std::string dxr_query_gpu_name(const dxr_backend_state &state) {
+    DXGI_ADAPTER_DESC1 adapter_desc{};
+    if (state.adapter != nullptr && SUCCEEDED(state.adapter->GetDesc1(&adapter_desc))) {
+        return dxr_wide_to_utf8(adapter_desc.Description);
+    }
+    if (state.factory == nullptr || state.device == nullptr) {
+        return {};
+    }
+
+    IDXGIAdapter1* adapter = nullptr;
+    const HRESULT hr = state.factory->EnumAdapterByLuid(
+        state.device->GetAdapterLuid(),
+        IID_PPV_ARGS(&adapter));
+    if (FAILED(hr) || adapter == nullptr) {
+        return {};
+    }
+    const bool succeeded = SUCCEEDED(adapter->GetDesc1(&adapter_desc));
+    adapter->Release();
+    return succeeded ? dxr_wide_to_utf8(adapter_desc.Description) : std::string();
+}
+
 rt_rhi_device_info dxr_backend_info(const dxr_backend_state &state) {
     return {
         rt_rhi_backend_kind::d3d12_dxr,
         "d3d12_dxr",
+        state.gpu_name.c_str(),
         state.raytracing_supported,
     };
 }
@@ -2818,6 +2865,10 @@ bool initialize_dxr_native(dxr_backend_state &state, const rt_rhi_device_desc &d
             append_rt_startup_log(detail);
         }
         return false;
+    }
+    state.gpu_name = dxr_query_gpu_name(state);
+    if (state.gpu_name.empty()) {
+        state.gpu_name = "Unknown GPU";
     }
     state.native_d3d12_texture_present_supported =
         desc.native_device != nullptr &&

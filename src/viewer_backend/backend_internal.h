@@ -11,6 +11,8 @@ struct rt_render_request {
     int height = 0;
     const frame_scene* scene = nullptr;
     bool has_frame = false;
+    float render_scale_x = 1.0f;
+    float render_scale_y = 1.0f;
 };
 
 struct rt_pick_request {

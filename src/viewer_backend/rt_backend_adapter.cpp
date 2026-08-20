@@ -47,7 +47,7 @@ private:
 
 backend_info selected_info() {
     if (g_rhi == nullptr) {
-        return {backend_kind::unsupported, "unsupported", {false}};
+        return {backend_kind::unsupported, "unsupported", {false}, ""};
     }
     const rt_rhi_device_info info = g_rhi->info();
     backend_kind kind = backend_kind::unsupported;
@@ -68,6 +68,7 @@ backend_info selected_info() {
         {
             info.hardware_ray_tracing,
         },
+        info.gpu_name,
     };
 }
 
@@ -115,6 +116,8 @@ bool execute_present(const rt_present_request &request, rt_present_result* out_r
     native_request.operation = request.operation;
     native_request.width = request.width;
     native_request.height = request.height;
+    native_request.render_scale_x = request.render_scale_x;
+    native_request.render_scale_y = request.render_scale_y;
     native_request.update_build_info = request.update_build_info;
     native_request.native_target = request.native_target;
     native_request.out_native_target = request.out_native_target;
@@ -169,7 +172,9 @@ bool execute_present(const rt_present_request &request, rt_present_result* out_r
         build,
         request.width,
         request.height,
-        static_cast<std::uint32_t>(mode));
+        static_cast<std::uint32_t>(mode),
+        request.render_scale_x,
+        request.render_scale_y);
     begin_rt_renderer_accumulation(
         renderer,
         next_key,
@@ -200,7 +205,9 @@ bool execute_present(const rt_present_request &request, rt_present_result* out_r
         selection.primitive_index,
         false,
         0,
-        0);
+        0,
+        request.render_scale_x,
+        request.render_scale_y);
     native_request.dispatch = make_rt_dispatch_plan(build, false).kind;
     native_request.reuse_output =
         native_request.dispatch == rt_dispatch_kind::render &&
@@ -286,6 +293,8 @@ bool render_native_d3d12(const rt_render_request &request, void* texture_resourc
         request.has_frame,
         texture_resource,
     };
+    present.render_scale_x = request.render_scale_x;
+    present.render_scale_y = request.render_scale_y;
     rt_present_result result{};
     const bool succeeded = execute_present(present, &result);
     g_latest_native_delivery_submission = native_delivery_submission(
@@ -307,6 +316,8 @@ bool render_native_metal(const rt_render_request &request, void* pixel_buffer) {
         request.has_frame,
         pixel_buffer,
     };
+    present.render_scale_x = request.render_scale_x;
+    present.render_scale_y = request.render_scale_y;
     rt_present_result result{};
     const bool succeeded = execute_present(present, &result);
     g_latest_native_delivery_submission = native_delivery_submission(
@@ -327,6 +338,8 @@ bool render_native_vulkan(const rt_render_request &request, void** out_image) {
         request.scene,
         request.has_frame,
     };
+    present.render_scale_x = request.render_scale_x;
+    present.render_scale_y = request.render_scale_y;
     present.out_native_target = out_image;
     rt_present_result result{};
     const bool succeeded = execute_present(present, &result);
@@ -348,6 +361,8 @@ bool capture_bgra(
         request.scene,
         request.has_frame,
     };
+    present.render_scale_x = request.render_scale_x;
+    present.render_scale_y = request.render_scale_y;
     present.out_pixels = out_pixels;
     present.update_build_info = update_build_info;
     return execute_present(present);
@@ -370,6 +385,8 @@ bool capture_png(const wchar_t* path, const rt_render_request &request) {
         request.height,
         request.scene,
         request.has_frame};
+    present.render_scale_x = request.render_scale_x;
+    present.render_scale_y = request.render_scale_y;
     present.out_pixels = &pixels;
     rt_present_result result{};
     if (!execute_present(present, &result)) {
@@ -494,7 +511,9 @@ bool pick(const rt_pick_request &request, pick_result* out_result) {
         selection.primitive_index,
         true,
         request.pixel_x,
-        request.pixel_y);
+        request.pixel_y,
+        request.render.render_scale_x,
+        request.render.render_scale_y);
     bool native_pending = false;
     rt_pick_dispatch_request completed_request{};
     const bool succeeded = dispatch_rt_renderer_pick(
