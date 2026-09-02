@@ -823,25 +823,25 @@ inline void finalize_explicit_frame(client_state* c) {
 
 
 
-inline bool connect(const config* cfg, const char* app_name) {
+bool connect(const config* cfg, const char* app_name) {
     detail::client_state &c = detail::global_client();
     detail::disconnect_client(&c);
     return detail::connect_client(&c, cfg, app_name);
 }
 
-inline void disconnect() {
+void disconnect() {
     detail::client_state &c = detail::global_client();
     detail::finalize_explicit_frame(&c);
     detail::disconnect_client(&c);
 }
 
-inline bool is_connected() {
+bool is_connected() {
     return detail::global_client().socket != nullptr;
 }
 
 
 
-inline bool begin_frame() {
+bool begin_frame() {
     detail::client_state &c = detail::global_client();
     if (c.explicit_frame_open) {
         return false;
@@ -853,7 +853,7 @@ inline bool begin_frame() {
     return true;
 }
 
-inline bool end_frame() {
+bool end_frame() {
     detail::client_state &c = detail::global_client();
     if (!c.explicit_frame_open) {
         return false;
@@ -867,7 +867,7 @@ inline bool end_frame() {
 
 
 
-inline bool set_perspective_camera(
+bool set_perspective_camera(
     float origin_x, float origin_y, float origin_z,
     float target_x, float target_y, float target_z,
     float up_x, float up_y, float up_z,
@@ -888,7 +888,7 @@ inline bool set_perspective_camera(
     return detail::send_control_message(message_kind::set_camera, &payload, sizeof(payload));
 }
 
-inline bool set_fisheye_camera(
+bool set_fisheye_camera(
     float origin_x, float origin_y, float origin_z,
     float target_x, float target_y, float target_z,
     float up_x, float up_y, float up_z,
@@ -910,7 +910,7 @@ inline bool set_fisheye_camera(
     return detail::send_control_message(message_kind::set_camera, &payload, sizeof(payload));
 }
 
-inline bool set_orthographic_camera(
+bool set_orthographic_camera(
     float origin_x, float origin_y, float origin_z,
     float target_x, float target_y, float target_z,
     float up_x, float up_y, float up_z,
@@ -931,19 +931,19 @@ inline bool set_orthographic_camera(
     return detail::send_control_message(message_kind::set_camera, &payload, sizeof(payload));
 }
 
-inline bool set_reference_grid(reference_grid value) {
+bool set_reference_grid(reference_grid value) {
     const reference_grid_payload payload{value};
     return detail::send_control_message(message_kind::set_reference_grid, &payload, sizeof(payload));
 }
 
-inline bool request_capture(bool full_accumulation) {
+bool request_capture(bool full_accumulation) {
     const capture_request_payload payload{static_cast<std::uint8_t>(full_accumulation ? 1 : 0)};
     return detail::send_control_message(message_kind::request_capture, &payload, sizeof(payload));
 }
 
 
 
-inline bool push_layer(const char* name) {
+bool push_layer(const char* name) {
     detail::client_state &c = detail::global_client();
     if (name == nullptr || name[0] == '\0' || std::strchr(name, '/') != nullptr) {
         return false;
@@ -964,7 +964,7 @@ inline bool push_layer(const char* name) {
     return true;
 }
 
-inline bool pop_layer() {
+bool pop_layer() {
     detail::client_state &c = detail::global_client();
     if (c.socket == nullptr || c.layer_stack.empty()) {
         return false;
@@ -978,11 +978,11 @@ inline bool pop_layer() {
 
 
 
-inline bool clear() {
+bool clear() {
     return detail::send_control_message(message_kind::clear, nullptr, 0);
 }
 
-inline void set_color(float r, float g, float b, float a) {
+void set_color(float r, float g, float b, float a) {
     detail::client_state &c = detail::global_client();
     if (c.socket != nullptr) {
         const std::uint64_t now_tick = detail::current_tick_ms();
@@ -993,7 +993,7 @@ inline void set_color(float r, float g, float b, float a) {
     c.current_color = {r, g, b, a};
 }
 
-inline void set_point_radius(float value) {
+void set_point_radius(float value) {
     if (!(value > 0.0f)) {
         return;
     }
@@ -1007,7 +1007,7 @@ inline void set_point_radius(float value) {
     c.current_point_radius = value;
 }
 
-inline void set_line_radius(float value) {
+void set_line_radius(float value) {
     if (!(value > 0.0f)) {
         return;
     }
@@ -1021,7 +1021,7 @@ inline void set_line_radius(float value) {
     c.current_line_radius = value;
 }
 
-inline bool triangle(
+bool triangle(
     float ax, float ay, float az,
     float bx, float by, float bz,
     float cx, float cy, float cz,
@@ -1057,7 +1057,7 @@ inline bool triangle(
     return true;
 }
 
-inline bool point(float x, float y, float z, std::uint32_t user_data) {
+bool point(float x, float y, float z, std::uint32_t user_data) {
     detail::client_state &c = detail::global_client();
     if (!(c.current_point_radius > 0.0f)) {
         return false;
@@ -1085,7 +1085,7 @@ inline bool point(float x, float y, float z, std::uint32_t user_data) {
     return true;
 }
 
-inline bool line(float ax, float ay, float az, float bx, float by, float bz, std::uint32_t user_data) {
+bool line(float ax, float ay, float az, float bx, float by, float bz, std::uint32_t user_data) {
     detail::client_state &c = detail::global_client();
     if (!(c.current_line_radius > 0.0f)) {
         return false;
@@ -1113,7 +1113,7 @@ inline bool line(float ax, float ay, float az, float bx, float by, float bz, std
     return true;
 }
 
-inline bool flush() {
+bool flush() {
     detail::client_state &c = detail::global_client();
     if (c.socket == nullptr) {
         return false;

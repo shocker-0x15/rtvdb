@@ -45,9 +45,9 @@ struct loaded_mesh {
 struct options {
     std::filesystem::path mesh_path;
     std::uint64_t batch_size = 512;
-    std::uint64_t sleep_ms = 250;
-    std::uint64_t sleep_ms_min = 250;
-    std::uint64_t sleep_ms_max = 250;
+    std::uint64_t sleep_ms = 0;
+    std::uint64_t sleep_ms_min = 0;
+    std::uint64_t sleep_ms_max = 0;
     std::uint64_t triangle_limit = 0;
     float line_radius = 0.0f;
     bool line_radius_override = false;

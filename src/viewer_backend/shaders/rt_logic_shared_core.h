@@ -264,6 +264,7 @@ float4 apply_selection_highlight(
             ? float3(0.08, 0.08, 0.08)
             : float3(0.95, 0.95, 0.95);
         color.rgb = color.rgb + (target - color.rgb) * 0.65;
+        color.a = 1.0;
     }
     return color;
 }
