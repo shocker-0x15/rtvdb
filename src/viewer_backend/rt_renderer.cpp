@@ -9,6 +9,13 @@
 
 namespace rtvdb::viewer_backend {
 
+bool resolve_layer_tlas_instance_source(
+    const rt_scene_build &build,
+    const rt_acceleration_build_item &item,
+    std::string* out_layer,
+    bool* out_fallback_visible,
+    bool* out_layer_visibility_exempt);
+
 namespace {
 
 constexpr std::size_t kRtPickResultBufferBytes = sizeof(rt_pick_gpu_result);
@@ -1331,6 +1338,8 @@ bool sync_rt_renderer_acceleration(
     renderer->last_line_blas_prebuild_info_count = 0;
     std::vector<rt_tlas_instance_desc> tlas_instances;
     tlas_instances.reserve(commands.blas_commands.size());
+    std::vector<rt_layer_tlas_instance> layer_tlas_instances;
+    layer_tlas_instances.reserve(commands.blas_commands.size());
     for (std::size_t command_index = 0;
         command_index < commands.blas_commands.size();
         ++command_index) {
@@ -1418,6 +1427,24 @@ bool sync_rt_renderer_acceleration(
         instance.mask = command.visible ? 0xff : 0x00;
         instance.hit_group_contribution = command.hit_group_contribution;
         tlas_instances.push_back(instance);
+
+        rt_layer_tlas_instance layer_instance{};
+        layer_instance.instance = instance;
+        layer_instance.kind = command.kind;
+        layer_instance.geometry_count = command.geometry_count;
+        if (!resolve_layer_tlas_instance_source(
+                *request.build,
+                build_plan.items[command_index],
+                &layer_instance.layer,
+                &layer_instance.fallback_visible,
+                &layer_instance.layer_visibility_exempt)) {
+            stage_error = {
+                rt_rhi_operation::build_tlas,
+                0,
+                "RT layer TLAS instance source is invalid"};
+            return fail_build();
+        }
+        layer_tlas_instances.push_back(std::move(layer_instance));
     }
 
     const rt_tlas_build_desc tlas_desc{
@@ -1460,8 +1487,9 @@ bool sync_rt_renderer_acceleration(
     out_result->blas_reused_triangle_chunk_count = summary.blas_reused_triangle_chunk_count;
     out_result->blas_rebuilt_triangle_chunk_count = summary.blas_rebuilt_triangle_chunk_count;
     out_result->tlas_rebuild_count = summary.tlas_rebuild_count;
-    renderer->submitted_acceleration_revision = resources.revision;
-    renderer->submitted_acceleration_summary = summary;
+    const std::uint64_t submitted_revision = request.scene_revision != 0
+        ? request.scene_revision
+        : resources.revision;
     const double command_record_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - sync_start).count();
     out_result->acceleration_timing.command_record_ms += command_record_ms;
@@ -1472,8 +1500,12 @@ bool sync_rt_renderer_acceleration(
         deferred_acceleration->created_accelerations = std::move(created_accelerations);
         deferred_acceleration->acquired_accelerations = std::move(acquired_accelerations);
         deferred_acceleration->retired_accelerations = std::move(retired_accelerations);
+        deferred_acceleration->next_layer_tlas_instances = std::move(layer_tlas_instances);
         deferred_acceleration->scene_revision = resources.revision;
+        deferred_acceleration->presentation_revision = submitted_revision;
         deferred_acceleration->connection_serial = resources.connection_serial;
+        deferred_acceleration->acceleration_summary = summary;
+        deferred_acceleration->scene_changed = true;
         return true;
     }
 
@@ -1490,6 +1522,9 @@ bool sync_rt_renderer_acceleration(
     for (rt_blas_storage_pool_entry &entry : retired_accelerations) {
         enqueue_blas_storage_pool_entry(renderer, std::move(entry), submission);
     }
+    renderer->submitted_acceleration_revision = submitted_revision;
+    renderer->submitted_acceleration_summary = summary;
+    renderer->layer_tlas_instances = std::move(layer_tlas_instances);
     destroy_scene_upload_buffers(renderer, &renderer->scene_buffers);
     return true;
 }
@@ -1502,14 +1537,20 @@ void commit_deferred_acceleration_submission(
         !deferred_acceleration->encoder) {
         return;
     }
-    renderer->blas_cache_state = std::move(deferred_acceleration->next_blas_cache_state);
-    for (rt_blas_storage_pool_entry &entry : deferred_acceleration->retired_accelerations) {
-        enqueue_blas_storage_pool_entry(renderer, std::move(entry), renderer->last_submission);
+    if (deferred_acceleration->scene_changed) {
+        renderer->blas_cache_state = std::move(deferred_acceleration->next_blas_cache_state);
+        for (rt_blas_storage_pool_entry &entry : deferred_acceleration->retired_accelerations) {
+            enqueue_blas_storage_pool_entry(renderer, std::move(entry), renderer->last_submission);
+        }
+        renderer->layer_tlas_instances = std::move(deferred_acceleration->next_layer_tlas_instances);
+        destroy_scene_upload_buffers(renderer, &renderer->scene_buffers);
+        renderer->frame_state.scene_revision = deferred_acceleration->scene_revision;
+        renderer->frame_state.scene_valid = true;
+        renderer->current_connection_serial = deferred_acceleration->connection_serial;
     }
-    destroy_scene_upload_buffers(renderer, &renderer->scene_buffers);
-    renderer->frame_state.scene_revision = deferred_acceleration->scene_revision;
-    renderer->frame_state.scene_valid = true;
-    renderer->current_connection_serial = deferred_acceleration->connection_serial;
+    renderer->frame_state.presentation_revision = deferred_acceleration->presentation_revision;
+    renderer->submitted_acceleration_revision = deferred_acceleration->presentation_revision;
+    renderer->submitted_acceleration_summary = deferred_acceleration->acceleration_summary;
     *deferred_acceleration = {};
 }
 
@@ -1626,6 +1667,7 @@ bool initialize_rt_renderer(
     renderer->pick_slots = {};
     renderer->viewer_constant_buffer = {};
     renderer->blas_cache_state = {};
+    renderer->layer_tlas_instances.clear();
     renderer->current_connection_serial = 0;
     renderer->resource_pool_sequence = 1;
     renderer->last_submission = {};
@@ -1692,6 +1734,7 @@ bool shutdown_rt_renderer(rt_renderer* renderer, rt_rhi_error* out_error) {
     renderer->capabilities = {};
     renderer->frame_state = {};
     renderer->current_connection_serial = 0;
+    renderer->layer_tlas_instances.clear();
     renderer->last_submission = {};
     renderer->resource_pool_sequence = 1;
     renderer->blas_storage_pool_hit_count = 0;
@@ -2947,7 +2990,7 @@ bool collect_rt_renderer_render_submissions(
             return false;
         }
         if (pending.confirms_scene &&
-            pending.scene_revision == renderer->frame_state.scene_revision) {
+            pending.scene_revision == renderer->frame_state.presentation_revision) {
             renderer->last_acceleration_revision = pending.scene_revision;
             renderer->last_acceleration_summary = pending.acceleration_summary;
         }
@@ -3021,6 +3064,247 @@ bool track_rt_renderer_delivery_submission(
     return true;
 }
 
+bool effective_layer_visibility(
+    const layer_visibility_map* visibility,
+    const std::string &path,
+    bool fallback)
+{
+    if (visibility == nullptr || visibility->empty()) {
+        return fallback;
+    }
+    bool found_visibility = false;
+    std::size_t separator = 0;
+    for (;;) {
+        separator = path.find('/', separator);
+        const auto found = visibility->find(path.substr(0, separator));
+        if (found != visibility->end()) {
+            found_visibility = true;
+            if (!found->second) {
+                return false;
+            }
+        }
+        if (separator == std::string::npos) {
+            break;
+        }
+        ++separator;
+    }
+    return found_visibility ? true : fallback;
+}
+
+bool resolve_layer_tlas_instance_source(
+    const rt_scene_build &build,
+    const rt_acceleration_build_item &item,
+    std::string* out_layer,
+    bool* out_fallback_visible,
+    bool* out_layer_visibility_exempt)
+{
+    if (out_layer == nullptr || out_fallback_visible == nullptr ||
+        out_layer_visibility_exempt == nullptr || item.group.chunk_count == 0 ||
+        item.group.chunk_count > kRtBlasChunkSetChunkCount) {
+        return false;
+    }
+
+    const auto resolve_chunk = [&](std::size_t chunk_index,
+                                   const std::string** out_chunk_layer,
+                                   bool* out_chunk_visible,
+                                   bool* out_chunk_exempt) {
+        if (out_chunk_layer == nullptr || out_chunk_visible == nullptr || out_chunk_exempt == nullptr) {
+            return false;
+        }
+        switch (item.kind) {
+        case rt_acceleration_geometry_kind::triangle:
+            if (chunk_index >= build.triangle_chunks.size()) {
+                return false;
+            }
+            *out_chunk_layer = &build.triangle_chunks[chunk_index].layer;
+            *out_chunk_visible = build.triangle_chunks[chunk_index].visible;
+            *out_chunk_exempt = build.triangle_chunks[chunk_index].layer_visibility_exempt;
+            return true;
+        case rt_acceleration_geometry_kind::point:
+            if (chunk_index >= build.point_chunks.size()) {
+                return false;
+            }
+            *out_chunk_layer = &build.point_chunks[chunk_index].layer;
+            *out_chunk_visible = build.point_chunks[chunk_index].visible;
+            *out_chunk_exempt = build.point_chunks[chunk_index].layer_visibility_exempt;
+            return true;
+        case rt_acceleration_geometry_kind::line:
+            if (chunk_index >= build.line_chunks.size()) {
+                return false;
+            }
+            *out_chunk_layer = &build.line_chunks[chunk_index].layer;
+            *out_chunk_visible = build.line_chunks[chunk_index].visible;
+            *out_chunk_exempt = build.line_chunks[chunk_index].layer_visibility_exempt;
+            return true;
+        default:
+            return false;
+        }
+    };
+
+    const std::string* first_layer = nullptr;
+    bool first_visible = true;
+    bool first_exempt = false;
+    if (!resolve_chunk(
+            item.group.chunk_indices[0],
+            &first_layer,
+            &first_visible,
+            &first_exempt) ||
+        first_layer == nullptr) {
+        return false;
+    }
+    for (std::size_t geometry_index = 1; geometry_index < item.group.chunk_count; ++geometry_index) {
+        const std::string* layer = nullptr;
+        bool visible = true;
+        bool exempt = false;
+        if (!resolve_chunk(
+                item.group.chunk_indices[geometry_index],
+                &layer,
+                &visible,
+                &exempt) ||
+            layer == nullptr || *layer != *first_layer || visible != first_visible || exempt != first_exempt) {
+            return false;
+        }
+    }
+    *out_layer = *first_layer;
+    *out_fallback_visible = first_visible;
+    *out_layer_visibility_exempt = first_exempt;
+    return true;
+}
+
+bool apply_layer_visibility(
+    const rt_scene_build &build,
+    const rt_acceleration_build_plan &build_plan,
+    const layer_visibility_map* visibility,
+    rt_acceleration_command_plan* commands)
+{
+    if (commands == nullptr || commands->blas_commands.size() != build_plan.items.size()) {
+        return false;
+    }
+    for (std::size_t item_index = 0; item_index < build_plan.items.size(); ++item_index) {
+        const rt_acceleration_build_item &item = build_plan.items[item_index];
+        std::string layer;
+        bool fallback = true;
+        bool visibility_exempt = false;
+        if (!resolve_layer_tlas_instance_source(
+                build,
+                item,
+                &layer,
+                &fallback,
+                &visibility_exempt)) {
+            return false;
+        }
+        commands->blas_commands[item_index].visible =
+            visibility_exempt ? fallback : effective_layer_visibility(visibility, layer, fallback);
+    }
+    return true;
+}
+
+bool sync_rt_renderer_layer_visibility(
+    rt_renderer* renderer,
+    const rt_renderer_frame_request &request,
+    std::uint64_t presentation_revision,
+    rt_renderer_frame_result* out_result,
+    rt_rhi_error* out_error,
+    rt_deferred_acceleration_submission* deferred_acceleration)
+{
+    if (renderer == nullptr || renderer->rhi == nullptr || request.build == nullptr ||
+        out_result == nullptr || !renderer->frame_state.scene_valid || !renderer->tlas ||
+        renderer->current_connection_serial != request.build->connection_serial) {
+        set_frame_error(
+            out_error,
+            rt_rhi_operation::begin_commands,
+            "RT layer visibility update request is invalid");
+        return false;
+    }
+
+    std::vector<rt_tlas_instance_desc> instances;
+    instances.reserve(renderer->layer_tlas_instances.size());
+    rt_acceleration_build_summary summary{};
+    for (const rt_layer_tlas_instance &source : renderer->layer_tlas_instances) {
+        if (!source.instance.acceleration || source.geometry_count == 0) {
+            set_frame_error(
+                out_error,
+                rt_rhi_operation::build_tlas,
+                "RT layer visibility instance is invalid");
+            return false;
+        }
+        rt_tlas_instance_desc instance = source.instance;
+        const bool visible = source.layer_visibility_exempt
+            ? source.fallback_visible
+            : effective_layer_visibility(
+                  request.layer_visibility,
+                  source.layer,
+                  source.fallback_visible);
+        instance.mask = visible ? 0xff : 0x00;
+        instances.push_back(instance);
+        ++summary.blas_reused_count;
+        if (source.kind == rt_acceleration_geometry_kind::triangle) {
+            summary.blas_reused_triangle_chunk_count += source.geometry_count;
+        }
+    }
+
+    rt_command_encoder encoder{};
+    rt_rhi_error stage_error{rt_rhi_operation::begin_commands, 0, {}};
+    if (!begin_rt_commands(
+            renderer,
+            rt_queue_class::graphics,
+            &encoder,
+            &stage_error,
+            &out_result->acceleration_timing)) {
+        if (out_error != nullptr) {
+            *out_error = stage_error;
+        }
+        return false;
+    }
+    const auto sync_start = std::chrono::steady_clock::now();
+    const rt_tlas_build_desc tlas_desc{
+        renderer->tlas,
+        instances.data(),
+        instances.size(),
+        rt_acceleration_build_prefer_fast_trace};
+    stage_error = {rt_rhi_operation::build_tlas, 0, {}};
+    if (!renderer->rhi->build_tlas(encoder, tlas_desc, &stage_error)) {
+        discard_rt_commands(renderer, encoder);
+        if (out_error != nullptr) {
+            *out_error = stage_error;
+        }
+        return false;
+    }
+    summary.tlas_rebuild_count = instances.empty() ? 0 : 1;
+    const double command_record_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - sync_start).count();
+    out_result->blas_reused_count = summary.blas_reused_count;
+    out_result->blas_reused_triangle_chunk_count = summary.blas_reused_triangle_chunk_count;
+    out_result->tlas_rebuild_count = summary.tlas_rebuild_count;
+    out_result->acceleration_timing.command_record_ms += command_record_ms;
+    renderer->last_acceleration_cpu_ms = command_record_ms;
+    if (deferred_acceleration != nullptr) {
+        deferred_acceleration->encoder = encoder;
+        deferred_acceleration->presentation_revision = presentation_revision;
+        deferred_acceleration->acceleration_summary = summary;
+        deferred_acceleration->scene_changed = false;
+        return true;
+    }
+
+    rt_submission_token submission{};
+    stage_error = {rt_rhi_operation::submit_commands, 0, {}};
+    if (!submit_rt_commands(
+            renderer,
+            encoder,
+            &submission,
+            &out_result->acceleration_timing,
+            &stage_error)) {
+        discard_rt_commands(renderer, encoder);
+        if (out_error != nullptr) {
+            *out_error = stage_error;
+        }
+        return false;
+    }
+    renderer->submitted_acceleration_revision = presentation_revision;
+    renderer->submitted_acceleration_summary = summary;
+    return true;
+}
+
 bool prepare_rt_renderer_frame(
     rt_renderer* renderer,
     const rt_renderer_frame_request &request,
@@ -3063,12 +3347,18 @@ bool prepare_rt_renderer_frame(
     const auto preparation_start = std::chrono::steady_clock::now();
     renderer->frame_state.active = true;
     rt_renderer_frame_result result{};
+    const std::uint64_t presentation_revision = request.scene_revision != 0
+        ? request.scene_revision
+        : request.build->revision;
+    const std::uint64_t geometry_revision = request.build->revision;
     result.output_changed = request.require_output &&
         (!renderer->frame_state.output_valid ||
             renderer->frame_state.output_width != request.width ||
             renderer->frame_state.output_height != request.height);
     result.scene_changed = !renderer->frame_state.scene_valid ||
-        renderer->frame_state.scene_revision != request.build->revision;
+        renderer->frame_state.scene_revision != geometry_revision;
+    const bool visibility_changed = !result.scene_changed &&
+        renderer->frame_state.presentation_revision != presentation_revision;
     const bool connection_changed = renderer->current_connection_serial != 0 &&
         renderer->current_connection_serial != request.build->connection_serial;
 
@@ -3114,6 +3404,19 @@ bool prepare_rt_renderer_frame(
                 "RT acceleration command plan is invalid");
             return false;
         }
+        if (!apply_layer_visibility(
+                *request.build,
+                acceleration_plan,
+                request.layer_visibility,
+                &acceleration_commands)) {
+            renderer->frame_state.active = false;
+            set_frame_error(out_error, rt_rhi_operation::begin_frame, "RT layer visibility is invalid");
+            return false;
+        }
+        acceleration_plan.revision = geometry_revision;
+        blas_cache_plan.revision = geometry_revision;
+        resources.revision = geometry_revision;
+        acceleration_commands.revision = geometry_revision;
         resolved_request.acceleration_plan = &acceleration_plan;
         resolved_request.blas_cache_plan = &blas_cache_plan;
         resolved_request.resources = &resources;
@@ -3188,7 +3491,18 @@ bool prepare_rt_renderer_frame(
         renderer->frame_state.active = false;
         return false;
     }
-    result.acceleration_changed = result.scene_changed;
+    if (visibility_changed &&
+        !sync_rt_renderer_layer_visibility(
+            renderer,
+            resolved_request,
+            presentation_revision,
+            &result,
+            out_error,
+            deferred_acceleration)) {
+        renderer->frame_state.active = false;
+        return false;
+    }
+    result.acceleration_changed = result.scene_changed || visibility_changed;
     if (result.scene_changed &&
         (deferred_acceleration == nullptr || !deferred_acceleration->encoder)) {
         renderer->blas_cache_state = std::move(blas_cache_plan.next_state);
@@ -3232,7 +3546,8 @@ bool prepare_rt_renderer_frame(
     }
 
     if (deferred_acceleration == nullptr || !deferred_acceleration->encoder) {
-        renderer->frame_state.scene_revision = request.build->revision;
+        renderer->frame_state.scene_revision = geometry_revision;
+        renderer->frame_state.presentation_revision = presentation_revision;
         renderer->frame_state.scene_valid = true;
         if (result.scene_changed) {
             renderer->current_connection_serial = request.build->connection_serial;

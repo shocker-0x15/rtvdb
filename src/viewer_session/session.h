@@ -58,6 +58,9 @@ struct session_config {
 
 bool start_session(const session_callbacks &callbacks, const session_config &config);
 void copy_latest_scene(viewer_backend::frame_scene* out_scene, bool* out_has_frame);
+bool acquire_latest_scene(
+    std::shared_ptr<const viewer_backend::frame_scene>* out_scene,
+    bool* out_has_frame);
 void copy_recent_logs(std::vector<log_entry>* out_logs);
 void copy_last_error_message(char* out_message, std::size_t out_message_size);
 std::uint64_t milliseconds_since_session_start();

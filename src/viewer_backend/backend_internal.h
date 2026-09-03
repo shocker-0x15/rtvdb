@@ -13,6 +13,9 @@ struct rt_render_request {
     bool has_frame = false;
     float render_scale_x = 1.0f;
     float render_scale_y = 1.0f;
+    std::uint64_t scene_revision = 0;
+    std::shared_ptr<const layer_visibility_map> layer_visibility;
+    std::shared_ptr<const rt_scene_build> build_snapshot;
 };
 
 struct rt_pick_request {
@@ -58,6 +61,5 @@ const backend_ops* rt_backend_ops();
 
 void copy_present_render_scene(frame_scene* out_scene, bool* out_has_frame);
 void copy_present_client_rt_scene_build(rt_scene_build* out_build);
-void copy_present_render_rt_scene_build(rt_scene_build* out_build);
 
 } // namespace rtvdb::viewer_backend

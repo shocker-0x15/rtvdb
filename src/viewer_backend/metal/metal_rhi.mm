@@ -489,7 +489,8 @@ private:
         std::size_t* acceleration_size,
         id<MTLBuffer>* scratch,
         std::size_t* scratch_size,
-        bool* out_reused);
+        bool* out_reused,
+        bool force_replacement = false);
     bool initialize_timestamp_resources();
     void release_timestamp_resources();
     bool create_dispatch_timestamp_buffer(
@@ -1064,7 +1065,8 @@ bool metal_rhi_device::ensure_acceleration_storage(
     std::size_t* acceleration_size,
     id<MTLBuffer>* scratch,
     std::size_t* scratch_size,
-    bool* out_reused)
+    bool* out_reused,
+    bool force_replacement)
 {
     if (out_reused != nullptr) {
         *out_reused = false;
@@ -1077,8 +1079,10 @@ bool metal_rhi_device::ensure_acceleration_storage(
         return false;
     }
 
-    const bool acceleration_reused = *acceleration != nil && *acceleration_size >= required_size;
-    const bool scratch_reused = *scratch != nil && *scratch_size >= required_scratch_size;
+    const bool acceleration_reused = !force_replacement &&
+        *acceleration != nil && *acceleration_size >= required_size;
+    const bool scratch_reused = !force_replacement &&
+        *scratch != nil && *scratch_size >= required_scratch_size;
     id<MTLAccelerationStructure> replacement_acceleration = nil;
     id<MTLBuffer> replacement_scratch = nil;
     if (!acceleration_reused) {
@@ -2636,6 +2640,10 @@ bool metal_rhi_device::build_tlas(
     ++diagnostics_.tlas_prebuild_query_count;
 
     bool reused = false;
+    const bool has_in_flight_commands = std::any_of(
+        command_slots_.begin(),
+        command_slots_.end(),
+        [](const metal_command_slot &candidate) { return candidate.pending; });
     const auto allocation_begin = std::chrono::steady_clock::now();
     const bool storage_ready = ensure_acceleration_storage(
         sizes.accelerationStructureSize,
@@ -2644,7 +2652,8 @@ bool metal_rhi_device::build_tlas(
         &destination->allocation_size,
         &destination->scratch,
         &destination->scratch_size,
-        &reused);
+        &reused,
+        has_in_flight_commands);
     diagnostics_.acceleration_resource_allocate_ms +=
         elapsed_ms(allocation_begin, std::chrono::steady_clock::now());
     (void)reused;

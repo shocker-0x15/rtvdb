@@ -147,13 +147,17 @@ bool execute_present(const rt_present_request &request, rt_present_result* out_r
     }
 
     const auto scene_snapshot_start = std::chrono::steady_clock::now();
-    rt_scene_build build{};
-    copy_present_render_rt_scene_build(&build);
+    if (request.build_snapshot == nullptr) {
+        return false;
+    }
+    const rt_scene_build &build = *request.build_snapshot;
     const double scene_snapshot_cpu_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - scene_snapshot_start).count();
     rt_renderer_frame_result frame_result{};
     rt_deferred_acceleration_submission deferred_acceleration{};
-    const rt_renderer_frame_request frame_request{&build, request.width, request.height, true, false};
+    rt_renderer_frame_request frame_request{&build, request.width, request.height, true, false};
+    frame_request.scene_revision = request.scene_revision;
+    frame_request.layer_visibility = request.layer_visibility.get();
     if (!prepare_rt_renderer_frame(
             renderer,
             frame_request,
@@ -166,7 +170,7 @@ bool execute_present(const rt_present_request &request, rt_present_result* out_r
     const auto rt_output_prepare_start = std::chrono::steady_clock::now();
     display_mode mode = display_mode::triangle_normal;
     get_display_mode(&mode);
-    const rt_accumulation_key next_key = make_rt_accumulation_key(
+    rt_accumulation_key next_key = make_rt_accumulation_key(
         *request.scene,
         request.has_frame,
         build,
@@ -175,6 +179,7 @@ bool execute_present(const rt_present_request &request, rt_present_result* out_r
         static_cast<std::uint32_t>(mode),
         request.render_scale_x,
         request.render_scale_y);
+    next_key.build_revision = request.scene_revision != 0 ? request.scene_revision : build.revision;
     begin_rt_renderer_accumulation(
         renderer,
         next_key,
@@ -295,6 +300,9 @@ bool render_native_d3d12(const rt_render_request &request, void* texture_resourc
     };
     present.render_scale_x = request.render_scale_x;
     present.render_scale_y = request.render_scale_y;
+    present.scene_revision = request.scene_revision;
+    present.layer_visibility = request.layer_visibility;
+    present.build_snapshot = request.build_snapshot;
     rt_present_result result{};
     const bool succeeded = execute_present(present, &result);
     g_latest_native_delivery_submission = native_delivery_submission(
@@ -318,6 +326,9 @@ bool render_native_metal(const rt_render_request &request, void* pixel_buffer) {
     };
     present.render_scale_x = request.render_scale_x;
     present.render_scale_y = request.render_scale_y;
+    present.scene_revision = request.scene_revision;
+    present.layer_visibility = request.layer_visibility;
+    present.build_snapshot = request.build_snapshot;
     rt_present_result result{};
     const bool succeeded = execute_present(present, &result);
     g_latest_native_delivery_submission = native_delivery_submission(
@@ -340,6 +351,9 @@ bool render_native_vulkan(const rt_render_request &request, void** out_image) {
     };
     present.render_scale_x = request.render_scale_x;
     present.render_scale_y = request.render_scale_y;
+    present.scene_revision = request.scene_revision;
+    present.layer_visibility = request.layer_visibility;
+    present.build_snapshot = request.build_snapshot;
     present.out_native_target = out_image;
     rt_present_result result{};
     const bool succeeded = execute_present(present, &result);
@@ -363,6 +377,9 @@ bool capture_bgra(
     };
     present.render_scale_x = request.render_scale_x;
     present.render_scale_y = request.render_scale_y;
+    present.scene_revision = request.scene_revision;
+    present.layer_visibility = request.layer_visibility;
+    present.build_snapshot = request.build_snapshot;
     present.out_pixels = out_pixels;
     present.update_build_info = update_build_info;
     return execute_present(present);
@@ -387,6 +404,9 @@ bool capture_png(const wchar_t* path, const rt_render_request &request) {
         request.has_frame};
     present.render_scale_x = request.render_scale_x;
     present.render_scale_y = request.render_scale_y;
+    present.scene_revision = request.scene_revision;
+    present.layer_visibility = request.layer_visibility;
+    present.build_snapshot = request.build_snapshot;
     present.out_pixels = &pixels;
     rt_present_result result{};
     if (!execute_present(present, &result)) {
@@ -465,19 +485,23 @@ bool pick(const rt_pick_request &request, pick_result* out_result) {
         append_rt_rhi_error_log("collect_rt_renderer_render_submissions", error);
         return false;
     }
-    rt_scene_build build{};
-    copy_present_render_rt_scene_build(&build);
+    if (request.render.build_snapshot == nullptr) {
+        return false;
+    }
+    const rt_scene_build &build = *request.render.build_snapshot;
     if (make_rt_dispatch_plan(build, true).kind != rt_dispatch_kind::pick) {
         return false;
     }
 
-    const rt_renderer_frame_request frame_request{
+    rt_renderer_frame_request frame_request{
         &build,
         request.render.width,
         request.render.height,
         true,
         true,
     };
+    frame_request.scene_revision = request.render.scene_revision;
+    frame_request.layer_visibility = request.render.layer_visibility.get();
     rt_renderer_frame_result frame_result{};
     if (!prepare_rt_renderer_frame(renderer, frame_request, &frame_result, &error)) {
         append_rt_rhi_error_log("prepare_rt_renderer_frame", error);
@@ -491,7 +515,7 @@ bool pick(const rt_pick_request &request, pick_result* out_result) {
     selection_highlight selection{};
     get_selection_highlight(&selection);
     rt_pick_dispatch_request dispatch_request{
-        build.revision,
+        request.render.scene_revision != 0 ? request.render.scene_revision : build.revision,
         request.render.width,
         request.render.height,
         request.pixel_x,

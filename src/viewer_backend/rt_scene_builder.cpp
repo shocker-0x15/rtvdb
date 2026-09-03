@@ -133,7 +133,8 @@ std::vector<rt_blas_chunk_set> build_blas_chunk_sets(const std::vector<Chunk> &c
         for (std::size_t chunk_index = bucket_start; chunk_index < chunks.size(); ++chunk_index) {
             const Chunk &candidate = chunks[chunk_index];
             if (claimed[chunk_index] || (require_sealed && !candidate.sealed) ||
-                candidate.layer != bucket_source.layer || candidate.visible != bucket_source.visible) {
+                candidate.layer != bucket_source.layer || candidate.visible != bucket_source.visible ||
+                candidate.layer_visibility_exempt != bucket_source.layer_visibility_exempt) {
                 continue;
             }
             claimed[chunk_index] = true;
@@ -482,6 +483,7 @@ bool build_rt_scene_overlay_input(
 
     const std::size_t effective_group_size =
         (std::max)(std::size_t{1}, kDefaultRtSceneProceduralChunkPrimitives);
+    const std::size_t base_point_count = base_build.point_count;
     for (std::size_t first = 0; first < scene.points.size();) {
         if (should_cancel()) {
             return false;
@@ -489,7 +491,8 @@ bool build_rt_scene_overlay_input(
         std::size_t end = first + 1;
         while (end < scene.points.size() && end - first < effective_group_size &&
                scene.points[end].layer == scene.points[first].layer &&
-               scene.points[end].visible == scene.points[first].visible) {
+               scene.points[end].visible == scene.points[first].visible &&
+               (end < base_point_count) == (first < base_point_count)) {
             ++end;
         }
         rt_procedural_chunk group{};
@@ -497,6 +500,7 @@ bool build_rt_scene_overlay_input(
         group.primitive_count = end - first;
         group.layer = scene.points[first].layer;
         group.visible = scene.points[first].visible;
+        group.layer_visibility_exempt = first >= base_point_count;
         for (std::size_t index = first; index < end; ++index) {
             expand_bounds(&group.bounds, scene.points[index]);
         }
@@ -504,6 +508,7 @@ bool build_rt_scene_overlay_input(
         first = end;
     }
 
+    const std::size_t base_line_count = base_build.line_count;
     for (std::size_t first = 0; first < scene.lines.size();) {
         if (should_cancel()) {
             return false;
@@ -511,7 +516,8 @@ bool build_rt_scene_overlay_input(
         std::size_t end = first + 1;
         while (end < scene.lines.size() && end - first < effective_group_size &&
                scene.lines[end].layer == scene.lines[first].layer &&
-               scene.lines[end].visible == scene.lines[first].visible) {
+               scene.lines[end].visible == scene.lines[first].visible &&
+               (end < base_line_count) == (first < base_line_count)) {
             ++end;
         }
         rt_procedural_chunk group{};
@@ -519,6 +525,7 @@ bool build_rt_scene_overlay_input(
         group.primitive_count = end - first;
         group.layer = scene.lines[first].layer;
         group.visible = scene.lines[first].visible;
+        group.layer_visibility_exempt = first >= base_line_count;
         for (std::size_t index = first; index < end; ++index) {
             expand_bounds(&group.bounds, scene.lines[index]);
         }
@@ -526,7 +533,6 @@ bool build_rt_scene_overlay_input(
         first = end;
     }
 
-    const std::size_t base_line_count = base_build.line_count;
     if (base_line_count < scene.lines.size()) {
         for (std::size_t index = base_line_count; index < scene.lines.size(); ++index) {
             expand_bounds(&build.bounds, scene.lines[index]);

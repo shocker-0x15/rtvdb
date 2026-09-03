@@ -93,6 +93,8 @@ constexpr float kLogTabEntriesHeight = 180.0f;
 constexpr float kLayerVisibilityIconWidthScale = 1.45f;
 constexpr float kLayerVisibilityIconHeightScale = 0.58f;
 constexpr float kLayerVisibilityIconStroke = 1.4f;
+constexpr float kLayerSubtreeVisibilityIconScale = 0.78f;
+constexpr float kLayerSubtreeVisibilityCheckStroke = 1.5f;
 constexpr float kLayerHoverHighlightAlpha = 0.18f;
 constexpr float kLayerHoverAncestorHighlightAlpha = 0.10f;
 constexpr std::size_t kMaxRecentViewerLogCount = 64;
@@ -185,10 +187,23 @@ struct layer_tree {
     std::vector<std::size_t> roots;
 };
 
+struct layer_tree_row {
+    std::size_t node_index = 0;
+    std::size_t depth = 0;
+};
+
+enum class layer_subtree_visibility_state {
+    hidden,
+    visible,
+    mixed,
+};
+
 struct layer_visibility_icon_button_result {
     bool pressed = false;
     bool hovered = false;
 };
+
+using layer_subtree_visibility_button_result = layer_visibility_icon_button_result;
 
 struct drag_state {
     bool left_pressed = false;
@@ -206,6 +221,7 @@ struct frame_pacing_state {
         double viewer_pre_render_ms = 0.0;
         double native_target_setup_ms = 0.0;
         double rt_scene_snapshot_ms = 0.0;
+        double rt_backend_other_ms = 0.0;
         double rt_pre_acceleration_prepare_ms = 0.0;
         double as_command_slot_wait_ms = 0.0;
         double acceleration_command_record_ms = 0.0;
@@ -228,6 +244,34 @@ struct frame_pacing_state {
     double average_render_ms = 0.0;
     std::uint64_t average_render_frame_count = 0;
     std::uint64_t average_render_frame_serial = 0;
+};
+
+struct layer_update_timing_state {
+    std::uint64_t generation = 0;
+    std::uint64_t backend_revision = 0;
+    bool pending = false;
+    bool worker_started = false;
+    bool submit_started = false;
+    bool submitted = false;
+    bool ready = false;
+    bool awaiting_present = false;
+    bool has_completed = false;
+    std::chrono::steady_clock::time_point requested_at{};
+    std::chrono::steady_clock::time_point worker_started_at{};
+    std::chrono::steady_clock::time_point submit_started_at{};
+    std::chrono::steady_clock::time_point submitted_at{};
+    std::chrono::steady_clock::time_point ready_at{};
+    std::chrono::steady_clock::time_point completed_at{};
+};
+
+struct layer_update_timing_snapshot {
+    bool has_value = false;
+    double total_ms = 0.0;
+    double worker_wait_ms = 0.0;
+    double scene_copy_filter_ms = 0.0;
+    double backend_enqueue_copy_ms = 0.0;
+    double backend_scene_build_ms = 0.0;
+    double ready_to_present_ms = 0.0;
 };
 
 struct render_diagnostics_state {
@@ -360,6 +404,7 @@ struct status_tree_state {
     bool paint_cpu_work_open = false;
     bool rt_frame_preparation_open = false;
     bool rt_output_open = false;
+    bool layer_update_open = false;
     bool last_as_build_open = false;
     bool scene_build_open = false;
 };
@@ -389,6 +434,14 @@ bool g_layers_open = true;
 std::mutex g_layer_visibility_mutex;
 std::unordered_map<std::string, bool> g_layer_visibility;
 std::vector<std::string> g_layer_paths;
+std::shared_ptr<const layer_tree> g_layer_tree = std::make_shared<const layer_tree>();
+std::uint64_t g_layer_state_revision = 1;
+std::uint64_t g_layer_ui_snapshot_revision = 0;
+std::shared_ptr<const layer_tree> g_layer_ui_tree = g_layer_tree;
+std::unordered_map<std::string, bool> g_layer_ui_visibility;
+std::unordered_map<std::string, bool> g_layer_ui_open;
+std::vector<layer_tree_row> g_layer_ui_rows;
+bool g_layer_ui_rows_dirty = true;
 std::string g_layer_visibility_hovered_path;
 std::uint64_t g_layer_connection_serial = 0;
 std::uint64_t g_pending_auto_frame_connection_serial = 0;
@@ -396,10 +449,140 @@ std::condition_variable g_layer_rebuild_condition;
 std::thread g_layer_rebuild_thread;
 std::uint64_t g_layer_rebuild_generation = 0;
 bool g_layer_rebuild_stop = false;
+std::mutex g_layer_update_timing_mutex;
+layer_update_timing_state g_layer_update_timing{};
 float g_viewer_window_height = 0.0f;
 float g_camera_speed_log10 = 0.0f;
 bool g_display_background_enabled = true;
 float g_display_background_color[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+
+double layer_update_duration_ms(
+    std::chrono::steady_clock::time_point begin,
+    std::chrono::steady_clock::time_point end)
+{
+    return std::chrono::duration<double, std::milli>(end - begin).count();
+}
+
+void begin_layer_update_timing(std::uint64_t generation) {
+    std::scoped_lock lock(g_layer_update_timing_mutex);
+    g_layer_update_timing = {};
+    g_layer_update_timing.generation = generation;
+    g_layer_update_timing.pending = true;
+    g_layer_update_timing.requested_at = std::chrono::steady_clock::now();
+}
+
+void record_layer_update_worker_started(
+    std::uint64_t generation,
+    std::chrono::steady_clock::time_point started_at)
+{
+    std::scoped_lock lock(g_layer_update_timing_mutex);
+    if (!g_layer_update_timing.pending || g_layer_update_timing.generation != generation) {
+        return;
+    }
+    g_layer_update_timing.worker_started = true;
+    g_layer_update_timing.worker_started_at = started_at;
+}
+
+void record_layer_update_submit_started(
+    std::uint64_t generation,
+    std::chrono::steady_clock::time_point started_at)
+{
+    std::scoped_lock lock(g_layer_update_timing_mutex);
+    if (!g_layer_update_timing.pending || g_layer_update_timing.generation != generation) {
+        return;
+    }
+    g_layer_update_timing.submit_started = true;
+    g_layer_update_timing.submit_started_at = started_at;
+}
+
+void record_layer_update_submitted(
+    std::uint64_t generation,
+    std::uint64_t backend_revision,
+    std::chrono::steady_clock::time_point submitted_at)
+{
+    std::scoped_lock lock(g_layer_update_timing_mutex);
+    if (!g_layer_update_timing.pending || g_layer_update_timing.generation != generation) {
+        return;
+    }
+    g_layer_update_timing.backend_revision = backend_revision;
+    g_layer_update_timing.submitted = true;
+    g_layer_update_timing.submitted_at = submitted_at;
+}
+
+void record_layer_update_ready(std::uint64_t backend_revision) {
+    std::scoped_lock lock(g_layer_update_timing_mutex);
+    if (!g_layer_update_timing.pending ||
+        !g_layer_update_timing.submitted ||
+        g_layer_update_timing.backend_revision != backend_revision ||
+        g_layer_update_timing.ready) {
+        return;
+    }
+    g_layer_update_timing.ready = true;
+    g_layer_update_timing.ready_at = std::chrono::steady_clock::now();
+}
+
+void record_layer_update_painted(std::uint64_t backend_revision) {
+    std::scoped_lock lock(g_layer_update_timing_mutex);
+    if (!g_layer_update_timing.pending ||
+        !g_layer_update_timing.ready ||
+        g_layer_update_timing.backend_revision != backend_revision) {
+        return;
+    }
+    g_layer_update_timing.awaiting_present = true;
+}
+
+void record_layer_update_presented() {
+    std::scoped_lock lock(g_layer_update_timing_mutex);
+    if (!g_layer_update_timing.pending || !g_layer_update_timing.awaiting_present) {
+        return;
+    }
+    g_layer_update_timing.pending = false;
+    g_layer_update_timing.awaiting_present = false;
+    g_layer_update_timing.has_completed = true;
+    g_layer_update_timing.completed_at = std::chrono::steady_clock::now();
+}
+
+void cancel_layer_update_timing(std::uint64_t generation) {
+    std::scoped_lock lock(g_layer_update_timing_mutex);
+    if (g_layer_update_timing.pending && g_layer_update_timing.generation == generation) {
+        g_layer_update_timing.pending = false;
+    }
+}
+
+layer_update_timing_snapshot copy_layer_update_timing_snapshot() {
+    std::scoped_lock lock(g_layer_update_timing_mutex);
+    layer_update_timing_snapshot snapshot{};
+    const layer_update_timing_state &timing = g_layer_update_timing;
+    if (!timing.pending && !timing.has_completed) {
+        return snapshot;
+    }
+
+    const auto end = timing.pending ? std::chrono::steady_clock::now() : timing.completed_at;
+    snapshot.has_value = true;
+    snapshot.total_ms = layer_update_duration_ms(timing.requested_at, end);
+    snapshot.worker_wait_ms = layer_update_duration_ms(
+        timing.requested_at,
+        timing.worker_started ? timing.worker_started_at : end);
+    if (timing.worker_started) {
+        snapshot.scene_copy_filter_ms = layer_update_duration_ms(
+            timing.worker_started_at,
+            timing.submit_started ? timing.submit_started_at : end);
+    }
+    if (timing.submit_started) {
+        snapshot.backend_enqueue_copy_ms = layer_update_duration_ms(
+            timing.submit_started_at,
+            timing.submitted ? timing.submitted_at : end);
+    }
+    if (timing.submitted) {
+        snapshot.backend_scene_build_ms = layer_update_duration_ms(
+            timing.submitted_at,
+            timing.ready ? timing.ready_at : end);
+    }
+    if (timing.ready) {
+        snapshot.ready_to_present_ms = layer_update_duration_ms(timing.ready_at, end);
+    }
+    return snapshot;
+}
 
 float effective_display_background_alpha() {
     return g_display_background_enabled ? g_display_background_color[3] : 0.0f;
@@ -530,7 +713,8 @@ bool copy_effective_present_scene(rtvdb::viewer_backend::frame_scene* out_scene,
 bool copy_effective_present_render_scene(rtvdb::viewer_backend::frame_scene* out_scene, bool* out_has_frame);
 bool acquire_effective_present_render_scene(
     std::shared_ptr<const rtvdb::viewer_backend::frame_scene>* out_scene,
-    bool* out_has_frame);
+    bool* out_has_frame,
+    std::uint64_t* out_revision = nullptr);
 void start_layer_rebuild_worker();
 void stop_layer_rebuild_worker();
 void append_render_stall_trace_line(const char* text);
@@ -714,6 +898,7 @@ bool try_build_fitted_camera(
     rtvdb::camera* out_camera);
 void reset_view_for_new_connection(std::uint64_t connection_serial);
 std::vector<std::string> collect_layer_paths(const rtvdb::viewer_backend::frame_scene &scene);
+layer_tree build_layer_tree(const std::vector<std::string> &paths);
 
 bool viewer_help_requested(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
@@ -3196,6 +3381,7 @@ void draw_status_overlay(
         const frame_pacing_state::paint_cpu_timing paint_timing = paint_callback_completed
             ? g_frame_pacing.last_paint_cpu_timing
             : frame_pacing_state::paint_cpu_timing{};
+        const layer_update_timing_snapshot layer_update_timing = copy_layer_update_timing_snapshot();
         const double paint_cpu_work_ms = paint_callback_completed ? g_frame_pacing.last_render_ms : 0.0;
         rtvdb::viewer_shell::frame_timing shell_timing{};
         rtvdb::viewer_shell::copy_frame_timing(&shell_timing);
@@ -3207,6 +3393,7 @@ void draw_status_overlay(
         const bool details_open =
             g_status_tree_state.display_cadence_open ||
             g_status_tree_state.paint_cpu_work_open ||
+            g_status_tree_state.layer_update_open ||
             g_status_tree_state.last_as_build_open ||
             g_status_tree_state.scene_build_open;
         const float summary_value_column =
@@ -3284,10 +3471,31 @@ void draw_status_overlay(
                 paint_timing.rt_output_command_slot_wait_ms +
                 paint_timing.rt_output_command_record_ms +
                 paint_timing.rt_output_submit_ms;
+            const double accounted_paint_cpu_work_ms =
+                paint_timing.viewer_pre_render_ms +
+                paint_timing.native_target_setup_ms +
+                paint_timing.rt_scene_snapshot_ms +
+                paint_timing.rt_backend_other_ms +
+                rt_frame_preparation_ms +
+                paint_timing.rt_output_prepare_ms +
+                rt_output_ms +
+                paint_timing.as_finalize_ms +
+                paint_timing.native_target_publish_ms +
+                paint_timing.rt_accumulation_finalize_ms +
+                paint_timing.render_target_readback_ms +
+                paint_timing.viewer_post_render_ms;
+            const double paint_timing_residual_ms = (std::max)(
+                0.0,
+                paint_cpu_work_ms - accounted_paint_cpu_work_ms);
             draw_status_detail_value(
                 "RT scene snapshot",
                 paint_timing.rt_scene_snapshot_ms,
-                "Copies the current present scene into the RT backend build representation.");
+                "Acquires the immutable RT scene build used by the current render or pick operation.");
+            draw_status_detail_value(
+                "RT backend other",
+                paint_timing.rt_backend_other_ms,
+                "RT backend call time not covered by the named stages, including renderer-lock waiting, "
+                "completed-submission collection, resource-pool maintenance, and submission tracking.");
             const bool rt_frame_preparation_open = begin_status_detail_group(
                 "RT frame prep.",
                 "RT frame prep.",
@@ -3360,6 +3568,44 @@ void draw_status_overlay(
                 "Viewer post-render",
                 paint_timing.viewer_post_render_ms,
                 "Remaining paint-callback work after the timed render stages, such as capture bookkeeping and repaint scheduling.");
+            draw_status_detail_value(
+                "Paint timing residual",
+                paint_timing_residual_ms,
+                "Remaining Paint CPU Work not attributed to another child timer, including timer handoff overhead.");
+            ImGui::TreePop();
+        }
+        const bool layer_update_open = begin_status_detail_group(
+            "Layer update",
+            "Layer update",
+            layer_update_timing.has_value ? layer_update_timing.total_ms : 0.0,
+            summary_value_column,
+            "End-to-end latency of the latest layer visibility change, from the UI request through the first "
+            "successful present. This asynchronous work is outside Paint CPU Work.",
+            &g_status_tree_state.layer_update_open);
+        if (layer_update_open) {
+            draw_status_detail_value(
+                "Worker dispatch",
+                layer_update_timing.worker_wait_ms,
+                "Time from the UI request until the layer rebuild worker starts processing the latest request.");
+            draw_status_detail_value(
+                "Visibility prep.",
+                layer_update_timing.scene_copy_filter_ms,
+                "Snapshots the current connection and effective layer visibility. The fallback path also "
+                "copies and filters the client scene.");
+            draw_status_detail_value(
+                "Backend submit",
+                layer_update_timing.backend_enqueue_copy_ms,
+                "Hands the visibility snapshot to the backend. The fallback path moves a filtered scene.");
+            draw_status_detail_value(
+                "Backend CPU build",
+                layer_update_timing.backend_scene_build_ms,
+                "Backend time until the update is accepted. Visibility-only updates reuse the current scene; "
+                "the fallback includes queueing and CPU scene-input construction.");
+            draw_status_detail_value(
+                "Ready to present",
+                layer_update_timing.ready_to_present_ms,
+                "Time from backend acceptance through the TLAS mask update, render, SDL/ImGui composition, "
+                "and the first successful present.");
             ImGui::TreePop();
         }
         const bool last_as_build_open = begin_status_tree_group(
@@ -3593,10 +3839,11 @@ bool copy_effective_present_render_scene(rtvdb::viewer_backend::frame_scene* out
 
 bool acquire_effective_present_render_scene(
     std::shared_ptr<const rtvdb::viewer_backend::frame_scene>* out_scene,
-    bool* out_has_frame)
+    bool* out_has_frame,
+    std::uint64_t* out_revision)
 {
     progress_camera_animation();
-    return rtvdb::viewer_backend::acquire_present_render_scene(out_scene, out_has_frame);
+    return rtvdb::viewer_backend::acquire_present_render_scene(out_scene, out_has_frame, out_revision);
 }
 
 void copy_render_scene_metadata(
@@ -4616,7 +4863,8 @@ void draw_scene_to_paint_context(void*) {
         const rtvdb::viewer_backend::frame_scene* scene = nullptr;
         const rtvdb::viewer_backend::frame_scene* render_input = nullptr;
         bool has_frame = false;
-        if (acquire_effective_present_render_scene(&scene_snapshot, &has_frame)) {
+        std::uint64_t render_scene_revision = 0;
+        if (acquire_effective_present_render_scene(&scene_snapshot, &has_frame, &render_scene_revision)) {
             scene = scene_snapshot.get();
             apply_effective_camera_to_render_scene(*scene, &render_scene);
             render_input = &render_scene;
@@ -4640,10 +4888,11 @@ void draw_scene_to_paint_context(void*) {
             has_frame,
             nullptr,
             nullptr,
-            nullptr,
-            &paint_timing)) {
+             nullptr,
+             &paint_timing)) {
             return;
         }
+        record_layer_update_painted(render_scene_revision);
         const auto readback_start = std::chrono::steady_clock::now();
         process_pending_manual_png_capture(has_frame);
         process_pending_client_capture(has_frame);
@@ -4747,6 +4996,7 @@ bool show_scene_in_shell(
     bool native_target_ready = false;
     bool native_rendered = false;
     bool vulkan_render_failed = false;
+    double rt_backend_total_ms = 0.0;
     const auto record_native_target_setup = [&]() {
         if (out_timing != nullptr) {
             out_timing->native_target_setup_ms += std::chrono::duration<double, std::milli>(
@@ -4754,16 +5004,36 @@ bool show_scene_in_shell(
         }
         native_target_setup_start = std::chrono::steady_clock::now();
     };
-    const auto render_native = [](const auto &render) {
-        return render();
+    const auto render_native = [&rt_backend_total_ms](const auto &render) {
+        const auto start = std::chrono::steady_clock::now();
+        const bool succeeded = render();
+        rt_backend_total_ms += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - start).count();
+        return succeeded;
     };
-    const auto record_rt_timing = [out_timing]() {
+    const auto record_rt_timing = [out_timing, &rt_backend_total_ms]() {
         if (out_timing == nullptr) {
             return;
         }
         rtvdb::viewer_backend::scene_build_info after_build_info{};
         rtvdb::viewer_backend::copy_present_build_info(&after_build_info);
+        const double accounted_rt_backend_ms =
+            after_build_info.paint_rt_scene_snapshot_ms +
+            after_build_info.paint_rt_pre_acceleration_prepare_ms +
+            after_build_info.paint_as_command_slot_wait_ms +
+            after_build_info.paint_accel_command_record_ms +
+            after_build_info.paint_rt_post_acceleration_prepare_ms +
+            after_build_info.paint_rt_output_prepare_ms +
+            after_build_info.paint_rt_output_command_slot_wait_ms +
+            after_build_info.paint_rt_command_record_ms +
+            after_build_info.paint_rt_submit_ms +
+            after_build_info.paint_as_finalize_ms +
+            after_build_info.paint_native_target_publish_ms +
+            after_build_info.paint_rt_accumulation_finalize_ms;
         out_timing->rt_scene_snapshot_ms += after_build_info.paint_rt_scene_snapshot_ms;
+        out_timing->rt_backend_other_ms += (std::max)(
+            0.0,
+            rt_backend_total_ms - accounted_rt_backend_ms);
         out_timing->rt_pre_acceleration_prepare_ms +=
             after_build_info.paint_rt_pre_acceleration_prepare_ms;
         out_timing->as_command_slot_wait_ms += after_build_info.paint_as_command_slot_wait_ms;
@@ -5810,12 +6080,22 @@ void on_present_ready(const rtvdb::viewer_backend::frame_scene* scene, bool has_
     if (scene == nullptr) {
         return;
     }
+    std::uint64_t backend_revision = 0;
+    rtvdb::viewer_backend::acquire_present_render_scene(nullptr, nullptr, &backend_revision);
+    record_layer_update_ready(backend_revision);
     const std::vector<std::string> layer_paths = has_frame ? collect_layer_paths(*scene) : std::vector<std::string>{};
     {
         std::scoped_lock lock(g_layer_visibility_mutex);
-        g_layer_paths = layer_paths;
+        bool layer_state_changed = g_layer_paths != layer_paths;
+        if (layer_state_changed) {
+            g_layer_paths = layer_paths;
+            g_layer_tree = std::make_shared<const layer_tree>(build_layer_tree(layer_paths));
+        }
         for (const std::string &path : layer_paths) {
-            g_layer_visibility.try_emplace(path, true);
+            layer_state_changed = g_layer_visibility.try_emplace(path, true).second || layer_state_changed;
+        }
+        if (layer_state_changed) {
+            ++g_layer_state_revision;
         }
     }
     if (has_frame &&
@@ -5857,7 +6137,56 @@ std::vector<std::string> collect_layer_paths(const rtvdb::viewer_backend::frame_
         append_path(value.layer);
     }
     std::vector<std::string> paths(unique_paths.begin(), unique_paths.end());
-    std::sort(paths.begin(), paths.end());
+    std::sort(paths.begin(), paths.end(), [](const std::string &left, const std::string &right) {
+        std::size_t left_index = 0;
+        std::size_t right_index = 0;
+        while (left_index < left.size() && right_index < right.size()) {
+            const bool left_is_digit = left[left_index] >= '0' && left[left_index] <= '9';
+            const bool right_is_digit = right[right_index] >= '0' && right[right_index] <= '9';
+            if (!left_is_digit || !right_is_digit) {
+                if (left[left_index] != right[right_index]) {
+                    return left[left_index] < right[right_index];
+                }
+                ++left_index;
+                ++right_index;
+                continue;
+            }
+
+            const std::size_t left_digits_begin = left_index;
+            const std::size_t right_digits_begin = right_index;
+            while (left_index < left.size() && left[left_index] >= '0' && left[left_index] <= '9') {
+                ++left_index;
+            }
+            while (right_index < right.size() && right[right_index] >= '0' && right[right_index] <= '9') {
+                ++right_index;
+            }
+
+            std::size_t left_significant_begin = left_digits_begin;
+            std::size_t right_significant_begin = right_digits_begin;
+            while (left_significant_begin < left_index && left[left_significant_begin] == '0') {
+                ++left_significant_begin;
+            }
+            while (right_significant_begin < right_index && right[right_significant_begin] == '0') {
+                ++right_significant_begin;
+            }
+            const std::size_t left_significant_length = left_index - left_significant_begin;
+            const std::size_t right_significant_length = right_index - right_significant_begin;
+            if (left_significant_length != right_significant_length) {
+                return left_significant_length < right_significant_length;
+            }
+
+            const int significant_digits = left.compare(
+                left_significant_begin,
+                left_significant_length,
+                right,
+                right_significant_begin,
+                right_significant_length);
+            if (significant_digits != 0) {
+                return significant_digits < 0;
+            }
+        }
+        return left.size() < right.size();
+    });
     return paths;
 }
 
@@ -5869,20 +6198,148 @@ std::string layer_label_from_path(const std::string &path) {
     return path.substr(separator + 1);
 }
 
-bool layer_visible(const std::string &path) {
-    std::scoped_lock lock(g_layer_visibility_mutex);
-    const auto found = g_layer_visibility.find(path);
-    return found == g_layer_visibility.end() || found->second;
+bool layer_visible(
+    const std::unordered_map<std::string, bool> &visibility,
+    const std::string &path)
+{
+    const auto found = visibility.find(path);
+    return found == visibility.end() || found->second;
 }
 
-void set_layer_visibility_recursive(const std::string &path, bool visible) {
+bool layer_effectively_visible(
+    const std::unordered_map<std::string, bool> &visibility,
+    const std::string &path)
+{
+    std::size_t separator = 0;
+    for (;;) {
+        separator = path.find('/', separator);
+        const std::string prefix = path.substr(0, separator);
+        const auto found = visibility.find(prefix);
+        if (found != visibility.end() && !found->second) {
+            return false;
+        }
+        if (separator == std::string::npos) {
+            return true;
+        }
+        ++separator;
+    }
+}
+
+std::string layer_hidden_by_ancestor(
+    const std::unordered_map<std::string, bool> &visibility,
+    const std::string &path)
+{
+    for (std::size_t separator = path.find('/');
+         separator != std::string::npos;
+         separator = path.find('/', separator + 1)) {
+        const std::string prefix = path.substr(0, separator);
+        const auto found = visibility.find(prefix);
+        if (found != visibility.end() && !found->second) {
+            return prefix;
+        }
+    }
+    return {};
+}
+
+void accumulate_layer_subtree_visibility(
+    const layer_tree &tree,
+    std::size_t node_index,
+    const std::unordered_map<std::string, bool> &visibility,
+    bool &all_visible,
+    bool &all_hidden)
+{
+    const layer_tree_node &node = tree.nodes[node_index];
+    const bool visible = layer_visible(visibility, node.path);
+    all_visible = all_visible && visible;
+    all_hidden = all_hidden && !visible;
+    for (const std::size_t child_index : node.children) {
+        accumulate_layer_subtree_visibility(tree, child_index, visibility, all_visible, all_hidden);
+    }
+}
+
+layer_subtree_visibility_state summarize_layer_subtree_visibility(
+    const layer_tree &tree,
+    std::size_t node_index,
+    const std::unordered_map<std::string, bool> &visibility)
+{
+    bool all_visible = true;
+    bool all_hidden = true;
+    accumulate_layer_subtree_visibility(tree, node_index, visibility, all_visible, all_hidden);
+    if (all_visible) {
+        return layer_subtree_visibility_state::visible;
+    }
+    if (all_hidden) {
+        return layer_subtree_visibility_state::hidden;
+    }
+    return layer_subtree_visibility_state::mixed;
+}
+
+layer_subtree_visibility_state summarize_layer_tree_visibility(
+    const layer_tree &tree,
+    const std::unordered_map<std::string, bool> &visibility)
+{
+    bool all_visible = true;
+    bool all_hidden = true;
+    for (const std::size_t root_index : tree.roots) {
+        accumulate_layer_subtree_visibility(tree, root_index, visibility, all_visible, all_hidden);
+    }
+    if (all_visible) {
+        return layer_subtree_visibility_state::visible;
+    }
+    if (all_hidden) {
+        return layer_subtree_visibility_state::hidden;
+    }
+    return layer_subtree_visibility_state::mixed;
+}
+
+bool set_layer_visibility_local(const std::string &path, bool visible) {
+    std::scoped_lock lock(g_layer_visibility_mutex);
+    const auto found = g_layer_visibility.find(path);
+    if (found == g_layer_visibility.end()) {
+        if (visible) {
+            return false;
+        }
+        g_layer_visibility.emplace(path, false);
+        ++g_layer_state_revision;
+        return true;
+    }
+    if (found->second == visible) {
+        return false;
+    }
+    found->second = visible;
+    ++g_layer_state_revision;
+    return true;
+}
+
+bool set_layer_visibility_recursive(const std::string &path, bool visible) {
     std::scoped_lock lock(g_layer_visibility_mutex);
     const std::string child_prefix = path + "/";
+    bool changed = false;
     for (auto &[candidate, candidate_visible] : g_layer_visibility) {
         if (candidate == path || candidate.starts_with(child_prefix)) {
+            changed = changed || candidate_visible != visible;
             candidate_visible = visible;
         }
     }
+    if (changed) {
+        ++g_layer_state_revision;
+    }
+    return changed;
+}
+
+bool set_all_layer_visibility(bool visible) {
+    std::scoped_lock lock(g_layer_visibility_mutex);
+    bool changed = false;
+    for (auto &[path, candidate_visible] : g_layer_visibility) {
+        if (candidate_visible != visible) {
+            candidate_visible = visible;
+            changed = true;
+        }
+    }
+    if (changed) {
+        ++g_layer_state_revision;
+    }
+    return changed;
 }
 
 layer_tree build_layer_tree(const std::vector<std::string> &paths) {
@@ -5914,6 +6371,88 @@ layer_tree build_layer_tree(const std::vector<std::string> &paths) {
     return tree;
 }
 
+void refresh_layer_ui_snapshot() {
+    std::scoped_lock lock(g_layer_visibility_mutex);
+    if (g_layer_ui_snapshot_revision == g_layer_state_revision) {
+        return;
+    }
+    if (g_layer_ui_tree != g_layer_tree) {
+        g_layer_ui_rows_dirty = true;
+    }
+    g_layer_ui_tree = g_layer_tree;
+    g_layer_ui_visibility = g_layer_visibility;
+    g_layer_ui_snapshot_revision = g_layer_state_revision;
+}
+
+void set_layer_ui_snapshot_visibility_recursive(const std::string &path, bool visible) {
+    const std::string child_prefix = path + "/";
+    for (auto &[candidate, candidate_visible] : g_layer_ui_visibility) {
+        if (candidate == path || candidate.starts_with(child_prefix)) {
+            candidate_visible = visible;
+        }
+    }
+}
+
+void set_layer_ui_snapshot_visibility_local(const std::string &path, bool visible) {
+    g_layer_ui_visibility[path] = visible;
+}
+
+std::size_t push_layer_tree_id_scope(const std::string &path) {
+    std::size_t pushed_id_count = 0;
+    std::size_t separator = path.find('/');
+    while (separator != std::string::npos) {
+        ImGui::PushID(path.data(), path.data() + separator);
+        ++pushed_id_count;
+        separator = path.find('/', separator + 1);
+    }
+    ImGui::PushID(path.c_str());
+    return pushed_id_count + 1;
+}
+
+void pop_layer_tree_id_scope(std::size_t pushed_id_count) {
+    while (pushed_id_count > 0) {
+        ImGui::PopID();
+        --pushed_id_count;
+    }
+}
+
+bool layer_tree_node_is_open(const layer_tree_node &node) {
+    if (node.children.empty()) {
+        return false;
+    }
+    const int default_open = node.path.find('/') == std::string::npos ? 1 : 0;
+    const auto found = g_layer_ui_open.find(node.path);
+    return found == g_layer_ui_open.end() ? default_open != 0 : found->second;
+}
+
+void append_visible_layer_tree_rows(
+    const layer_tree &tree,
+    std::size_t node_index,
+    std::size_t depth,
+    std::vector<layer_tree_row>* rows)
+{
+    if (rows == nullptr) {
+        return;
+    }
+    rows->push_back({node_index, depth});
+    const layer_tree_node &node = tree.nodes[node_index];
+    if (!layer_tree_node_is_open(node)) {
+        return;
+    }
+    for (std::size_t child_index : node.children) {
+        append_visible_layer_tree_rows(tree, child_index, depth + 1, rows);
+    }
+}
+
+void rebuild_visible_layer_tree_rows(const layer_tree &tree) {
+    g_layer_ui_rows.clear();
+    g_layer_ui_rows.reserve(tree.nodes.size());
+    for (std::size_t root_index : tree.roots) {
+        append_visible_layer_tree_rows(tree, root_index, 0, &g_layer_ui_rows);
+    }
+    g_layer_ui_rows_dirty = false;
+}
+
 bool layer_path_is_same_or_ancestor(const std::string &candidate, const std::string &path) {
     if (candidate.empty() || path.empty()) {
         return false;
@@ -5938,7 +6477,12 @@ ImU32 layer_hover_highlight_color(bool direct_match) {
     ));
 }
 
-layer_visibility_icon_button_result draw_layer_visibility_icon_button(const char* id, bool visible, bool row_hovered) {
+layer_visibility_icon_button_result draw_layer_visibility_icon_button(
+    const char* id,
+    bool visible,
+    bool row_hovered,
+    bool muted)
+{
     const float line_height = ImGui::GetTextLineHeight();
     const ImVec2 button_size(line_height * kLayerVisibilityIconWidthScale, line_height);
     const bool pressed = ImGui::InvisibleButton(id, button_size);
@@ -5956,8 +6500,11 @@ layer_visibility_icon_button_result draw_layer_visibility_icon_button(const char
     const ImVec4 text_color = ImGui::GetStyleColorVec4(ImGuiCol_Text);
     const bool icon_hovered = ImGui::IsItemHovered();
     const bool visual_hovered = row_hovered || icon_hovered;
-    const float outline_alpha = visible ? (visual_hovered ? 1.0f : 0.90f) : (visual_hovered ? 0.55f : 0.32f);
-    const float pupil_alpha = visible ? (visual_hovered ? 0.95f : 0.82f) : (visual_hovered ? 0.22f : 0.10f);
+    const float muted_alpha = muted ? 0.45f : 1.0f;
+    const float outline_alpha = muted_alpha *
+        (visible ? (visual_hovered ? 1.0f : 0.90f) : (visual_hovered ? 0.55f : 0.32f));
+    const float pupil_alpha = muted_alpha *
+        (visible ? (visual_hovered ? 0.95f : 0.82f) : (visual_hovered ? 0.22f : 0.10f));
     const ImU32 outline_color = ImGui::GetColorU32(ImVec4(
         text_color.x,
         text_color.y,
@@ -5981,23 +6528,105 @@ layer_visibility_icon_button_result draw_layer_visibility_icon_button(const char
     draw_list->AddBezierCubic(left, top_cp1, top_cp2, right, outline_color, kLayerVisibilityIconStroke);
     draw_list->AddBezierCubic(right, bottom_cp1, bottom_cp2, left, outline_color, kLayerVisibilityIconStroke);
     draw_list->AddCircleFilled(center, half_height * 0.52f, pupil_color, 16);
+    if (!visible) {
+        draw_list->AddLine(
+            ImVec2(center.x - half_width * 0.95f, center.y - half_height * 1.05f),
+            ImVec2(center.x + half_width * 0.95f, center.y + half_height * 1.05f),
+            outline_color,
+            kLayerVisibilityIconStroke
+        );
+    }
 
     return {pressed, icon_hovered};
 }
 
-void draw_layer_tree_node(
+layer_subtree_visibility_button_result draw_layer_subtree_visibility_button(
+    const char* id,
+    layer_subtree_visibility_state state,
+    bool row_hovered,
+    bool muted)
+{
+    const float line_height = ImGui::GetTextLineHeight();
+    const ImVec2 button_size(line_height, line_height);
+    const bool pressed = ImGui::InvisibleButton(id, button_size);
+
+    ImDrawList* const draw_list = ImGui::GetWindowDrawList();
+    const ImVec2 item_min = ImGui::GetItemRectMin();
+    const ImVec2 item_max = ImGui::GetItemRectMax();
+    const ImVec2 center(
+        (item_min.x + item_max.x) * 0.5f,
+        (item_min.y + item_max.y) * 0.5f
+    );
+    const bool icon_hovered = ImGui::IsItemHovered();
+    const bool visual_hovered = row_hovered || icon_hovered;
+    const float alpha = muted ? 0.45f : 1.0f;
+    const float square_size = line_height * kLayerSubtreeVisibilityIconScale;
+    const ImVec2 square_min(
+        center.x - square_size * 0.5f,
+        center.y - square_size * 0.5f
+    );
+    const ImVec2 square_max(
+        center.x + square_size * 0.5f,
+        center.y + square_size * 0.5f
+    );
+    ImVec4 frame_color = ImGui::GetStyleColorVec4(
+        visual_hovered ? ImGuiCol_FrameBgHovered : ImGuiCol_FrameBg
+    );
+    frame_color.w *= alpha;
+    ImVec4 check_color = ImGui::GetStyleColorVec4(ImGuiCol_CheckMark);
+    check_color.w *= alpha;
+    const ImU32 frame_color_u32 = ImGui::GetColorU32(frame_color);
+    const ImU32 check_color_u32 = ImGui::GetColorU32(check_color);
+
+    draw_list->AddRectFilled(square_min, square_max, frame_color_u32, ImGui::GetStyle().FrameRounding);
+    if (state == layer_subtree_visibility_state::visible) {
+        const float pad = square_size * 0.22f;
+        draw_list->AddLine(
+            ImVec2(square_min.x + pad, center.y),
+            ImVec2(center.x - square_size * 0.06f, square_max.y - pad),
+            check_color_u32,
+            kLayerSubtreeVisibilityCheckStroke
+        );
+        draw_list->AddLine(
+            ImVec2(center.x - square_size * 0.06f, square_max.y - pad),
+            ImVec2(square_max.x - pad, square_min.y + pad),
+            check_color_u32,
+            kLayerSubtreeVisibilityCheckStroke
+        );
+    } else if (state == layer_subtree_visibility_state::mixed) {
+        const float pad = square_size * 0.22f;
+        draw_list->AddRectFilled(
+            ImVec2(square_min.x + pad, center.y - kLayerSubtreeVisibilityCheckStroke * 0.5f),
+            ImVec2(square_max.x - pad, center.y + kLayerSubtreeVisibilityCheckStroke * 0.5f),
+            check_color_u32,
+            kLayerSubtreeVisibilityCheckStroke * 0.5f
+        );
+    }
+
+    return {pressed, icon_hovered};
+}
+
+void draw_layer_tree_row(
     const layer_tree &tree,
-    std::size_t node_index,
+    const layer_tree_row &row,
+    std::unordered_map<std::string, bool> &visibility,
     const std::string &hovered_path,
     std::string *next_hovered_path,
-    bool *visibility_changed
-) {
-    if (next_hovered_path == nullptr || visibility_changed == nullptr) {
+    bool *visibility_changed,
+    bool *tree_open_changed)
+{
+    if (next_hovered_path == nullptr || visibility_changed == nullptr || tree_open_changed == nullptr) {
         return;
     }
 
-    const layer_tree_node &node = tree.nodes[node_index];
-    bool visible = layer_visible(node.path);
+    const layer_tree_node &node = tree.nodes[row.node_index];
+    const bool local_visible = layer_visible(visibility, node.path);
+    const bool effective_visible = layer_effectively_visible(visibility, node.path);
+    const std::string hidden_by_ancestor = layer_hidden_by_ancestor(visibility, node.path);
+    const bool inherited_hidden = !hidden_by_ancestor.empty() && !effective_visible;
+    const layer_subtree_visibility_state subtree_state =
+        summarize_layer_subtree_visibility(tree, row.node_index, visibility);
+    const bool was_open = layer_tree_node_is_open(node);
     const float row_height = ImGui::GetTextLineHeightWithSpacing();
     const ImGuiStyle &style = ImGui::GetStyle();
 
@@ -6010,16 +6639,25 @@ void draw_layer_tree_node(
     }
     ImGui::TableSetColumnIndex(0);
     const ImVec2 row_content_min = ImGui::GetCursorScreenPos();
+    const float indent_width = static_cast<float>(row.depth) * style.IndentSpacing;
+    if (indent_width > 0.0f) {
+        ImGui::Indent(indent_width);
+    }
 
-    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_SpanAvailWidth;
+    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_SpanAvailWidth | ImGuiTreeNodeFlags_NoTreePushOnOpen;
     if (node.path.find('/') == std::string::npos) {
         flags |= ImGuiTreeNodeFlags_DefaultOpen;
     }
     if (node.children.empty()) {
-        flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
+        flags |= ImGuiTreeNodeFlags_Leaf;
     }
 
-    ImGui::PushID(node.path.c_str());
+    const std::size_t pushed_id_count = push_layer_tree_id_scope(node.path);
+    if (inherited_hidden) {
+        ImVec4 muted_text = ImGui::GetStyleColorVec4(ImGuiCol_Text);
+        muted_text.w *= 0.55f;
+        ImGui::PushStyleColor(ImGuiCol_Text, muted_text);
+    }
     ImGui::PushStyleColor(ImGuiCol_Header, 0);
     ImGui::PushStyleColor(ImGuiCol_HeaderHovered, 0);
     ImGui::PushStyleColor(ImGuiCol_HeaderActive, 0);
@@ -6027,6 +6665,12 @@ void draw_layer_tree_node(
     const bool label_hovered = ImGui::IsItemHovered();
     const ImVec2 label_rect_max = ImGui::GetItemRectMax();
     ImGui::PopStyleColor(3);
+    if (inherited_hidden) {
+        ImGui::PopStyleColor();
+    }
+    if (indent_width > 0.0f) {
+        ImGui::Unindent(indent_width);
+    }
     if (label_hovered) {
         *next_hovered_path = node.path;
         ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, layer_hover_highlight_color(true));
@@ -6037,9 +6681,14 @@ void draw_layer_tree_node(
     const float visibility_column_width = ImGui::GetColumnWidth();
     const bool row_hovered = label_hovered || hovered_path == node.path;
     const layer_visibility_icon_button_result icon_result =
-        draw_layer_visibility_icon_button("##visible", visible, row_hovered);
-    const ImVec2 icon_rect_min = ImGui::GetItemRectMin();
+        draw_layer_visibility_icon_button("##visible", local_visible, row_hovered, inherited_hidden);
     const ImVec2 icon_rect_max = ImGui::GetItemRectMax();
+    ImGui::TableSetColumnIndex(2);
+    const ImVec2 subtree_content_min = ImGui::GetCursorScreenPos();
+    const float subtree_column_width = ImGui::GetColumnWidth();
+    const layer_subtree_visibility_button_result subtree_result =
+        draw_layer_subtree_visibility_button("##subtree", subtree_state, row_hovered, inherited_hidden);
+    const ImVec2 subtree_rect_max = ImGui::GetItemRectMax();
     const ImVec2 row_rect_min(
         row_content_min.x - style.CellPadding.x,
         row_content_min.y - style.CellPadding.y
@@ -6047,11 +6696,14 @@ void draw_layer_tree_node(
     const ImVec2 row_rect_max(
         (std::max)(
             visibility_content_min.x - style.CellPadding.x + visibility_column_width,
-            icon_rect_max.x + style.CellPadding.x
+            (std::max)(
+                icon_rect_max.x + style.CellPadding.x,
+                subtree_content_min.x - style.CellPadding.x + subtree_column_width
+            )
         ),
         (std::max)(
             row_rect_min.y + row_height,
-            (std::max)(label_rect_max.y, icon_rect_max.y) + style.CellPadding.y
+            (std::max)(label_rect_max.y, (std::max)(icon_rect_max.y, subtree_rect_max.y)) + style.CellPadding.y
         )
     );
     const bool row_rect_hovered = ImGui::IsMouseHoveringRect(row_rect_min, row_rect_max, false);
@@ -6063,18 +6715,37 @@ void draw_layer_tree_node(
         *next_hovered_path = node.path;
         ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, layer_hover_highlight_color(true));
     }
-    if (icon_result.pressed) {
-        visible = !visible;
-        set_layer_visibility_recursive(node.path, visible);
-        *visibility_changed = true;
+    if (subtree_result.hovered) {
+        *next_hovered_path = node.path;
+        ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, layer_hover_highlight_color(true));
     }
-    ImGui::PopID();
-
-    if (!node.children.empty() && open) {
-        for (std::size_t child_index : node.children) {
-            draw_layer_tree_node(tree, child_index, hovered_path, next_hovered_path, visibility_changed);
+    if (icon_result.pressed) {
+        const bool next_visible = !local_visible;
+        if (set_layer_visibility_local(node.path, next_visible)) {
+            set_layer_ui_snapshot_visibility_local(node.path, next_visible);
+            *visibility_changed = true;
         }
-        ImGui::TreePop();
+    }
+    if (subtree_result.pressed) {
+        const bool next_visible = subtree_state != layer_subtree_visibility_state::visible;
+        if (set_layer_visibility_recursive(node.path, next_visible)) {
+            set_layer_ui_snapshot_visibility_recursive(node.path, next_visible);
+            *visibility_changed = true;
+        }
+    }
+    if (icon_result.hovered) {
+        ImGui::SetTooltip("Branch visibility\nChild settings are preserved.");
+    }
+    if (subtree_result.hovered) {
+        ImGui::SetTooltip("Set this layer and all descendants to the same state.");
+    }
+    if (inherited_hidden && label_hovered) {
+        ImGui::SetTooltip("Hidden by ancestor: %s\nLocal state is preserved.", hidden_by_ancestor.c_str());
+    }
+    pop_layer_tree_id_scope(pushed_id_count);
+    if (!node.children.empty() && open != was_open) {
+        g_layer_ui_open[node.path] = open;
+        *tree_open_changed = true;
     }
 }
 
@@ -6099,58 +6770,111 @@ rtvdb::viewer_backend::frame_scene filter_scene_layers(const rtvdb::viewer_backe
         std::scoped_lock lock(g_layer_visibility_mutex);
         visibility = g_layer_visibility;
     }
-    const auto path_visible = [&visibility](const std::string &path) {
-        std::size_t separator = 0;
-        for (;;) {
-            separator = path.find('/', separator);
-            const std::string prefix = path.substr(0, separator);
-            const auto found = visibility.find(prefix);
-            if (found != visibility.end() && !found->second) {
-                return false;
-            }
-            if (separator == std::string::npos) {
-                return true;
-            }
-            ++separator;
-        }
-    };
     for (auto &value : filtered.triangles) {
-        value.visible = path_visible(value.layer);
+        value.visible = layer_effectively_visible(visibility, value.layer);
     }
     for (auto &value : filtered.points) {
-        value.visible = path_visible(value.layer);
+        value.visible = layer_effectively_visible(visibility, value.layer);
     }
     for (auto &value : filtered.lines) {
-        value.visible = path_visible(value.layer);
+        value.visible = layer_effectively_visible(visibility, value.layer);
     }
     return filtered;
 }
 
-void submit_latest_scene_with_layer_filter(bool allow_auto_frame) {
-    rtvdb::viewer_backend::frame_scene source{};
+void submit_latest_scene_with_layer_filter(bool allow_auto_frame, std::uint64_t generation) {
+    const auto worker_started_at = std::chrono::steady_clock::now();
+    record_layer_update_worker_started(generation, worker_started_at);
+    rtvdb::viewer_backend::layer_visibility_map visibility;
+    std::uint64_t connection_serial = 0;
+    {
+        std::scoped_lock lock(g_layer_visibility_mutex);
+        visibility = g_layer_visibility;
+        connection_serial = g_layer_connection_serial;
+    }
+    const auto visibility_submit_started_at = std::chrono::steady_clock::now();
+    std::uint64_t visibility_revision = 0;
+    if (rtvdb::viewer_backend::submit_layer_visibility_update(
+            connection_serial,
+            visibility,
+            &visibility_revision)) {
+        record_layer_update_submit_started(generation, visibility_submit_started_at);
+        record_layer_update_submitted(
+            generation,
+            visibility_revision,
+            std::chrono::steady_clock::now());
+        record_layer_update_ready(visibility_revision);
+        {
+            std::scoped_lock lock(g_present_update_mutex);
+            g_pending_present_update = true;
+        }
+        request_repaint_traced("layer_visibility", g_last_present_ready_frame_serial);
+        return;
+    }
+
+    std::shared_ptr<const rtvdb::viewer_backend::frame_scene> source;
     bool has_frame = false;
-    rtvdb::viewer_session::copy_latest_scene(&source, &has_frame);
+    rtvdb::viewer_session::acquire_latest_scene(&source, &has_frame);
+    if (source == nullptr || source->connection_serial != connection_serial) {
+        cancel_layer_update_timing(generation);
+        return;
+    }
+    rtvdb::viewer_backend::frame_scene filtered_scene = filter_scene_layers(*source);
     if (has_frame && !allow_auto_frame) {
-        rtvdb::viewer_backend::frame_scene present_scene{};
+        rtvdb::camera present_camera{};
+        rtvdb::camera_projection projection_blend_from = rtvdb::camera_projection::perspective;
+        rtvdb::camera_projection projection_blend_to = rtvdb::camera_projection::perspective;
+        float projection_blend_t = 1.0f;
+        std::uint64_t present_view_revision = 0;
         bool has_present_frame = false;
-        rtvdb::viewer_backend::copy_present_scene(&present_scene, &has_present_frame);
+        rtvdb::viewer_backend::copy_present_camera(
+            &present_camera,
+            &projection_blend_from,
+            &projection_blend_to,
+            &projection_blend_t,
+            &has_present_frame,
+            &present_view_revision);
         if (has_present_frame) {
-            source.camera = present_scene.camera;
-            source.projection_blend_from = present_scene.projection_blend_from;
-            source.projection_blend_to = present_scene.projection_blend_to;
-            source.projection_blend_t = present_scene.projection_blend_t;
-            source.view_revision = present_scene.view_revision;
+            filtered_scene.camera = present_camera;
+            filtered_scene.projection_blend_from = projection_blend_from;
+            filtered_scene.projection_blend_to = projection_blend_to;
+            filtered_scene.projection_blend_t = projection_blend_t;
+            filtered_scene.view_revision = present_view_revision;
         }
     }
     if (has_frame) {
-        rtvdb::viewer_backend::submit_scene_build(filter_scene_layers(source), true, allow_auto_frame);
+        const auto submit_started_at = std::chrono::steady_clock::now();
+        record_layer_update_submit_started(generation, submit_started_at);
+        std::uint64_t backend_revision = 0;
+        if (!rtvdb::viewer_backend::submit_scene_build(
+                std::move(filtered_scene),
+                true,
+                allow_auto_frame,
+                rtvdb::viewer_backend::scene_submission_mode::immediate,
+                &backend_revision)) {
+            cancel_layer_update_timing(generation);
+            return;
+        }
+        record_layer_update_submitted(
+            generation,
+            backend_revision,
+            std::chrono::steady_clock::now());
+        std::uint64_t present_revision = 0;
+        rtvdb::viewer_backend::acquire_present_render_scene(nullptr, nullptr, &present_revision);
+        if (present_revision == backend_revision) {
+            record_layer_update_ready(backend_revision);
+        }
+    } else {
+        cancel_layer_update_timing(generation);
     }
 }
 
 void schedule_layer_rebuild() {
+    std::uint64_t generation = 0;
     {
         std::scoped_lock lock(g_layer_visibility_mutex);
-        ++g_layer_rebuild_generation;
+        generation = ++g_layer_rebuild_generation;
+        begin_layer_update_timing(generation);
     }
     g_layer_rebuild_condition.notify_one();
 }
@@ -6174,7 +6898,7 @@ void start_layer_rebuild_worker() {
             }
             processed_generation = g_layer_rebuild_generation;
             lock.unlock();
-            submit_latest_scene_with_layer_filter(false);
+            submit_latest_scene_with_layer_filter(false, processed_generation);
             lock.lock();
         }
     });
@@ -6209,6 +6933,8 @@ void on_frame_ready(const rtvdb::viewer_backend::frame_scene* scene, void*) {
             g_layer_connection_serial = scene->connection_serial;
             g_layer_visibility.clear();
             g_layer_paths.clear();
+            g_layer_tree = std::make_shared<const layer_tree>();
+            ++g_layer_state_revision;
             reset_view_for_new_connection(scene->connection_serial);
         }
         if (has_primitives && scene->connection_serial == g_pending_auto_frame_connection_serial &&
@@ -6220,7 +6946,9 @@ void on_frame_ready(const rtvdb::viewer_backend::frame_scene* scene, void*) {
         }
         const std::vector<std::string> layer_paths = collect_layer_paths(*scene);
         for (const std::string &path : layer_paths) {
-            g_layer_visibility.try_emplace(path, true);
+            if (g_layer_visibility.try_emplace(path, true).second) {
+                ++g_layer_state_revision;
+            }
         }
         for (const auto &entry : g_layer_visibility) {
             if (!entry.second) {
@@ -6475,6 +7203,7 @@ void on_ui(void*) {
     ImGui::SetNextWindowSize(window_size, ImGuiCond_Always);
     if (!ImGui::Begin("Viewer", nullptr, ImGuiWindowFlags_NoResize)) {
         ImGui::End();
+        draw_capture_overlay();
         return;
     }
 
@@ -6482,8 +7211,6 @@ void on_ui(void*) {
     rtvdb::viewer_backend::display_mode mode = rtvdb::viewer_backend::display_mode::triangle_normal;
     rtvdb::viewer_backend::get_display_mode(&mode);
     const bool auto_frame = rtvdb::viewer_backend::auto_frame_enabled();
-
-    draw_capture_overlay();
 
     rtvdb::camera effective_camera{};
     std::shared_ptr<const rtvdb::viewer_backend::frame_scene> effective_scene;
@@ -6574,40 +7301,107 @@ void on_ui(void*) {
             }
 
             ImGui::Separator();
-            ImGui::TextUnformatted("Layers");
             g_layers_open = true;
-            if (ImGui::BeginChild("scene_layers", ImVec2(0.0f, kSceneTabLayersHeight), true)) {
-                std::vector<std::string> layer_paths;
-                {
-                    std::scoped_lock lock(g_layer_visibility_mutex);
-                    layer_paths = g_layer_paths;
+            refresh_layer_ui_snapshot();
+            const std::shared_ptr<const layer_tree> tree = g_layer_ui_tree;
+
+            const bool has_layers = tree != nullptr && !tree->nodes.empty();
+            const float line_height = ImGui::GetTextLineHeight();
+            const float gate_column_width = line_height * kLayerVisibilityIconWidthScale +
+                ImGui::GetStyle().FramePadding.x * 2.0f;
+            const float subtree_column_width = line_height + ImGui::GetStyle().FramePadding.x * 2.0f;
+            bool visibility_changed = false;
+            ImVec2 root_checkbox_cursor_pos{};
+            bool root_checkbox_cursor_pos_valid = false;
+            if (ImGui::BeginTable("scene_layers_header", 3, ImGuiTableFlags_NoSavedSettings)) {
+                ImGui::TableSetupColumn("Layer", ImGuiTableColumnFlags_WidthStretch);
+                ImGui::TableSetupColumn("Gate", ImGuiTableColumnFlags_WidthFixed, gate_column_width);
+                ImGui::TableSetupColumn("All", ImGuiTableColumnFlags_WidthFixed, subtree_column_width);
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::TextUnformatted("Layers");
+                if (has_layers) {
+                    ImGui::TableSetColumnIndex(2);
+                    root_checkbox_cursor_pos = ImGui::GetCursorScreenPos();
+                    root_checkbox_cursor_pos_valid = true;
                 }
-                if (layer_paths.empty()) {
+                ImGui::EndTable();
+            }
+
+            const ImGuiStyle &style = ImGui::GetStyle();
+            const float list_window_padding_x = style.WindowPadding.x;
+            const float list_window_padding_y = style.WindowPadding.y;
+            const float list_row_height = ImGui::GetTextLineHeightWithSpacing();
+            const float list_content_height = static_cast<float>(g_layer_ui_rows.size()) * list_row_height;
+            const float list_inner_height = kSceneTabLayersHeight -
+                ImGui::GetStyle().ChildBorderSize * 2.0f -
+                list_window_padding_y * 2.0f;
+            const bool list_content_overflow = list_content_height > list_inner_height;
+            if (!list_content_overflow) {
+                ImGui::PushStyleColor(ImGuiCol_ScrollbarBg, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+                ImGui::PushStyleColor(ImGuiCol_ScrollbarGrab, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+                ImGui::PushStyleColor(ImGuiCol_ScrollbarGrabHovered, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+                ImGui::PushStyleColor(ImGuiCol_ScrollbarGrabActive, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+            }
+            ImGui::PushStyleVar(
+                ImGuiStyleVar_WindowPadding,
+                ImVec2(0.0f, list_window_padding_y)
+            );
+            const bool layers_list_open = ImGui::BeginChild(
+                "scene_layers",
+                ImVec2(0.0f, kSceneTabLayersHeight),
+                true,
+                ImGuiWindowFlags_AlwaysVerticalScrollbar
+            );
+            ImGui::PopStyleVar();
+            if (layers_list_open) {
+                if (!has_layers) {
+                    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + list_window_padding_x);
                     ImGui::TextUnformatted("No layers yet");
                 } else {
-                    const layer_tree tree = build_layer_tree(layer_paths);
-                    bool visibility_changed = false;
                     std::string next_hovered_path;
-                    if (ImGui::BeginTable("scene_layers_table", 2, ImGuiTableFlags_NoSavedSettings)) {
+                    bool tree_open_changed = false;
+                    if (g_layer_ui_rows_dirty) {
+                        rebuild_visible_layer_tree_rows(*tree);
+                    }
+                    if (ImGui::BeginTable("scene_layers_table", 3, ImGuiTableFlags_NoSavedSettings)) {
                         ImGui::TableSetupColumn("Layer", ImGuiTableColumnFlags_WidthStretch);
                         ImGui::TableSetupColumn(
-                            "Visible",
+                            "Gate",
                             ImGuiTableColumnFlags_WidthFixed,
-                            ImGui::GetTextLineHeight() * kLayerVisibilityIconWidthScale + ImGui::GetStyle().FramePadding.x * 2.0f
+                            gate_column_width
                         );
-                        for (std::size_t root_index : tree.roots) {
-                            draw_layer_tree_node(
-                                tree,
-                                root_index,
-                                g_layer_visibility_hovered_path,
-                                &next_hovered_path,
-                                &visibility_changed
-                            );
+                        ImGui::TableSetupColumn(
+                            "All",
+                            ImGuiTableColumnFlags_WidthFixed,
+                            subtree_column_width
+                        );
+                        ImGuiListClipper clipper;
+                        clipper.Begin(
+                            static_cast<int>(g_layer_ui_rows.size()),
+                            ImGui::GetTextLineHeightWithSpacing()
+                        );
+                        while (clipper.Step()) {
+                            for (int row_index = clipper.DisplayStart; row_index < clipper.DisplayEnd; ++row_index) {
+                                draw_layer_tree_row(
+                                    *tree,
+                                    g_layer_ui_rows[static_cast<std::size_t>(row_index)],
+                                    g_layer_ui_visibility,
+                                    g_layer_visibility_hovered_path,
+                                    &next_hovered_path,
+                                    &visibility_changed,
+                                    &tree_open_changed
+                                );
+                            }
                         }
                         ImGui::EndTable();
                     }
                     if (g_layer_visibility_hovered_path != next_hovered_path) {
                         g_layer_visibility_hovered_path = next_hovered_path;
+                        rtvdb::viewer_shell::request_repaint();
+                    }
+                    if (tree_open_changed) {
+                        g_layer_ui_rows_dirty = true;
                         rtvdb::viewer_shell::request_repaint();
                     }
                     if (visibility_changed) {
@@ -6619,6 +7413,38 @@ void on_ui(void*) {
                 }
             }
             ImGui::EndChild();
+            if (!list_content_overflow) {
+                ImGui::PopStyleColor(4);
+            }
+            const ImVec2 layers_list_end_cursor_pos = ImGui::GetCursorScreenPos();
+            if (has_layers && root_checkbox_cursor_pos_valid) {
+                ImVec2 root_checkbox_pos = root_checkbox_cursor_pos;
+                root_checkbox_pos.x -= ImGui::GetStyle().ScrollbarSize;
+                ImGui::SetCursorScreenPos(root_checkbox_pos);
+                const layer_subtree_visibility_state root_state =
+                    summarize_layer_tree_visibility(*tree, g_layer_ui_visibility);
+                const layer_subtree_visibility_button_result root_result =
+                    draw_layer_subtree_visibility_button(
+                        "##all_layers",
+                        root_state,
+                        false,
+                        false
+                    );
+                if (root_result.hovered) {
+                    ImGui::SetTooltip("All layers\nSet every layer to the same visibility state.");
+                }
+                if (root_result.pressed) {
+                    const bool next_visible = root_state != layer_subtree_visibility_state::visible;
+                    const bool root_visibility_changed = set_all_layer_visibility(next_visible);
+                    visibility_changed = visibility_changed || root_visibility_changed;
+                    if (root_visibility_changed) {
+                        for (auto &entry : g_layer_ui_visibility) {
+                            entry.second = next_visible;
+                        }
+                    }
+                }
+                ImGui::SetCursorScreenPos(layers_list_end_cursor_pos);
+            }
             ImGui::EndTabItem();
         }
 
@@ -6832,6 +7658,8 @@ void on_ui(void*) {
     g_viewer_window_height = measured_height;
     ImGui::SetWindowSize(ImVec2(kViewerWindowWidth, measured_height));
     ImGui::End();
+
+    draw_capture_overlay();
 }
 
 } // namespace
@@ -6923,6 +7751,7 @@ int viewer_main(rtvdb::viewer_shell::platform_app_instance instance, int show_co
                     g_post_present_capture_display_ready = true;
                 }
             }
+            record_layer_update_presented();
             update_present_timing();
             if (update_keyboard_camera()) {
                 request_camera_repaint();

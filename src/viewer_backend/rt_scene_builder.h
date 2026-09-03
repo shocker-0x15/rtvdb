@@ -29,6 +29,7 @@ struct rt_triangle_chunk {
     scene_bounds bounds{};
     std::string layer;
     bool visible = true;
+    bool layer_visibility_exempt = false;
 };
 
 struct rt_procedural_chunk {
@@ -39,6 +40,7 @@ struct rt_procedural_chunk {
     scene_bounds bounds{};
     std::string layer;
     bool visible = true;
+    bool layer_visibility_exempt = false;
 };
 
 struct rt_blas_chunk_set {

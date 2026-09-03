@@ -932,6 +932,20 @@ void copy_latest_scene(viewer_backend::frame_scene* out_scene, bool* out_has_fra
     }
 }
 
+bool acquire_latest_scene(
+    std::shared_ptr<const viewer_backend::frame_scene>* out_scene,
+    bool* out_has_frame)
+{
+    std::scoped_lock lock(g_state.mutex);
+    if (out_scene != nullptr) {
+        *out_scene = g_state.published_scene;
+    }
+    if (out_has_frame != nullptr) {
+        *out_has_frame = g_state.has_frame;
+    }
+    return g_state.published_scene != nullptr;
+}
+
 void copy_recent_logs(std::vector<log_entry>* out_logs) {
     if (out_logs == nullptr) {
         return;

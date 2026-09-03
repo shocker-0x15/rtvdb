@@ -236,37 +236,47 @@ if(APPLE)
         ${CMAKE_CURRENT_SOURCE_DIR}/src/viewer_backend/shaders/rt_logic_shared_core.h)
     find_program(RTVDB_METAL_EXECUTABLE NAMES metal)
     find_program(RTVDB_METALLIB_EXECUTABLE NAMES metallib)
-    if(NOT RTVDB_METAL_EXECUTABLE OR NOT RTVDB_METALLIB_EXECUTABLE)
-        find_program(_rtvdb_xcrun_executable NAMES xcrun)
-        if(_rtvdb_xcrun_executable)
-            if(NOT RTVDB_METAL_EXECUTABLE)
-                execute_process(
-                    COMMAND "${_rtvdb_xcrun_executable}" --find metal
-                    RESULT_VARIABLE _rtvdb_metal_result
-                    OUTPUT_VARIABLE _rtvdb_metal_path
-                    OUTPUT_STRIP_TRAILING_WHITESPACE
-                    ERROR_QUIET
-                )
-                if(_rtvdb_metal_result EQUAL 0 AND _rtvdb_metal_path)
-                    set(RTVDB_METAL_EXECUTABLE "${_rtvdb_metal_path}")
-                endif()
-            endif()
-            if(NOT RTVDB_METALLIB_EXECUTABLE)
-                execute_process(
-                    COMMAND "${_rtvdb_xcrun_executable}" --find metallib
-                    RESULT_VARIABLE _rtvdb_metallib_result
-                    OUTPUT_VARIABLE _rtvdb_metallib_path
-                    OUTPUT_STRIP_TRAILING_WHITESPACE
-                    ERROR_QUIET
-                )
-                if(_rtvdb_metallib_result EQUAL 0 AND _rtvdb_metallib_path)
-                    set(RTVDB_METALLIB_EXECUTABLE "${_rtvdb_metallib_path}")
-                endif()
-            endif()
+    find_program(_rtvdb_xcrun_executable NAMES xcrun)
+    set(_rtvdb_metal_compile_command)
+    set(_rtvdb_metallib_link_command)
+    if(_rtvdb_xcrun_executable)
+        execute_process(
+            COMMAND "${_rtvdb_xcrun_executable}" --sdk macosx --find metal
+            RESULT_VARIABLE _rtvdb_metal_result
+            OUTPUT_VARIABLE _rtvdb_metal_path
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET
+        )
+        execute_process(
+            COMMAND "${_rtvdb_xcrun_executable}" --sdk macosx --find metallib
+            RESULT_VARIABLE _rtvdb_metallib_result
+            OUTPUT_VARIABLE _rtvdb_metallib_path
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET
+        )
+        if(_rtvdb_metal_result EQUAL 0 AND _rtvdb_metal_path AND
+            _rtvdb_metallib_result EQUAL 0 AND _rtvdb_metallib_path)
+            # MetalToolchain is distributed as a remountable cryptex. Keep xcrun
+            # in the build rule instead of embedding its temporary path.
+            set(_rtvdb_metal_compile_command
+                "${_rtvdb_xcrun_executable}" --sdk macosx metal)
+            set(_rtvdb_metallib_link_command
+                "${_rtvdb_xcrun_executable}" --sdk macosx metallib)
         endif()
     endif()
-    if(NOT RTVDB_METAL_EXECUTABLE OR NOT RTVDB_METALLIB_EXECUTABLE)
-        message(FATAL_ERROR "Apple Metal backend requires metal and metallib. Put them on PATH, set DEVELOPER_DIR for xcrun, or pass RTVDB_METAL_EXECUTABLE and RTVDB_METALLIB_EXECUTABLE.")
+    if(NOT _rtvdb_metal_compile_command AND RTVDB_METAL_EXECUTABLE AND
+        EXISTS "${RTVDB_METAL_EXECUTABLE}")
+        set(_rtvdb_metal_compile_command "${RTVDB_METAL_EXECUTABLE}")
+    endif()
+    if(NOT _rtvdb_metallib_link_command AND RTVDB_METALLIB_EXECUTABLE AND
+        EXISTS "${RTVDB_METALLIB_EXECUTABLE}")
+        set(_rtvdb_metallib_link_command "${RTVDB_METALLIB_EXECUTABLE}")
+    endif()
+    if(NOT _rtvdb_metal_compile_command OR NOT _rtvdb_metallib_link_command)
+        message(FATAL_ERROR
+            "Apple Metal backend requires usable metal and metallib tools. Install the Metal Toolchain "
+            "with xcodebuild -downloadComponent MetalToolchain, set DEVELOPER_DIR for xcrun, or pass "
+            "RTVDB_METAL_EXECUTABLE and RTVDB_METALLIB_EXECUTABLE.")
     endif()
 
     set(RTVDB_METAL_RT_SHADER_AIR ${CMAKE_CURRENT_BINARY_DIR}/generated/metal_rt.air)
@@ -278,11 +288,13 @@ if(APPLE)
         MAIN_DEPENDENCY ${RTVDB_METAL_RT_SHADER_MSL}
         COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/generated
         COMMAND ${CMAKE_COMMAND} -E make_directory ${RTVDB_METAL_RT_SHADER_MODULE_CACHE}
-        COMMAND ${RTVDB_METAL_EXECUTABLE}
+        COMMAND ${_rtvdb_metal_compile_command}
             -fmodules-cache-path=${RTVDB_METAL_RT_SHADER_MODULE_CACHE}
             -c ${RTVDB_METAL_RT_SHADER_MSL}
             -o ${RTVDB_METAL_RT_SHADER_AIR}
-        COMMAND ${RTVDB_METALLIB_EXECUTABLE} ${RTVDB_METAL_RT_SHADER_AIR} -o ${RTVDB_METAL_RT_SHADER_METALLIB}
+        COMMAND ${_rtvdb_metallib_link_command}
+            ${RTVDB_METAL_RT_SHADER_AIR}
+            -o ${RTVDB_METAL_RT_SHADER_METALLIB}
         COMMAND ${CMAKE_COMMAND}
             -DINPUT_FILE=${RTVDB_METAL_RT_SHADER_METALLIB}
             -DOUTPUT_FILE=${RTVDB_METAL_RT_SHADER_METALLIB_HEADER}

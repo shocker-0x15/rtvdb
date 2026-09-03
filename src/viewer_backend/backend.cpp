@@ -31,20 +31,23 @@ struct backend_state {
     std::chrono::steady_clock::time_point pending_updated_at{};
     std::thread worker;
     bool stop_worker = false;
-    frame_scene pending_client_scene;
+    std::shared_ptr<frame_scene> pending_client_scene;
     bool pending_has_frame = false;
     bool pending_allow_auto_frame = true;
     bool pending_helper_overlay_update = false;
+    scene_submission_mode pending_submission_mode = scene_submission_mode::coalesced;
     std::uint64_t pending_revision = 0;
     std::uint64_t next_revision = 0;
-    frame_scene present_client_scene;
+    std::shared_ptr<const frame_scene> present_client_scene;
     bool present_client_has_frame = false;
     std::uint64_t present_client_revision = 0;
-    rt_scene_build present_client_rt_build{};
+    std::shared_ptr<const rt_scene_build> present_client_rt_build;
     std::shared_ptr<const frame_scene> present_render_scene;
     bool present_render_has_frame = false;
     std::uint64_t present_render_revision = 0;
-    rt_scene_build present_render_rt_build{};
+    std::shared_ptr<const rt_scene_build> present_render_rt_build;
+    std::shared_ptr<const layer_visibility_map> layer_visibility =
+        std::make_shared<const layer_visibility_map>();
     bool build_in_progress = false;
     bool auto_frame = true;
     bool helper_overlay = true;
@@ -66,6 +69,9 @@ rt_render_request make_rt_render_request(
     std::scoped_lock lock(g_backend.mutex);
     request.render_scale_x = g_backend.config.render_scale_x;
     request.render_scale_y = g_backend.config.render_scale_y;
+    request.scene_revision = g_backend.present_render_revision;
+    request.layer_visibility = g_backend.layer_visibility;
+    request.build_snapshot = g_backend.present_render_rt_build;
     return request;
 }
 
@@ -84,10 +90,13 @@ bool should_cancel_scene_build(void* user_data) {
 }
 
 std::chrono::milliseconds scene_coalesce_delay_locked() {
+    if (g_backend.pending_client_scene == nullptr) {
+        return kStaleSceneCoalesceDelay;
+    }
     const std::size_t primitive_count =
-        g_backend.pending_client_scene.triangles.size() +
-        g_backend.pending_client_scene.points.size() +
-        g_backend.pending_client_scene.lines.size();
+        g_backend.pending_client_scene->triangles.size() +
+        g_backend.pending_client_scene->points.size() +
+        g_backend.pending_client_scene->lines.size();
     return primitive_count >= kLargeScenePrimitiveThreshold
         ? kLargeSceneCoalesceDelay
         : kStaleSceneCoalesceDelay;
@@ -217,6 +226,7 @@ void schedule_helper_overlay_rebuild_locked() {
     g_backend.pending_has_frame = g_backend.present_client_has_frame;
     g_backend.pending_allow_auto_frame = false;
     g_backend.pending_helper_overlay_update = true;
+    g_backend.pending_submission_mode = scene_submission_mode::immediate;
     g_backend.pending_revision = ++g_backend.next_revision;
     g_backend.pending_updated_at = std::chrono::steady_clock::now();
     g_backend.build_in_progress = g_backend.pending_has_frame;
@@ -234,7 +244,8 @@ void backend_worker() {
         }
 
         for (;;) {
-            if (g_backend.pending_helper_overlay_update) {
+            if (g_backend.pending_helper_overlay_update ||
+                g_backend.pending_submission_mode == scene_submission_mode::immediate) {
                 break;
             }
             const auto observed_pending_updated_at = g_backend.pending_updated_at;
@@ -266,9 +277,16 @@ void backend_worker() {
         }
 
         const bool pending_helper_overlay_update = g_backend.pending_helper_overlay_update;
-        frame_scene pending_scene = pending_helper_overlay_update
-            ? g_backend.present_client_scene
+        std::shared_ptr<frame_scene> pending_scene_storage = pending_helper_overlay_update
+            ? std::make_shared<frame_scene>(
+                  g_backend.present_client_scene != nullptr ? *g_backend.present_client_scene : frame_scene{})
             : g_backend.pending_client_scene;
+        if (pending_scene_storage == nullptr) {
+            g_backend.pending_revision = 0;
+            g_backend.build_in_progress = false;
+            continue;
+        }
+        frame_scene &pending_scene = *pending_scene_storage;
         const bool pending_has_frame = g_backend.pending_has_frame;
         const bool pending_allow_auto_frame = g_backend.pending_allow_auto_frame;
         const std::uint64_t pending_revision = g_backend.pending_revision;
@@ -276,7 +294,7 @@ void backend_worker() {
         const bool auto_frame = g_backend.auto_frame;
         const bool helper_overlay = g_backend.helper_overlay;
         const helper_plane helper_overlay_plane = g_backend.helper_overlay_plane;
-        const rt_scene_build previous_client_build = g_backend.present_client_rt_build;
+        const std::shared_ptr<const rt_scene_build> previous_client_build = g_backend.present_client_rt_build;
         lock.unlock();
 
         scene_build_cancel_context cancel_context{pending_revision};
@@ -291,18 +309,21 @@ void backend_worker() {
         };
 
         const bool can_reuse_client_build = pending_helper_overlay_update &&
-            previous_client_build.revision != 0 &&
-            previous_client_build.connection_serial == pending_scene.connection_serial &&
-            previous_client_build.triangle_count == pending_scene.triangles.size() &&
-            previous_client_build.point_count == pending_scene.points.size() &&
-            previous_client_build.line_count == pending_scene.lines.size();
+            previous_client_build != nullptr &&
+            previous_client_build->revision != 0 &&
+            previous_client_build->connection_serial == pending_scene.connection_serial &&
+            previous_client_build->triangle_count == pending_scene.triangles.size() &&
+            previous_client_build->point_count == pending_scene.points.size() &&
+            previous_client_build->line_count == pending_scene.lines.size();
         rt_scene_build client_rt_build{};
         if (can_reuse_client_build) {
-            client_rt_build = previous_client_build;
+            client_rt_build = *previous_client_build;
             client_rt_build.revision = pending_revision;
         } else if (!build_rt_scene_input(
                        pending_scene,
-                       previous_client_build.revision != 0 ? &previous_client_build : nullptr,
+                       previous_client_build != nullptr && previous_client_build->revision != 0
+                           ? previous_client_build.get()
+                           : nullptr,
                        pending_revision,
                        kDefaultRtSceneTriangleChunkPrimitives,
                        &client_rt_build,
@@ -351,7 +372,7 @@ void backend_worker() {
             continue;
         }
 
-        frame_scene ready_scene{};
+        std::shared_ptr<const frame_scene> ready_scene;
         bool ready_has_frame = false;
         scene_ready_callback ready_callback = nullptr;
         void* ready_user_data = nullptr;
@@ -366,14 +387,16 @@ void backend_worker() {
             continue;
         }
 
-        g_backend.present_client_scene = pending_scene;
+        g_backend.present_client_scene = pending_scene_storage;
         g_backend.present_client_has_frame = pending_has_frame;
         g_backend.present_client_revision = pending_revision;
-        g_backend.present_client_rt_build = std::move(client_rt_build);
+        g_backend.present_client_rt_build =
+            std::make_shared<rt_scene_build>(std::move(client_rt_build));
         g_backend.present_render_scene = std::make_shared<frame_scene>(std::move(render_scene));
         g_backend.present_render_has_frame = pending_has_frame;
         g_backend.present_render_revision = pending_revision;
-        g_backend.present_render_rt_build = std::move(render_rt_build);
+        g_backend.present_render_rt_build =
+            std::make_shared<rt_scene_build>(std::move(render_rt_build));
         g_backend.pending_revision = 0;
         g_backend.pending_helper_overlay_update = false;
         g_backend.build_in_progress = false;
@@ -385,7 +408,7 @@ void backend_worker() {
         lock.unlock();
 
         if (ready_callback != nullptr) {
-            ready_callback(&ready_scene, ready_has_frame, ready_user_data);
+            ready_callback(ready_scene.get(), ready_has_frame, ready_user_data);
         }
 
         lock.lock();
@@ -397,6 +420,7 @@ bool try_recover_backend(const d3d12_interop_config* replacement_d3d12 = nullptr
     frame_scene recovery_scene{};
     bool recovery_has_frame = false;
     bool recovery_allow_auto_frame = false;
+    scene_submission_mode recovery_submission_mode = scene_submission_mode::coalesced;
     bool auto_frame = true;
     bool helper_overlay = true;
     helper_plane helper_overlay_plane = helper_plane::xy;
@@ -422,13 +446,19 @@ bool try_recover_backend(const d3d12_interop_config* replacement_d3d12 = nullptr
         highlight = g_backend.highlight;
         selection = g_backend.selection;
         if (g_backend.pending_revision != 0) {
-            recovery_scene = g_backend.pending_helper_overlay_update
+            const std::shared_ptr<const frame_scene> recovery_source = g_backend.pending_helper_overlay_update
                 ? g_backend.present_client_scene
                 : g_backend.pending_client_scene;
+            if (recovery_source != nullptr) {
+                recovery_scene = *recovery_source;
+            }
             recovery_has_frame = g_backend.pending_has_frame;
             recovery_allow_auto_frame = g_backend.pending_allow_auto_frame;
+            recovery_submission_mode = g_backend.pending_submission_mode;
         } else {
-            recovery_scene = g_backend.present_client_scene;
+            if (g_backend.present_client_scene != nullptr) {
+                recovery_scene = *g_backend.present_client_scene;
+            }
             recovery_has_frame = g_backend.present_client_has_frame;
         }
     }
@@ -448,7 +478,8 @@ bool try_recover_backend(const d3d12_interop_config* replacement_d3d12 = nullptr
             scene_queued = submit_scene_build(
                 recovery_scene,
                 true,
-                recovery_allow_auto_frame);
+                recovery_allow_auto_frame,
+                recovery_submission_mode);
         }
         if (!scene_queued) {
             shutdown_backend();
@@ -594,6 +625,7 @@ void shutdown_backend() {
     g_backend.pending_has_frame = false;
     g_backend.pending_allow_auto_frame = true;
     g_backend.pending_helper_overlay_update = false;
+    g_backend.pending_submission_mode = scene_submission_mode::coalesced;
     g_backend.pending_revision = 0;
     g_backend.pending_updated_at = {};
     g_backend.next_revision = 0;
@@ -604,7 +636,8 @@ void shutdown_backend() {
     g_backend.present_render_scene.reset();
     g_backend.present_render_has_frame = false;
     g_backend.present_render_revision = 0;
-    g_backend.present_render_rt_build = {};
+    g_backend.present_render_rt_build.reset();
+    g_backend.layer_visibility = std::make_shared<const layer_visibility_map>();
     g_backend.build_in_progress = false;
     g_backend.auto_frame = true;
     g_backend.helper_overlay = true;
@@ -631,27 +664,81 @@ bool recover_backend_with_d3d12_interop(const d3d12_interop_config &d3d12) {
     return try_recover_backend(&d3d12);
 }
 
-bool submit_scene_build(const frame_scene &scene, bool has_frame, bool allow_auto_frame) {
+bool submit_scene_build(
+    const frame_scene &scene,
+    bool has_frame,
+    bool allow_auto_frame,
+    scene_submission_mode submission_mode,
+    std::uint64_t* out_revision)
+{
+    return submit_scene_build(
+        frame_scene{scene},
+        has_frame,
+        allow_auto_frame,
+        submission_mode,
+        out_revision);
+}
+
+bool submit_scene_build(
+    frame_scene &&scene,
+    bool has_frame,
+    bool allow_auto_frame,
+    scene_submission_mode submission_mode,
+    std::uint64_t* out_revision)
+{
     if (!g_backend.initialized || g_backend.ops == nullptr) {
         return false;
     }
 
+    auto pending_scene = std::make_shared<frame_scene>(std::move(scene));
     std::scoped_lock lock(g_backend.mutex);
-    g_backend.pending_client_scene = scene;
+    if (g_backend.present_client_scene == nullptr ||
+        g_backend.present_client_scene->connection_serial != pending_scene->connection_serial) {
+        g_backend.layer_visibility = std::make_shared<const layer_visibility_map>();
+    }
+    g_backend.pending_client_scene = std::move(pending_scene);
     g_backend.pending_has_frame = has_frame;
     g_backend.pending_allow_auto_frame = allow_auto_frame;
     g_backend.pending_helper_overlay_update = false;
+    g_backend.pending_submission_mode = submission_mode;
     g_backend.pending_revision = ++g_backend.next_revision;
+    if (out_revision != nullptr) {
+        *out_revision = g_backend.pending_revision;
+    }
     g_backend.pending_updated_at = std::chrono::steady_clock::now();
     g_backend.build_in_progress = true;
     g_backend.condition.notify_all();
     return true;
 }
 
+bool submit_layer_visibility_update(
+    std::uint64_t connection_serial,
+    const layer_visibility_map &visibility,
+    std::uint64_t* out_revision)
+{
+    auto visibility_snapshot = std::make_shared<const layer_visibility_map>(visibility);
+    std::scoped_lock lock(g_backend.mutex);
+    if (!g_backend.initialized ||
+        g_backend.ops == nullptr ||
+        g_backend.pending_revision != 0 ||
+        g_backend.present_render_rt_build == nullptr ||
+        g_backend.present_render_rt_build->connection_serial != connection_serial) {
+        return false;
+    }
+    g_backend.layer_visibility = std::move(visibility_snapshot);
+    g_backend.present_render_revision = ++g_backend.next_revision;
+    if (out_revision != nullptr) {
+        *out_revision = g_backend.present_render_revision;
+    }
+    return true;
+}
+
 void copy_present_scene(frame_scene* out_scene, bool* out_has_frame) {
     std::scoped_lock lock(g_backend.mutex);
     if (out_scene != nullptr) {
-        *out_scene = g_backend.present_client_scene;
+        *out_scene = g_backend.present_client_scene != nullptr
+            ? *g_backend.present_client_scene
+            : frame_scene{};
     }
     if (out_has_frame != nullptr) {
         *out_has_frame = g_backend.present_client_has_frame;
@@ -663,7 +750,8 @@ void copy_present_camera(
     rtvdb::camera_projection* out_projection_blend_from,
     rtvdb::camera_projection* out_projection_blend_to,
     float* out_projection_blend_t,
-    bool* out_has_frame)
+    bool* out_has_frame,
+    std::uint64_t* out_view_revision)
 {
     std::scoped_lock lock(g_backend.mutex);
     if (out_camera != nullptr) {
@@ -689,6 +777,11 @@ void copy_present_camera(
     if (out_has_frame != nullptr) {
         *out_has_frame = g_backend.present_render_has_frame;
     }
+    if (out_view_revision != nullptr) {
+        *out_view_revision = g_backend.present_render_scene != nullptr
+            ? g_backend.present_render_scene->view_revision
+            : 0;
+    }
 }
 
 void copy_present_render_scene(frame_scene* out_scene, bool* out_has_frame) {
@@ -703,7 +796,8 @@ void copy_present_render_scene(frame_scene* out_scene, bool* out_has_frame) {
 
 bool acquire_present_render_scene(
     std::shared_ptr<const frame_scene>* out_scene,
-    bool* out_has_frame)
+    bool* out_has_frame,
+    std::uint64_t* out_revision)
 {
     std::scoped_lock lock(g_backend.mutex);
     if (out_scene != nullptr) {
@@ -712,20 +806,18 @@ bool acquire_present_render_scene(
     if (out_has_frame != nullptr) {
         *out_has_frame = g_backend.present_render_has_frame;
     }
+    if (out_revision != nullptr) {
+        *out_revision = g_backend.present_render_revision;
+    }
     return g_backend.present_render_scene != nullptr;
 }
 
 void copy_present_client_rt_scene_build(rt_scene_build* out_build) {
     std::scoped_lock lock(g_backend.mutex);
     if (out_build != nullptr) {
-        *out_build = g_backend.present_client_rt_build;
-    }
-}
-
-void copy_present_render_rt_scene_build(rt_scene_build* out_build) {
-    std::scoped_lock lock(g_backend.mutex);
-    if (out_build != nullptr) {
-        *out_build = g_backend.present_render_rt_build;
+        *out_build = g_backend.present_client_rt_build != nullptr
+            ? *g_backend.present_client_rt_build
+            : rt_scene_build{};
     }
 }
 
@@ -739,20 +831,24 @@ void copy_present_build_info(scene_build_info* out_info) {
     {
         std::scoped_lock lock(g_backend.mutex);
         recovery_count = g_backend.recovery_count;
-        out_info->revision = g_backend.present_client_rt_build.revision;
-        out_info->triangle_count = g_backend.present_client_rt_build.triangle_count;
-        out_info->point_count = g_backend.present_client_rt_build.point_count;
-        out_info->line_count = g_backend.present_client_rt_build.line_count;
-        out_info->triangle_chunk_count = g_backend.present_client_rt_build.triangle_chunks.size();
-        out_info->point_chunk_count = g_backend.present_client_rt_build.point_chunks.size();
-        out_info->line_chunk_count = g_backend.present_client_rt_build.line_chunks.size();
-        out_info->triangle_blas_chunk_set_count = g_backend.present_client_rt_build.triangle_blas_chunk_sets.size();
-        out_info->point_blas_chunk_set_count = g_backend.present_client_rt_build.point_blas_chunk_sets.size();
-        out_info->line_blas_chunk_set_count = g_backend.present_client_rt_build.line_blas_chunk_sets.size();
-        out_info->reused_triangle_chunk_count = g_backend.present_client_rt_build.reused_triangle_chunk_count;
-        out_info->rebuilt_triangle_chunk_count = g_backend.present_client_rt_build.rebuilt_triangle_chunk_count;
-        out_info->vertex_count = g_backend.present_client_rt_build.vertex_count;
-        out_info->index_count = g_backend.present_client_rt_build.index_count;
+        const rt_scene_build* build = g_backend.present_client_rt_build.get();
+        out_info->revision = build != nullptr ? build->revision : 0;
+        out_info->triangle_count = build != nullptr ? build->triangle_count : 0;
+        out_info->point_count = build != nullptr ? build->point_count : 0;
+        out_info->line_count = build != nullptr ? build->line_count : 0;
+        out_info->triangle_chunk_count = build != nullptr ? build->triangle_chunks.size() : 0;
+        out_info->point_chunk_count = build != nullptr ? build->point_chunks.size() : 0;
+        out_info->line_chunk_count = build != nullptr ? build->line_chunks.size() : 0;
+        out_info->triangle_blas_chunk_set_count =
+            build != nullptr ? build->triangle_blas_chunk_sets.size() : 0;
+        out_info->point_blas_chunk_set_count =
+            build != nullptr ? build->point_blas_chunk_sets.size() : 0;
+        out_info->line_blas_chunk_set_count =
+            build != nullptr ? build->line_blas_chunk_sets.size() : 0;
+        out_info->reused_triangle_chunk_count = build != nullptr ? build->reused_triangle_chunk_count : 0;
+        out_info->rebuilt_triangle_chunk_count = build != nullptr ? build->rebuilt_triangle_chunk_count : 0;
+        out_info->vertex_count = build != nullptr ? build->vertex_count : 0;
+        out_info->index_count = build != nullptr ? build->index_count : 0;
         if (g_backend.ops != nullptr) {
             fill_build_info = g_backend.ops->fill_build_info;
         }
@@ -766,7 +862,10 @@ void copy_present_build_info(scene_build_info* out_info) {
 
 bool copy_present_client_scene_bounds(rtvdb::vec3* out_min, rtvdb::vec3* out_max) {
     std::scoped_lock lock(g_backend.mutex);
-    const scene_bounds &bounds = g_backend.present_client_rt_build.bounds;
+    if (g_backend.present_client_rt_build == nullptr) {
+        return false;
+    }
+    const scene_bounds &bounds = g_backend.present_client_rt_build->bounds;
     if (!bounds.valid) {
         return false;
     }

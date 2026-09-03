@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace rtvdb::viewer_backend {
@@ -42,6 +43,11 @@ enum class helper_plane {
     xy,
     xz,
     yz,
+};
+
+enum class scene_submission_mode {
+    coalesced,
+    immediate,
 };
 
 enum class hover_highlight_kind : std::uint32_t {
@@ -129,6 +135,8 @@ struct frame_scene {
     std::vector<point> points;
     std::vector<line> lines;
 };
+
+using layer_visibility_map = std::unordered_map<std::string, bool>;
 
 struct scene_build_info {
     std::uint64_t backend_recovery_count = 0;
@@ -271,18 +279,35 @@ bool initialize_backend(const backend_config &config);
 void shutdown_backend();
 bool recover_backend();
 bool recover_backend_with_d3d12_interop(const d3d12_interop_config &d3d12);
-bool submit_scene_build(const frame_scene &scene, bool has_frame, bool allow_auto_frame = true);
+bool submit_scene_build(
+    const frame_scene &scene,
+    bool has_frame,
+    bool allow_auto_frame = true,
+    scene_submission_mode submission_mode = scene_submission_mode::coalesced,
+    std::uint64_t* out_revision = nullptr);
+bool submit_layer_visibility_update(
+    std::uint64_t connection_serial,
+    const layer_visibility_map &visibility,
+    std::uint64_t* out_revision = nullptr);
+bool submit_scene_build(
+    frame_scene &&scene,
+    bool has_frame,
+    bool allow_auto_frame = true,
+    scene_submission_mode submission_mode = scene_submission_mode::coalesced,
+    std::uint64_t* out_revision = nullptr);
 void copy_present_scene(frame_scene* out_scene, bool* out_has_frame);
 void copy_present_render_scene(frame_scene* out_scene, bool* out_has_frame);
 bool acquire_present_render_scene(
     std::shared_ptr<const frame_scene>* out_scene,
-    bool* out_has_frame);
+    bool* out_has_frame,
+    std::uint64_t* out_revision = nullptr);
 void copy_present_camera(
     rtvdb::camera* out_camera,
     rtvdb::camera_projection* out_projection_blend_from,
     rtvdb::camera_projection* out_projection_blend_to,
     float* out_projection_blend_t,
-    bool* out_has_frame);
+    bool* out_has_frame,
+    std::uint64_t* out_view_revision = nullptr);
 void copy_present_build_info(scene_build_info* out_info);
 bool copy_present_client_scene_bounds(rtvdb::vec3* out_min, rtvdb::vec3* out_max);
 bool build_in_progress();

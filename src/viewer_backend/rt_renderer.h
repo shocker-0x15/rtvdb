@@ -75,6 +75,9 @@ struct rt_present_request {
     bool update_build_info = false;
     float render_scale_x = 1.0f;
     float render_scale_y = 1.0f;
+    std::uint64_t scene_revision = 0;
+    std::shared_ptr<const layer_visibility_map> layer_visibility;
+    std::shared_ptr<const rt_scene_build> build_snapshot;
 };
 
 struct rt_present_result {
@@ -158,6 +161,8 @@ struct rt_renderer_frame_request {
     rt_blas_cache_update_plan* blas_cache_plan = nullptr;
     const rt_scene_resource_data* resources = nullptr;
     const rt_acceleration_command_plan* acceleration_commands = nullptr;
+    std::uint64_t scene_revision = 0;
+    const layer_visibility_map* layer_visibility = nullptr;
 };
 
 struct rt_blas_storage_pool_entry {
@@ -216,6 +221,7 @@ struct rt_renderer_frame_result {
 
 struct rt_renderer_frame_state {
     std::uint64_t scene_revision = 0;
+    std::uint64_t presentation_revision = 0;
     int output_width = 0;
     int output_height = 0;
     std::uint64_t serial = 0;
@@ -224,14 +230,27 @@ struct rt_renderer_frame_state {
     bool active = false;
 };
 
+struct rt_layer_tlas_instance {
+    rt_tlas_instance_desc instance{};
+    std::string layer;
+    rt_acceleration_geometry_kind kind = rt_acceleration_geometry_kind::triangle;
+    std::size_t geometry_count = 0;
+    bool fallback_visible = true;
+    bool layer_visibility_exempt = false;
+};
+
 struct rt_deferred_acceleration_submission {
     rt_command_encoder encoder{};
     rt_blas_cache_state next_blas_cache_state{};
     std::vector<rt_blas_handle> created_accelerations;
     std::vector<rt_blas_storage_pool_entry> acquired_accelerations;
     std::vector<rt_blas_storage_pool_entry> retired_accelerations;
+    std::vector<rt_layer_tlas_instance> next_layer_tlas_instances;
     std::uint64_t scene_revision = 0;
+    std::uint64_t presentation_revision = 0;
     std::uint64_t connection_serial = 0;
+    rt_acceleration_build_summary acceleration_summary{};
+    bool scene_changed = false;
 };
 
 struct rt_pending_render_submission {
@@ -262,6 +281,7 @@ struct rt_renderer {
     rt_buffer_handle pick_output_buffer{};
     std::array<rt_pick_slot, kRtCommandSlotCount> pick_slots{};
     rt_blas_cache_state blas_cache_state{};
+    std::vector<rt_layer_tlas_instance> layer_tlas_instances;
     std::uint64_t current_connection_serial = 0;
     std::vector<rt_blas_storage_pool_entry> blas_storage_pool;
     std::vector<rt_scene_buffer_pool_entry> scene_buffer_pool;
