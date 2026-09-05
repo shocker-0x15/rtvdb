@@ -63,15 +63,20 @@ rt_render_request make_rt_render_request(
     int width,
     int height,
     const frame_scene &scene,
-    bool has_frame)
+    bool has_frame,
+    const render_scene_context* context = nullptr)
 {
     rt_render_request request{width, height, &scene, has_frame};
     std::scoped_lock lock(g_backend.mutex);
     request.render_scale_x = g_backend.config.render_scale_x;
     request.render_scale_y = g_backend.config.render_scale_y;
-    request.scene_revision = g_backend.present_render_revision;
+    request.scene_revision = context != nullptr && context->revision != 0
+        ? context->revision
+        : g_backend.present_render_revision;
     request.layer_visibility = g_backend.layer_visibility;
-    request.build_snapshot = g_backend.present_render_rt_build;
+    request.build_snapshot = context != nullptr && context->build_snapshot != nullptr
+        ? context->build_snapshot
+        : g_backend.present_render_rt_build;
     return request;
 }
 
@@ -797,7 +802,8 @@ void copy_present_render_scene(frame_scene* out_scene, bool* out_has_frame) {
 bool acquire_present_render_scene(
     std::shared_ptr<const frame_scene>* out_scene,
     bool* out_has_frame,
-    std::uint64_t* out_revision)
+    std::uint64_t* out_revision,
+    render_scene_context* out_context)
 {
     std::scoped_lock lock(g_backend.mutex);
     if (out_scene != nullptr) {
@@ -808,6 +814,10 @@ bool acquire_present_render_scene(
     }
     if (out_revision != nullptr) {
         *out_revision = g_backend.present_render_revision;
+    }
+    if (out_context != nullptr) {
+        out_context->revision = g_backend.present_render_revision;
+        out_context->build_snapshot = g_backend.present_render_rt_build;
     }
     return g_backend.present_render_scene != nullptr;
 }
@@ -1107,14 +1117,24 @@ bool notify_shell_post_present(bool* out_tracked_delivery_complete) {
     return false;
 }
 
+bool wait_for_idle() {
+    if (!g_backend.initialized ||
+        g_backend.ops == nullptr ||
+        g_backend.ops->wait_for_idle == nullptr) {
+        return false;
+    }
+    return g_backend.ops->wait_for_idle();
+}
+
 bool render_frame_to_native_d3d12_texture(
     int width,
     int height,
     const frame_scene &scene,
     bool has_frame,
-    void* texture_resource)
+    void* texture_resource,
+    const render_scene_context* context)
 {
-    const rt_render_request request = make_rt_render_request(width, height, scene, has_frame);
+    const rt_render_request request = make_rt_render_request(width, height, scene, has_frame, context);
     if (!g_backend.initialized ||
         g_backend.ops == nullptr ||
         g_backend.ops->render_to_native_d3d12_texture == nullptr) {
@@ -1134,9 +1154,10 @@ bool render_frame_to_native_metal_texture(
     int height,
     const frame_scene &scene,
     bool has_frame,
-    void* pixel_buffer)
+    void* pixel_buffer,
+    const render_scene_context* context)
 {
-    const rt_render_request request = make_rt_render_request(width, height, scene, has_frame);
+    const rt_render_request request = make_rt_render_request(width, height, scene, has_frame, context);
     if (!g_backend.initialized ||
         g_backend.ops == nullptr ||
         g_backend.ops->render_to_native_metal_texture == nullptr) {
@@ -1156,9 +1177,10 @@ bool render_frame_to_native_vulkan_texture(
     int height,
     const frame_scene &scene,
     bool has_frame,
-    void** out_image)
+    void** out_image,
+    const render_scene_context* context)
 {
-    const rt_render_request request = make_rt_render_request(width, height, scene, has_frame);
+    const rt_render_request request = make_rt_render_request(width, height, scene, has_frame, context);
     if (out_image == nullptr ||
         !g_backend.initialized ||
         g_backend.ops == nullptr ||
@@ -1174,9 +1196,10 @@ bool capture_frame_to_bgra(
     const frame_scene &scene,
     bool has_frame,
     std::vector<std::uint8_t>* out_pixels,
-    bool update_build_info)
+    bool update_build_info,
+    const render_scene_context* context)
 {
-    const rt_render_request request = make_rt_render_request(width, height, scene, has_frame);
+    const rt_render_request request = make_rt_render_request(width, height, scene, has_frame, context);
     if (!g_backend.initialized || g_backend.ops == nullptr || g_backend.ops->capture_to_bgra == nullptr) {
         return false;
     }

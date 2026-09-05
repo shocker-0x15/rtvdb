@@ -120,6 +120,7 @@ bool render_coordinate_to_pixel(int x, int y, int* out_pixel_x, int* out_pixel_y
 void copy_frame_timing(frame_timing* out_timing);
 bool key_pressed(key_code key);
 bool get_d3d12_renderer_interop(d3d12_renderer_interop* out_interop);
+bool wait_for_d3d12_idle();
 bool copy_vulkan_instance_extensions(std::vector<const char*>* out_extensions);
 bool vulkan_presentation_supported(void* instance, void* physical_device, std::uint32_t queue_family_index);
 bool upload_bgra_frame(int width, int height, int stride, const void* pixels);

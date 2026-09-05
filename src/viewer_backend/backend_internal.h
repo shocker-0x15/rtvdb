@@ -54,6 +54,7 @@ struct backend_ops {
     bool (*get_vulkan_renderer_interop)(vulkan_renderer_interop* out_interop);
     bool (*track_latest_native_delivery)();
     bool (*notify_shell_post_present)(bool* out_tracked_delivery_complete);
+    bool (*wait_for_idle)();
 };
 
 bool select_rt_rhi(backend_preference preference);

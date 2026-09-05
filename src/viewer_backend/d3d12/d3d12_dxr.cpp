@@ -104,6 +104,13 @@ struct dxr_acceleration_build_context {
     std::vector<dxr_blas_build_record> blas_builds;
 };
 
+struct dxr_resource_state_change {
+    rt_resource_kind kind = rt_resource_kind::texture;
+    rt_buffer_handle buffer{};
+    rt_texture_handle texture{};
+    D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
+};
+
 struct dxr_command_slot {
     ID3D12CommandAllocator* allocator = nullptr;
     ID3D12Resource* tlas_instance_buffer = nullptr;
@@ -156,6 +163,7 @@ struct dxr_backend_state {
     std::uint64_t next_encoder_id = 1;
     std::uint64_t active_encoder_id = 0;
     bool active_dispatch_timestamp_recorded = false;
+    std::vector<dxr_resource_state_change> active_resource_state_changes;
     HANDLE fence_event = nullptr;
     ID3D12QueryHeap* timestamp_query_heap = nullptr;
     ID3D12Resource* timestamp_query_readback = nullptr;
@@ -2629,8 +2637,24 @@ bool reset_command_list(dxr_backend_state &state) {
         record_dxr_failure(state, "reset_command_list.command_list_reset", list_hr);
         return false;
     }
+    state.active_resource_state_changes.clear();
     state.active_command_slot_index = slot_index;
     return true;
+}
+
+void restore_discarded_resource_states(dxr_backend_state &state) {
+    for (auto change = state.active_resource_state_changes.rbegin();
+         change != state.active_resource_state_changes.rend();
+         ++change) {
+        if (change->kind == rt_resource_kind::texture) {
+            if (dxr_texture* const texture = state.texture_registry.get(change->texture)) {
+                texture->state = change->state;
+            }
+        } else if (dxr_buffer* const buffer = state.buffer_registry.get(change->buffer)) {
+            buffer->state = change->state;
+        }
+    }
+    state.active_resource_state_changes.clear();
 }
 
 bool close_and_execute_command_list(
@@ -3143,6 +3167,11 @@ bool d3d12_dxr_rhi_device::submit_commands(
     }
     native_state_.active_dispatch_timestamp_recorded = false;
     native_state_.active_encoder_id = 0;
+    if (submitted) {
+        native_state_.active_resource_state_changes.clear();
+    } else {
+        restore_discarded_resource_states(native_state_);
+    }
     if (out_timing != nullptr) {
         out_timing->submit_cpu_ms = submit_cpu_ms;
         out_timing->gpu_ms = native_state_.diagnostics.dispatch_gpu_ms;
@@ -3159,6 +3188,13 @@ void d3d12_dxr_rhi_device::discard_commands(
     if (!encoder || encoder.id != native_state_.active_encoder_id) {
         return;
     }
+    if (native_state_.command_list != nullptr) {
+        const HRESULT close_hr = native_state_.command_list->Close();
+        if (FAILED(close_hr)) {
+            record_dxr_failure(native_state_, "discard_commands.Close", close_hr);
+        }
+    }
+    restore_discarded_resource_states(native_state_);
     native_state_.acceleration_build = {};
     native_state_.active_dispatch_timestamp_recorded = false;
     native_state_.active_encoder_id = 0;
@@ -3281,6 +3317,7 @@ bool d3d12_dxr_rhi_device::barrier(
         D3D12_RESOURCE_STATES before = dxr_resource_state(source.before);
         const D3D12_RESOURCE_STATES after = dxr_resource_state(source.after);
         dxr_texture* texture = nullptr;
+        dxr_buffer* buffer = nullptr;
         if (source.kind == rt_resource_kind::texture) {
             texture = native_state_.texture_registry.get(source.texture);
             if (texture != nullptr) {
@@ -3288,8 +3325,7 @@ bool d3d12_dxr_rhi_device::barrier(
                 before = texture->state;
             }
         } else {
-            dxr_buffer* const buffer =
-                native_state_.buffer_registry.get(source.buffer);
+            buffer = native_state_.buffer_registry.get(source.buffer);
             if (buffer != nullptr) {
                 resource = buffer->resource;
                 before = buffer->state;
@@ -3316,9 +3352,22 @@ bool d3d12_dxr_rhi_device::barrier(
             native_barriers.push_back(barrier);
         }
         if (texture != nullptr) {
+            if (before != after) {
+                native_state_.active_resource_state_changes.push_back({
+                    rt_resource_kind::texture,
+                    {},
+                    source.texture,
+                    before});
+            }
             texture->state = after;
-        } else if (dxr_buffer* const buffer =
-                native_state_.buffer_registry.get(source.buffer)) {
+        } else if (buffer != nullptr) {
+            if (before != after) {
+                native_state_.active_resource_state_changes.push_back({
+                    rt_resource_kind::buffer,
+                    source.buffer,
+                    {},
+                    before});
+            }
             buffer->state = after;
         }
     }
@@ -3375,15 +3424,16 @@ bool d3d12_dxr_rhi_device::copy_texture_to_buffer(
     const std::size_t bytes_per_pixel = source_texture != nullptr
         ? rt_texture_format_bytes_per_pixel(source_texture->desc.format)
         : 0;
+    const std::size_t row_bytes = static_cast<std::size_t>(region.width) * bytes_per_pixel;
     const std::size_t required_size = region.buffer_offset +
-        region.buffer_row_pitch * static_cast<std::size_t>(region.height);
+        region.buffer_row_pitch * static_cast<std::size_t>(region.height - 1u) + row_bytes;
     const bool valid = encoder && encoder.id == native_state_.active_encoder_id &&
         source_texture != nullptr && source_texture->resource != nullptr &&
         destination_buffer != nullptr &&
         region.width > 0 && region.height > 0 && bytes_per_pixel > 0 &&
         region.width <= source_texture->desc.width &&
         region.height <= source_texture->desc.height &&
-        region.buffer_row_pitch >= static_cast<std::size_t>(region.width) * bytes_per_pixel &&
+        region.buffer_row_pitch >= row_bytes &&
         region.buffer_row_pitch % D3D12_TEXTURE_DATA_PITCH_ALIGNMENT == 0 &&
         required_size <= destination_buffer->GetDesc().Width;
     if (!valid) {

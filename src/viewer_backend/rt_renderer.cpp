@@ -2357,6 +2357,14 @@ bool collect_rt_output_readback(
     return true;
 }
 
+void discard_rt_output_readback(rt_renderer* renderer) {
+    if (renderer == nullptr) {
+        return;
+    }
+    renderer->output_readback_submission = {};
+    renderer->output_readback_pending = false;
+}
+
 bool readback_rt_output(
     rt_renderer* renderer,
     int width,
@@ -2379,6 +2387,7 @@ bool readback_rt_output(
     out_pixels->clear();
     if (renderer->output_readback_pending) {
         if (!collect_rt_output_readback(renderer, out_pixels, out_error)) {
+            discard_rt_output_readback(renderer);
             return false;
         }
         if (renderer->output_readback_pending || !out_pixels->empty()) {

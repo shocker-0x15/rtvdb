@@ -80,11 +80,6 @@ struct shared_state {
     bool winsock_started = false;
     char last_error_message[256]{};
     std::vector<log_entry> recent_logs;
-    struct pending_capture_request {
-        std::uint64_t connection_serial = 0;
-        bool full_accumulation = true;
-    };
-    std::vector<pending_capture_request> pending_capture_requests;
     std::uint64_t next_log_sequence = 1;
 } g_state;
 
@@ -314,18 +309,22 @@ std::string current_layer_path_locked() {
     return path;
 }
 
-bool publish_locked(
-    std::shared_ptr<const viewer_backend::frame_scene>* out_scene,
-    session_callbacks* out_callbacks)
-{
-    ensure_pending_revision_locked();
+std::shared_ptr<const viewer_backend::frame_scene> make_scene_snapshot_locked() {
     viewer_backend::frame_scene snapshot = g_state.working_scene;
     snapshot.helper_overlay_bounds_valid = g_state.working_bounds.valid;
     if (g_state.working_bounds.valid) {
         snapshot.helper_overlay_bounds_min = g_state.working_bounds.min;
         snapshot.helper_overlay_bounds_max = g_state.working_bounds.max;
     }
-    g_state.published_scene = std::make_shared<const viewer_backend::frame_scene>(std::move(snapshot));
+    return std::make_shared<const viewer_backend::frame_scene>(std::move(snapshot));
+}
+
+bool publish_locked(
+    std::shared_ptr<const viewer_backend::frame_scene>* out_scene,
+    session_callbacks* out_callbacks)
+{
+    ensure_pending_revision_locked();
+    g_state.published_scene = make_scene_snapshot_locked();
     g_state.has_frame = true;
     g_state.published_revision = g_state.current_revision;
     g_state.last_published_triangle_count = g_state.working_scene.triangles.size();
@@ -345,7 +344,8 @@ bool publish_locked(
     return true;
 }
 
-void publish_now(viewer_backend::frame_scene* out_scene = nullptr) {
+void publish_now(std::shared_ptr<const viewer_backend::frame_scene>* out_scene = nullptr)
+{
     std::shared_ptr<const viewer_backend::frame_scene> scene;
     session_callbacks callbacks{};
     {
@@ -358,29 +358,7 @@ void publish_now(viewer_backend::frame_scene* out_scene = nullptr) {
         callbacks.frame_ready(scene.get(), callbacks.user_data);
     }
     if (out_scene != nullptr && scene != nullptr) {
-        *out_scene = *scene;
-    }
-}
-
-void dispatch_pending_capture_requests() {
-    std::vector<shared_state::pending_capture_request> requests;
-    session_callbacks callbacks{};
-    {
-        std::scoped_lock lock(g_state.mutex);
-        if (g_state.pending_capture_requests.empty()) {
-            return;
-        }
-        requests.swap(g_state.pending_capture_requests);
-        callbacks = g_state.callbacks;
-    }
-    if (callbacks.capture_requested == nullptr) {
-        return;
-    }
-    for (const shared_state::pending_capture_request &request : requests) {
-        callbacks.capture_requested(
-            request.connection_serial,
-            request.full_accumulation,
-            callbacks.user_data);
+        *out_scene = scene;
     }
 }
 
@@ -592,10 +570,16 @@ void network_thread() {
                 default:
                     goto connection_end;
                 }
-                rtvdb::viewer_backend::apply_reference_grid_request(payload.value);
+                session_callbacks callbacks{};
                 {
                     std::scoped_lock lock(g_state.mutex);
+                    callbacks = g_state.callbacks;
                     append_log_locked(log_event_kind::set_reference_grid, header.payload_size, 0, nullptr);
+                }
+                if (callbacks.reference_grid_requested != nullptr) {
+                    callbacks.reference_grid_requested(payload.value, callbacks.user_data);
+                } else {
+                    rtvdb::viewer_backend::apply_reference_grid_request(payload.value);
                 }
                 break;
             }
@@ -744,7 +728,6 @@ void network_thread() {
                     append_log_locked(log_event_kind::end_frame, header.payload_size, 0, nullptr);
                 }
                 publish_now();
-                dispatch_pending_capture_requests();
                 break;
             }
             case rtvdb::message_kind::request_capture: {
@@ -759,29 +742,34 @@ void network_thread() {
                     goto connection_end;
                 }
                 session_callbacks callbacks{};
+                std::shared_ptr<const viewer_backend::frame_scene> capture_scene;
+                bool capture_has_frame = false;
                 std::uint64_t connection_serial = 0;
                 bool publish_before_capture = false;
-                bool dispatch_capture_now = false;
                 {
                     std::scoped_lock lock(g_state.mutex);
                     connection_serial = g_state.connection_serial;
                     append_log_locked(log_event_kind::request_capture, header.payload_size, 0, nullptr);
                     callbacks = g_state.callbacks;
                     if (g_state.explicit_frame_open) {
-                        g_state.pending_capture_requests.push_back({
-                            connection_serial,
-                            payload.full_accumulation != 0,
-                        });
+                        capture_scene = make_scene_snapshot_locked();
+                        capture_has_frame = true;
                     } else {
                         publish_before_capture = g_state.dirty;
-                        dispatch_capture_now = true;
+                        if (!publish_before_capture) {
+                            capture_scene = g_state.published_scene;
+                            capture_has_frame = g_state.has_frame;
+                        }
                     }
                 }
                 if (publish_before_capture) {
-                    publish_now();
+                    publish_now(&capture_scene);
+                    capture_has_frame = true;
                 }
-                if (dispatch_capture_now && callbacks.capture_requested != nullptr) {
+                if (callbacks.capture_requested != nullptr) {
                     callbacks.capture_requested(
+                        capture_scene,
+                        capture_has_frame,
                         connection_serial,
                         payload.full_accumulation != 0,
                         callbacks.user_data);
@@ -811,7 +799,6 @@ connection_end:
                     reset_working_bounds_locked();
                     g_state.explicit_frame_open = false;
                     g_state.dirty = false;
-                    g_state.pending_capture_requests.clear();
                 } else if (g_state.dirty) {
                     publish_locked(&scene, &callbacks);
                     publish_on_disconnect = true;

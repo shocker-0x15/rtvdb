@@ -45,9 +45,12 @@ struct session_callbacks {
         const std::shared_ptr<const viewer_backend::frame_scene> &scene,
         void* user_data);
     void (*capture_requested)(
+        const std::shared_ptr<const viewer_backend::frame_scene> &scene,
+        bool has_frame,
         std::uint64_t connection_serial,
         bool full_accumulation,
         void* user_data);
+    void (*reference_grid_requested)(rtvdb::reference_grid value, void* user_data);
     void* user_data;
 };
 

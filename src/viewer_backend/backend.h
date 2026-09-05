@@ -12,6 +12,8 @@
 
 namespace rtvdb::viewer_backend {
 
+struct rt_scene_build;
+
 enum class backend_kind {
     unsupported,
     d3d12_dxr,
@@ -295,12 +297,17 @@ bool submit_scene_build(
     bool allow_auto_frame = true,
     scene_submission_mode submission_mode = scene_submission_mode::coalesced,
     std::uint64_t* out_revision = nullptr);
+struct render_scene_context {
+    std::uint64_t revision = 0;
+    std::shared_ptr<const rt_scene_build> build_snapshot;
+};
 void copy_present_scene(frame_scene* out_scene, bool* out_has_frame);
 void copy_present_render_scene(frame_scene* out_scene, bool* out_has_frame);
 bool acquire_present_render_scene(
     std::shared_ptr<const frame_scene>* out_scene,
     bool* out_has_frame,
-    std::uint64_t* out_revision = nullptr);
+    std::uint64_t* out_revision = nullptr,
+    render_scene_context* out_context = nullptr);
 void copy_present_camera(
     rtvdb::camera* out_camera,
     rtvdb::camera_projection* out_projection_blend_from,
@@ -340,30 +347,35 @@ bool native_d3d12_texture_present_supported();
 bool get_vulkan_renderer_interop(vulkan_renderer_interop* out_interop);
 bool track_latest_native_delivery();
 bool notify_shell_post_present(bool* out_tracked_delivery_complete);
+bool wait_for_idle();
 bool render_frame_to_native_d3d12_texture(
     int width,
     int height,
     const frame_scene &scene,
     bool has_frame,
-    void* texture_resource);
+    void* texture_resource,
+    const render_scene_context* context = nullptr);
 bool render_frame_to_native_metal_texture(
     int width,
     int height,
     const frame_scene &scene,
     bool has_frame,
-    void* pixel_buffer);
+    void* pixel_buffer,
+    const render_scene_context* context = nullptr);
 bool render_frame_to_native_vulkan_texture(
     int width,
     int height,
     const frame_scene &scene,
     bool has_frame,
-    void** out_image);
+    void** out_image,
+    const render_scene_context* context = nullptr);
 bool capture_frame_to_bgra(
     int width, int height,
     const frame_scene &scene,
     bool has_frame,
     std::vector<std::uint8_t>* out_pixels,
-    bool update_build_info = true);
+    bool update_build_info = true,
+    const render_scene_context* context = nullptr);
 bool readback_current_frame_to_bgra(
     int width,
     int height,

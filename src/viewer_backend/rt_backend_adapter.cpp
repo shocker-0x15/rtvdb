@@ -628,6 +628,20 @@ bool notify_post_present(bool* out_tracked_delivery_complete) {
     return true;
 }
 
+bool wait_for_idle() {
+    if (g_rhi == nullptr || g_renderer.rhi != g_rhi.get()) {
+        return false;
+    }
+    rt_rhi_timing timing{};
+    rt_rhi_error error{};
+    rt_renderer_access_scope access(&g_renderer);
+    if (!wait_for_rt_renderer_idle(&g_renderer, &timing, &error)) {
+        append_rt_rhi_error_log("wait_for_rt_renderer_idle", error);
+        return false;
+    }
+    return true;
+}
+
 const backend_ops kRtBackendOps{
     selected_info,
     initialize_selected,
@@ -646,6 +660,7 @@ const backend_ops kRtBackendOps{
     get_vulkan_interop,
     track_latest_native_delivery,
     notify_post_present,
+    wait_for_idle,
 };
 
 } // namespace

@@ -1303,6 +1303,42 @@ bool get_d3d12_renderer_interop(d3d12_renderer_interop* out_interop) {
     return out_interop->device != nullptr && out_interop->command_queue != nullptr;
 }
 
+bool wait_for_d3d12_idle() {
+#if defined(_WIN32) && defined(RTVDB_ENABLE_D3D12_DXR)
+    if (g_d3d12_renderer_interop.device == nullptr ||
+        g_d3d12_renderer_interop.command_queue == nullptr) {
+        return false;
+    }
+
+    ID3D12Device* const device = static_cast<ID3D12Device*>(g_d3d12_renderer_interop.device);
+    ID3D12CommandQueue* const command_queue =
+        static_cast<ID3D12CommandQueue*>(g_d3d12_renderer_interop.command_queue);
+    ID3D12Fence* fence = nullptr;
+    if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) {
+        return false;
+    }
+
+    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (event == nullptr) {
+        fence->Release();
+        return false;
+    }
+
+    constexpr UINT64 kFenceValue = 1;
+    const HRESULT signal_result = command_queue->Signal(fence, kFenceValue);
+    bool succeeded = SUCCEEDED(signal_result);
+    if (succeeded && fence->GetCompletedValue() < kFenceValue) {
+        succeeded = SUCCEEDED(fence->SetEventOnCompletion(kFenceValue, event)) &&
+            WaitForSingleObject(event, INFINITE) == WAIT_OBJECT_0;
+    }
+    CloseHandle(event);
+    fence->Release();
+    return succeeded;
+#else
+    return false;
+#endif
+}
+
 bool copy_vulkan_instance_extensions(std::vector<const char*>* out_extensions) {
     if (out_extensions == nullptr) {
         return false;
