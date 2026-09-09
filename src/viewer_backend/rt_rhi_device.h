@@ -1,6 +1,6 @@
 ﻿#pragma once
 
-#include "viewer_backend/backend.h"
+#include "viewer_backend/rt_native_interop.h"
 #include "viewer_backend/rt_rhi.h"
 
 #include <cstddef>
@@ -71,6 +71,21 @@ struct rt_rhi_error {
     std::int64_t native_code = 0;
     std::string detail;
 };
+
+inline void reset_rt_rhi_error(rt_rhi_error* error, rt_rhi_operation operation) {
+    if (error != nullptr) {
+        *error = {operation, 0, {}};
+    }
+}
+
+inline bool fail_rt_rhi(
+    rt_rhi_error* error, rt_rhi_operation operation, const char* detail, std::int64_t native_code = 0)
+{
+    if (error != nullptr) {
+        *error = {operation, native_code, detail};
+    }
+    return false;
+}
 
 struct rt_rhi_timing {
     double command_slot_wait_ms = 0.0;

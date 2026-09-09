@@ -10,6 +10,8 @@
 
 #include "viewer_backend/d3d12/d3d12_rt_shaders.h"
 #include "viewer_backend/rt_rhi_device.h"
+#include "viewer_backend/rt_scope_exit.h"
+#include "viewer_backend/rt_binding_validation.h"
 #include "viewer_backend/rt_acceleration_plan.h"
 #include "viewer_backend/rt_diagnostics.h"
 #include "viewer_backend/rt_render_plan.h"
@@ -68,6 +70,7 @@ std::string dxr_wide_to_utf8(const wchar_t* text) {
 struct dxr_buffer {
     ID3D12Resource* resource = nullptr;
     D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
+    rt_buffer_desc desc{};
 };
 
 struct dxr_acceleration_structure {
@@ -1131,6 +1134,7 @@ bool d3d12_dxr_rhi_device::create_buffer(
     rt_buffer_handle* out_buffer,
     rt_rhi_error* out_error)
 {
+    reset_rt_rhi_error(out_error, rt_rhi_operation::create_resource);
     if (out_buffer != nullptr) {
         *out_buffer = {};
     }
@@ -1161,6 +1165,7 @@ bool d3d12_dxr_rhi_device::create_buffer(
             ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
             : D3D12_RESOURCE_FLAG_NONE;
     ID3D12Resource* resource = nullptr;
+    rt_scope_exit cleanup([&resource] { safe_release(resource); });
     if (!create_native_buffer(
             native_state_,
             heap_type,
@@ -1173,13 +1178,13 @@ bool d3d12_dxr_rhi_device::create_buffer(
         }
         return false;
     }
-    if (!native_state_.buffer_registry.insert({resource, initial_state}, out_buffer)) {
-        safe_release(resource);
+    if (!native_state_.buffer_registry.insert({resource, initial_state, desc}, out_buffer)) {
         if (out_error != nullptr) {
             out_error->detail = "DXR buffer registry allocation failed";
         }
         return false;
     }
+    cleanup.release();
     return static_cast<bool>(*out_buffer);
 }
 
@@ -1190,6 +1195,7 @@ bool d3d12_dxr_rhi_device::upload_buffer(
     std::size_t size,
     rt_rhi_error* out_error)
 {
+    reset_rt_rhi_error(out_error, rt_rhi_operation::upload_scene_buffers);
     ID3D12Resource* const resource = dxr_buffer_resource(native_state_, buffer);
     const bool uploaded = (size == 0 || (resource != nullptr &&
             upload_buffer_data(native_state_, resource, offset, data, size)));
@@ -1206,6 +1212,7 @@ bool d3d12_dxr_rhi_device::read_buffer(
     std::size_t size,
     rt_rhi_error* out_error)
 {
+    reset_rt_rhi_error(out_error, rt_rhi_operation::readback);
     ID3D12Resource* const resource = dxr_buffer_resource(native_state_, buffer);
     const bool valid = resource != nullptr && data != nullptr && size > 0 &&
         offset <= resource->GetDesc().Width &&
@@ -1260,6 +1267,7 @@ bool d3d12_dxr_rhi_device::create_texture(
     rt_texture_handle* out_texture,
     rt_rhi_error* out_error)
 {
+    reset_rt_rhi_error(out_error, rt_rhi_operation::create_resource);
     if (out_texture != nullptr) {
         *out_texture = {};
     }
@@ -1319,6 +1327,7 @@ bool d3d12_dxr_rhi_device::get_texture_copy_footprint(
     rt_texture_copy_footprint* out_footprint,
     rt_rhi_error* out_error)
 {
+    reset_rt_rhi_error(out_error, rt_rhi_operation::readback);
     if (out_footprint != nullptr) {
         *out_footprint = {};
     }
@@ -1890,6 +1899,7 @@ bool d3d12_dxr_rhi_device::create_blas(
     rt_blas_handle* out_blas,
     rt_rhi_error* out_error)
 {
+    reset_rt_rhi_error(out_error, rt_rhi_operation::create_resource);
     if (out_blas != nullptr) {
         *out_blas = {};
     }
@@ -1916,6 +1926,7 @@ bool d3d12_dxr_rhi_device::create_tlas(
     rt_tlas_handle* out_tlas,
     rt_rhi_error* out_error)
 {
+    reset_rt_rhi_error(out_error, rt_rhi_operation::create_resource);
     if (out_tlas != nullptr) {
         *out_tlas = {};
     }
@@ -1986,6 +1997,7 @@ bool d3d12_dxr_rhi_device::build_blas(
     rt_blas_build_result* out_result,
     rt_rhi_error* out_error)
 {
+    reset_rt_rhi_error(out_error, rt_rhi_operation::build_blas);
     if (out_result != nullptr) {
         *out_result = {};
     }
@@ -2029,6 +2041,7 @@ bool d3d12_dxr_rhi_device::build_tlas(
     const rt_tlas_build_desc &request,
     rt_rhi_error* out_error)
 {
+    reset_rt_rhi_error(out_error, rt_rhi_operation::build_tlas);
     if (!encoder || encoder.id != native_state_.active_encoder_id ||
         !validate_rt_tlas_build_desc(request) ||
         !begin_acceleration_recording(native_state_)) {
@@ -2130,36 +2143,58 @@ bool ensure_descriptor_heap(dxr_backend_state &state) {
     return true;
 }
 
+bool validate_native_bindings(
+    dxr_backend_state &state, const rt_binding_update_request &request, rt_rhi_error* error)
+{
+    if (!validate_rt_binding_request(request, error)) {
+        return false;
+    }
+    for (std::size_t index = 0; index < request.write_count; ++index) {
+        const rt_binding_write &write = request.writes[index];
+        if (write.location.group != 0 || write.location.binding >= kDescriptorBindingCapacity) {
+            return fail_rt_binding(error, write, "binding location is out of range");
+        }
+        if (write.type == rt_descriptor_type::acceleration_structure) {
+            const auto* tlas = state.tlas_registry.get(write.acceleration);
+            if (tlas == nullptr || tlas->result == nullptr) {
+                return fail_rt_binding(error, write, "acceleration structure is unavailable");
+            }
+        } else if (write.type == rt_descriptor_type::storage_texture) {
+            const auto* texture = state.texture_registry.get(write.texture);
+            if (texture == nullptr || texture->resource == nullptr ||
+                (texture->desc.usage & rt_texture_usage_shader_write) == 0u) {
+                return fail_rt_binding(error, write, "texture handle or shader-write usage is invalid");
+            }
+        } else {
+            const auto* buffer = state.buffer_registry.get(write.resource);
+            if (!validate_rt_binding_buffer(write, buffer != nullptr ? &buffer->desc : nullptr, error)) {
+                return false;
+            }
+            if (write.element_count > UINT_MAX || write.element_stride > UINT_MAX) {
+                return fail_rt_binding(error, write, "buffer element range exceeds DXR descriptor limits");
+            }
+        }
+    }
+    return true;
+}
+
 bool update_dxr_resource_bindings(
     dxr_backend_state &state,
     const rt_binding_update_request &request,
     UINT slot_index,
     std::string* out_detail)
 {
-    const auto fail = [out_detail](const rt_binding_write* write, std::string_view reason) {
+    rt_rhi_error error{};
+    if (!validate_native_bindings(state, request, &error) || !ensure_descriptor_heap(state)) {
         if (out_detail != nullptr) {
-            *out_detail = "DXR descriptor binding update failed";
-            if (write != nullptr) {
-                *out_detail += " at binding " + std::to_string(write->location.binding);
-            }
-            *out_detail += ": ";
-            *out_detail += reason;
+            *out_detail = error.detail.empty() ? "DXR descriptor heap is unavailable" : std::move(error.detail);
         }
         return false;
-    };
-    if (request.writes == nullptr || request.write_count == 0 || !ensure_descriptor_heap(state)) {
-        return fail(nullptr, "binding writes or descriptor heap are unavailable");
     }
     for (std::size_t index = 0; index < request.write_count; ++index) {
         const rt_binding_write &write = request.writes[index];
-        if (write.location.group != 0 || write.location.binding >= kDescriptorBindingCapacity) {
-            return fail(&write, "binding location is out of range");
-        }
         if (write.type == rt_descriptor_type::acceleration_structure) {
             const dxr_acceleration_structure* const tlas = state.tlas_registry.get(write.acceleration);
-            if (tlas == nullptr || tlas->result == nullptr) {
-                return fail(&write, "acceleration structure is unavailable");
-            }
             D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
             srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             srv.ViewDimension = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE;
@@ -2173,9 +2208,6 @@ bool update_dxr_resource_bindings(
                 continue;
             }
             ID3D12Resource* resource = dxr_buffer_resource(state, write.resource);
-            if (resource == nullptr || write.element_stride == 0) {
-                return fail(&write, "structured buffer is invalid");
-            }
             D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
             srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
@@ -2188,9 +2220,6 @@ bool update_dxr_resource_bindings(
                 descriptor_cpu_handle(state, slot_index, kSrvDescriptorBase + write.location.binding));
         } else if (write.type == rt_descriptor_type::storage_buffer) {
             ID3D12Resource* const resource = dxr_buffer_resource(state, write.resource);
-            if (resource == nullptr || write.element_count == 0 || write.element_stride == 0) {
-                return fail(&write, "storage buffer is invalid");
-            }
             D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
             uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
             uav.Format = DXGI_FORMAT_UNKNOWN;
@@ -2203,9 +2232,6 @@ bool update_dxr_resource_bindings(
                 descriptor_cpu_handle(state, slot_index, kUavDescriptorBase + write.location.binding));
         } else if (write.type == rt_descriptor_type::storage_texture) {
             dxr_texture* const texture = state.texture_registry.get(write.texture);
-            if (texture == nullptr || texture->resource == nullptr) {
-                return fail(&write, "storage texture is unavailable");
-            }
             D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
             uav.Format = dxr_texture_format(texture->desc.format);
             uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
@@ -2216,13 +2242,8 @@ bool update_dxr_resource_bindings(
                 descriptor_cpu_handle(state, slot_index, kUavDescriptorBase + write.location.binding));
         } else if (write.type == rt_descriptor_type::uniform_buffer) {
             ID3D12Resource* const resource = dxr_buffer_resource(state, write.resource);
-            if (resource == nullptr) {
-                return fail(&write, "uniform buffer is unavailable");
-            }
             state.camera_constant_buffer_handle = write.resource;
             state.camera_constant_buffer = resource;
-        } else {
-            return fail(&write, "descriptor type is unsupported");
         }
     }
     return true;
@@ -2567,46 +2588,28 @@ bool ensure_shader_tables(
     if (state.raytracing_state_props == nullptr || state.shader_group_export_names.empty()) {
         return false;
     }
-    std::vector<std::uint32_t> ray_generation_groups;
-    std::vector<std::uint32_t> miss_groups;
-    std::vector<std::uint32_t> hit_groups;
-    std::vector<std::uint32_t> callable_groups;
-    for (rt_logical_dispatch_entry logical_entry :
-            {rt_logical_dispatch_entry::render, rt_logical_dispatch_entry::pick}) {
-        std::uint32_t group_index = kRtUnusedShaderIndex;
-        if (!get_rt_pipeline_dispatch_entry_index(desc, logical_entry, &group_index)) {
-            return false;
-        }
-        ray_generation_groups.push_back(group_index);
-    }
-    for (std::size_t group_index = 0; group_index < desc.group_count; ++group_index) {
-        const rt_shader_group_desc &group = desc.groups[group_index];
-        if (group.type != rt_shader_group_type::general) {
-            hit_groups.push_back(static_cast<std::uint32_t>(group_index));
-        } else if (desc.shaders[group.general_shader].stage == rt_shader_stage::miss) {
-            miss_groups.push_back(static_cast<std::uint32_t>(group_index));
-        } else if (desc.shaders[group.general_shader].stage == rt_shader_stage::callable) {
-            callable_groups.push_back(static_cast<std::uint32_t>(group_index));
-        }
+    rt_shader_table_plan plan{};
+    if (!make_rt_shader_table_plan(desc, &plan)) {
+        return false;
     }
     return create_shader_table_section(
             state,
-            ray_generation_groups,
+            plan.ray_generation_groups,
             &state.raygen_shader_table,
             &state.raygen_shader_record_count) &&
         create_shader_table_section(
             state,
-            miss_groups,
+            plan.miss_groups,
             &state.miss_shader_table,
             &state.miss_shader_record_count) &&
         create_shader_table_section(
             state,
-            hit_groups,
+            plan.hit_groups,
             &state.hitgroup_shader_table,
             &state.hitgroup_shader_record_count) &&
         create_shader_table_section(
             state,
-            callable_groups,
+            plan.callable_groups,
             &state.callable_shader_table,
             &state.callable_shader_record_count);
 }
@@ -3040,9 +3043,7 @@ bool d3d12_dxr_rhi_device::initialize(
     const rt_rhi_device_desc &desc,
     rt_rhi_error* out_error)
 {
-    if (out_error != nullptr) {
-        *out_error = {rt_rhi_operation::initialize, 0, {}};
-    }
+    reset_rt_rhi_error(out_error, rt_rhi_operation::initialize);
     if (!initialize_dxr_native(native_state_, desc)) {
         if (out_error != nullptr) {
             out_error->detail = "DXR native initialization failed";
@@ -3056,11 +3057,9 @@ bool d3d12_dxr_rhi_device::wait_idle(
     rt_rhi_timing* out_timing,
     rt_rhi_error* out_error)
 {
+    reset_rt_rhi_error(out_error, rt_rhi_operation::wait_idle);
     if (out_timing != nullptr) {
         *out_timing = {};
-    }
-    if (out_error != nullptr) {
-        *out_error = {rt_rhi_operation::wait_idle, 0, {}};
     }
     if (native_state_.queue == nullptr ||
         native_state_.fence == nullptr ||
@@ -3092,6 +3091,7 @@ bool d3d12_dxr_rhi_device::begin_commands(
     rt_command_encoder* out_encoder,
     rt_rhi_error* out_error)
 {
+    reset_rt_rhi_error(out_error, rt_rhi_operation::begin_commands);
     collect_completed_dispatch_timestamp_queries(native_state_);
     if (out_encoder != nullptr) {
         *out_encoder = {};
@@ -3128,6 +3128,7 @@ bool d3d12_dxr_rhi_device::submit_commands(
     rt_rhi_timing* out_timing,
     rt_rhi_error* out_error)
 {
+    reset_rt_rhi_error(out_error, rt_rhi_operation::submit_commands);
     if (out_submission != nullptr) {
         *out_submission = {};
     }
@@ -3205,11 +3206,9 @@ bool d3d12_dxr_rhi_device::is_complete(
     bool* out_complete,
     rt_rhi_error* out_error)
 {
+    reset_rt_rhi_error(out_error, rt_rhi_operation::query_submission);
     if (out_complete != nullptr) {
         *out_complete = false;
-    }
-    if (out_error != nullptr) {
-        *out_error = {rt_rhi_operation::query_submission, 0, {}};
     }
     if (!submission || submission.serial >= native_state_.next_submission_serial ||
         out_complete == nullptr) {
@@ -3241,11 +3240,9 @@ bool d3d12_dxr_rhi_device::wait(
     rt_rhi_timing* out_timing,
     rt_rhi_error* out_error)
 {
+    reset_rt_rhi_error(out_error, rt_rhi_operation::wait_submission);
     if (out_timing != nullptr) {
         *out_timing = {};
-    }
-    if (out_error != nullptr) {
-        *out_error = {rt_rhi_operation::wait_submission, 0, {}};
     }
     if (!submission || submission.serial >= native_state_.next_submission_serial) {
         if (out_error != nullptr) {
@@ -3301,6 +3298,7 @@ bool d3d12_dxr_rhi_device::barrier(
     std::size_t barrier_count,
     rt_rhi_error* out_error)
 {
+    reset_rt_rhi_error(out_error, rt_rhi_operation::transition_resource);
     if (!encoder || encoder.id != native_state_.active_encoder_id ||
         (barrier_count != 0 && barriers == nullptr)) {
         if (out_error != nullptr) {
@@ -3386,6 +3384,7 @@ bool d3d12_dxr_rhi_device::copy_buffer(
     const rt_buffer_copy_region &region,
     rt_rhi_error* out_error)
 {
+    reset_rt_rhi_error(out_error, rt_rhi_operation::copy_resource);
     ID3D12Resource* const source_resource = dxr_buffer_resource(native_state_, source);
     ID3D12Resource* const destination_resource = dxr_buffer_resource(native_state_, destination);
     const bool valid = encoder && encoder.id == native_state_.active_encoder_id &&
@@ -3417,6 +3416,7 @@ bool d3d12_dxr_rhi_device::copy_texture_to_buffer(
     const rt_texture_buffer_copy_region &region,
     rt_rhi_error* out_error)
 {
+    reset_rt_rhi_error(out_error, rt_rhi_operation::copy_resource);
     const dxr_texture* const source_texture =
         native_state_.texture_registry.get(source);
     ID3D12Resource* const destination_buffer =
@@ -3476,6 +3476,7 @@ bool d3d12_dxr_rhi_device::clear_texture(
     const float color[4],
     rt_rhi_error* out_error)
 {
+    reset_rt_rhi_error(out_error, rt_rhi_operation::clear_texture);
     const dxr_texture* const texture_object =
         native_state_.texture_registry.get(texture);
     const bool valid = encoder && encoder.id == native_state_.active_encoder_id &&
@@ -3524,6 +3525,7 @@ bool d3d12_dxr_rhi_device::trace_rays(
     const rt_trace_rays_desc &desc,
     rt_rhi_error* out_error)
 {
+    reset_rt_rhi_error(out_error, rt_rhi_operation::trace_rays);
     ID3D12StateObject* const* const pipeline =
         native_state_.pipeline_registry.get(desc.pipeline);
     const std::uint32_t ray_generation_record =
@@ -3624,9 +3626,7 @@ bool d3d12_dxr_rhi_device::trace_rays(
 }
 
 bool d3d12_dxr_rhi_device::shutdown(rt_rhi_error* out_error) {
-    if (out_error != nullptr) {
-        *out_error = {rt_rhi_operation::shutdown, 0, {}};
-    }
+    reset_rt_rhi_error(out_error, rt_rhi_operation::shutdown);
 
     shutdown_dxr_native(native_state_);
     return true;
@@ -3636,40 +3636,39 @@ bool d3d12_dxr_rhi_device::update_bindings(
     const rt_binding_update_request &request,
     rt_rhi_error* out_error)
 {
-    std::string detail;
-    if (request.writes == nullptr || request.write_count == 0) {
-        if (out_error != nullptr) {
-            out_error->detail = "DXR descriptor binding update request is invalid";
-        }
+    reset_rt_rhi_error(out_error, rt_rhi_operation::update_bindings);
+    if (!validate_native_bindings(native_state_, request, out_error)) {
         return false;
     }
-
-    native_state_.pending_binding_writes.assign(
-        request.writes,
-        request.writes + request.write_count);
-    ++native_state_.binding_generation;
+    std::vector<rt_binding_write> candidate;
+    try {
+        candidate.assign(request.writes, request.writes + request.write_count);
+    } catch (const std::bad_alloc &) {
+        return fail_rt_rhi(out_error, rt_rhi_operation::update_bindings, "Binding state allocation failed");
+    }
+    std::string detail;
     const UINT slot_index = descriptor_target_slot(native_state_);
     if (native_state_.active_encoder_id == 0) {
         dxr_command_slot &slot = native_state_.command_slots[slot_index];
-        if (slot.submission && !wait_for_fence_value(native_state_, slot.fence_value)) {
-            if (out_error != nullptr) {
-                out_error->detail = "DXR descriptor binding slot wait failed";
-            }
-            return false;
+        HRESULT wait_error = S_OK;
+        if (slot.submission && !wait_for_fence_value(native_state_, slot.fence_value, &wait_error)) {
+            return fail_rt_rhi(
+                out_error, rt_rhi_operation::update_bindings, "DXR descriptor binding slot wait failed", wait_error);
         }
         if (slot.submission) {
             complete_command_slot(native_state_, slot_index);
         }
     }
     const rt_binding_update_request pending_request{
-        native_state_.pending_binding_writes.data(),
-        native_state_.pending_binding_writes.size()};
+        candidate.data(), candidate.size()};
     if (!update_dxr_resource_bindings(native_state_, pending_request, slot_index, &detail)) {
         if (out_error != nullptr) {
             out_error->detail = detail.empty() ? "DXR descriptor binding update failed" : std::move(detail);
         }
         return false;
     }
+    native_state_.pending_binding_writes.swap(candidate);
+    ++native_state_.binding_generation;
     native_state_.command_slot_binding_generations[slot_index] = native_state_.binding_generation;
     return true;
 }
@@ -3679,6 +3678,7 @@ bool d3d12_dxr_rhi_device::create_shader_module(
     rt_shader_module_handle* out_module,
     rt_rhi_error* out_error)
 {
+    reset_rt_rhi_error(out_error, rt_rhi_operation::create_shader_module);
     if (out_module != nullptr) {
         *out_module = {};
     }
@@ -3711,6 +3711,7 @@ bool d3d12_dxr_rhi_device::create_pipeline(
     rt_pipeline_handle* out_pipeline,
     rt_rhi_error* out_error)
 {
+    reset_rt_rhi_error(out_error, rt_rhi_operation::prepare_pipeline);
     if (out_pipeline != nullptr) {
         *out_pipeline = {};
     }
@@ -3759,6 +3760,7 @@ bool d3d12_dxr_rhi_device::publish_texture(
     rt_rhi_timing* out_timing,
     rt_rhi_error* out_error)
 {
+    reset_rt_rhi_error(out_error, rt_rhi_operation::native_texture);
     if (out_timing != nullptr) {
         *out_timing = {};
     }

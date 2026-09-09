@@ -384,6 +384,11 @@ set(RTVDB_VIEWER_BACKEND_HEADERS
     src/viewer_backend/rt_object_registry.h
     src/viewer_backend/rt_rhi.h
     src/viewer_backend/rt_rhi_device.h
+    src/viewer_backend/rt_native_interop.h
+    src/viewer_backend/rt_binding_validation.h
+    src/viewer_backend/rt_scope_exit.h
+    src/viewer_backend/rt_command_recording.h
+    src/viewer_backend/rt_resource_pool.h
     src/viewer_backend/rt_scene_builder.h
 )
 list(APPEND RTVDB_VIEWER_BACKEND_SOURCES ${RTVDB_VIEWER_BACKEND_HEADERS})

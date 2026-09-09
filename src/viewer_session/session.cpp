@@ -362,59 +362,61 @@ void publish_now(std::shared_ptr<const viewer_backend::frame_scene>* out_scene =
     }
 }
 
-void append_triangles_locked(const rtvdb::triangle_payload* triangles, std::size_t triangle_count) {
-    if (triangles == nullptr || triangle_count == 0) {
+template <typename Payload, typename Primitive, typename Convert>
+void append_primitives_locked(
+    const Payload* payloads, std::size_t count, std::vector<Primitive> &destination, Convert convert)
+{
+    if (payloads == nullptr || count == 0) {
         return;
     }
     ensure_pending_revision_locked();
-    if (!reserve_for_append(&g_state.working_scene.triangles, triangle_count)) {
+    if (!reserve_for_append(&destination, count)) {
         return;
     }
-    for (std::size_t i = 0; i < triangle_count; ++i) {
-        const rtvdb::triangle_payload &payload = triangles[i];
-        expand_working_bounds_locked(payload);
-        g_state.working_scene.triangles.push_back(
-            {payload.a, payload.b, payload.c, payload.color, payload.user_data, current_layer_path_locked()});
+    for (std::size_t i = 0; i < count; ++i) {
+        expand_working_bounds_locked(payloads[i]);
+        destination.push_back(convert(payloads[i]));
     }
     g_state.primitive_dirty = true;
     mark_dirty_locked();
 }
 
-void append_points_locked(const rtvdb::point_payload* points, std::size_t point_count) {
-    if (points == nullptr || point_count == 0) {
-        return;
-    }
-    ensure_pending_revision_locked();
-    if (!reserve_for_append(&g_state.working_scene.points, point_count)) {
-        return;
-    }
-    for (std::size_t i = 0; i < point_count; ++i) {
-        const rtvdb::point_payload &payload = points[i];
-        expand_working_bounds_locked(payload);
-        g_state.working_scene.points.push_back(
-            {payload.position, payload.radius, payload.color, payload.user_data, current_layer_path_locked()});
-    }
-    g_state.primitive_dirty = true;
-    mark_dirty_locked();
+void append_triangles_locked(const rtvdb::triangle_payload* triangles, std::size_t count) {
+    append_primitives_locked(triangles, count, g_state.working_scene.triangles, [](const auto &p) {
+        return viewer_backend::triangle{p.a, p.b, p.c, p.color, p.user_data, current_layer_path_locked()};
+    });
 }
 
-void append_lines_locked(const rtvdb::line_payload* lines, std::size_t line_count) {
-    if (lines == nullptr || line_count == 0) {
-        return;
+void append_points_locked(const rtvdb::point_payload* points, std::size_t count) {
+    append_primitives_locked(points, count, g_state.working_scene.points, [](const auto &p) {
+        return viewer_backend::point{p.position, p.radius, p.color, p.user_data, current_layer_path_locked()};
+    });
+}
+
+void append_lines_locked(const rtvdb::line_payload* lines, std::size_t count) {
+    append_primitives_locked(lines, count, g_state.working_scene.lines, [](const auto &p) {
+        return viewer_backend::line{
+            p.a, p.radius, p.b, p.color, p.user_data, viewer_backend::line_flags::none, current_layer_path_locked()};
+    });
+}
+
+template <typename Payload>
+bool receive_primitive_batch(
+    platform_socket client, std::uint32_t payload_size,
+    void (*append)(const Payload*, std::size_t), log_event_kind event)
+{
+    if (payload_size % sizeof(Payload) != 0) {
+        return false;
     }
-    ensure_pending_revision_locked();
-    if (!reserve_for_append(&g_state.working_scene.lines, line_count)) {
-        return;
+    const std::size_t count = payload_size / sizeof(Payload);
+    std::vector<Payload> payloads(count);
+    if (count > 0 && !recv_all(client, payloads.data(), static_cast<int>(payload_size))) {
+        return false;
     }
-    for (std::size_t i = 0; i < line_count; ++i) {
-        const rtvdb::line_payload &payload = lines[i];
-        expand_working_bounds_locked(payload);
-        g_state.working_scene.lines.push_back(
-            {payload.a, payload.radius, payload.b, payload.color, payload.user_data, viewer_backend::line_flags::none,
-             current_layer_path_locked()});
-    }
-    g_state.primitive_dirty = true;
-    mark_dirty_locked();
+    std::scoped_lock lock(g_state.mutex);
+    append(payloads.data(), payloads.size());
+    append_log_locked(event, payload_size, static_cast<std::uint32_t>(payloads.size()), nullptr);
+    return true;
 }
 
 void implicit_snapshot_thread() {
@@ -596,23 +598,9 @@ void network_thread() {
                 break;
             }
             case rtvdb::message_kind::triangle_batch: {
-                if ((header.payload_size % sizeof(rtvdb::triangle_payload)) != 0) {
+                if (!receive_primitive_batch(
+                        client, header.payload_size, append_triangles_locked, log_event_kind::triangle_batch)) {
                     goto connection_end;
-                }
-                const std::size_t triangle_count = header.payload_size / sizeof(rtvdb::triangle_payload);
-                std::vector<rtvdb::triangle_payload> payloads(triangle_count);
-                if (triangle_count > 0 &&
-                    !recv_all(client, payloads.data(), static_cast<int>(header.payload_size))) {
-                    goto connection_end;
-                }
-                {
-                    std::scoped_lock lock(g_state.mutex);
-                    append_triangles_locked(payloads.data(), payloads.size());
-                    append_log_locked(
-                        log_event_kind::triangle_batch,
-                        header.payload_size,
-                        static_cast<std::uint32_t>(payloads.size()),
-                        nullptr);
                 }
                 break;
             }
@@ -629,23 +617,9 @@ void network_thread() {
                 break;
             }
             case rtvdb::message_kind::point_batch: {
-                if ((header.payload_size % sizeof(rtvdb::point_payload)) != 0) {
+                if (!receive_primitive_batch(
+                        client, header.payload_size, append_points_locked, log_event_kind::point)) {
                     goto connection_end;
-                }
-                const std::size_t point_count = header.payload_size / sizeof(rtvdb::point_payload);
-                std::vector<rtvdb::point_payload> payloads(point_count);
-                if (point_count > 0 &&
-                    !recv_all(client, payloads.data(), static_cast<int>(header.payload_size))) {
-                    goto connection_end;
-                }
-                {
-                    std::scoped_lock lock(g_state.mutex);
-                    append_points_locked(payloads.data(), payloads.size());
-                    append_log_locked(
-                        log_event_kind::point,
-                        header.payload_size,
-                        static_cast<std::uint32_t>(payloads.size()),
-                        nullptr);
                 }
                 break;
             }
@@ -662,23 +636,9 @@ void network_thread() {
                 break;
             }
             case rtvdb::message_kind::line_batch: {
-                if ((header.payload_size % sizeof(rtvdb::line_payload)) != 0) {
+                if (!receive_primitive_batch(
+                        client, header.payload_size, append_lines_locked, log_event_kind::line)) {
                     goto connection_end;
-                }
-                const std::size_t line_count = header.payload_size / sizeof(rtvdb::line_payload);
-                std::vector<rtvdb::line_payload> payloads(line_count);
-                if (line_count > 0 &&
-                    !recv_all(client, payloads.data(), static_cast<int>(header.payload_size))) {
-                    goto connection_end;
-                }
-                {
-                    std::scoped_lock lock(g_state.mutex);
-                    append_lines_locked(payloads.data(), payloads.size());
-                    append_log_locked(
-                        log_event_kind::line,
-                        header.payload_size,
-                        static_cast<std::uint32_t>(payloads.size()),
-                        nullptr);
                 }
                 break;
             }

@@ -1,5 +1,7 @@
 ﻿#include "viewer_backend/metal/metal_rt_shaders.h"
 
+#include "viewer_backend/rt_render_plan.h"
+
 #include "rtvdb_metal_rt_metallib.h"
 
 #include <array>
@@ -7,7 +9,6 @@
 namespace rtvdb::viewer_backend {
 namespace {
 
-constexpr std::size_t kMetalRtShaderEntryCount = 2;
 constexpr std::array<rt_shader_module_desc, 1> kMetalRtShaderModules{{
     {
         rt_shader_binary_format::metallib,
@@ -15,23 +16,12 @@ constexpr std::array<rt_shader_module_desc, 1> kMetalRtShaderModules{{
         kMetalRtMetallibSize,
     },
 }};
-constexpr std::array<std::uint32_t, kMetalRtShaderEntryCount> kMetalRtShaderEntryModules{};
-constexpr std::array<rt_logical_shader_entry, kMetalRtShaderEntryCount> kMetalRtLogicalEntries{{
-    rt_logical_shader_entry::render,
-    rt_logical_shader_entry::pick,
-}};
-
 } // namespace
 
 rt_shader_package_desc metal_rt_shader_package() {
-    return {
-        rt_pipeline_model::compute_intersector,
+    return make_viewer_rt_shader_package(
         kMetalRtShaderModules.data(),
-        kMetalRtShaderModules.size(),
-        kMetalRtShaderEntryModules.data(),
-        kMetalRtLogicalEntries.data(),
-        kMetalRtShaderEntryModules.size(),
-    };
+        kMetalRtShaderModules.size());
 }
 
 } // namespace rtvdb::viewer_backend

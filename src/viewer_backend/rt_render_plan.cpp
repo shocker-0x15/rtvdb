@@ -6,6 +6,48 @@
 
 namespace rtvdb::viewer_backend {
 
+rt_shader_package_desc make_viewer_rt_shader_package(
+    const rt_shader_module_desc* modules,
+    std::size_t module_count)
+{
+    static constexpr std::array<rt_logical_shader_entry, kViewerRtShaderEntryCount> logical_entries{{
+        rt_logical_shader_entry::render,
+        rt_logical_shader_entry::pick,
+        rt_logical_shader_entry::miss,
+        rt_logical_shader_entry::triangle_closest_hit,
+        rt_logical_shader_entry::point_closest_hit,
+        rt_logical_shader_entry::point_intersection,
+        rt_logical_shader_entry::line_closest_hit,
+        rt_logical_shader_entry::line_intersection,
+    }};
+    static constexpr std::array<std::uint32_t, kViewerRtShaderEntryCount> library_entry_modules{};
+    static constexpr auto separate_entry_modules = [] {
+        std::array<std::uint32_t, kViewerRtShaderEntryCount> indices{};
+        for (std::size_t index = 0; index < indices.size(); ++index) {
+            indices[index] = static_cast<std::uint32_t>(index);
+        }
+        return indices;
+    }();
+    constexpr std::size_t kComputeEntryCount = 2;
+    if (modules == nullptr || module_count == 0) {
+        return {};
+    }
+    const bool separate_modules = modules[0].format == rt_shader_binary_format::spirv;
+    const bool compute = modules[0].format == rt_shader_binary_format::metallib;
+    if (module_count != (separate_modules ? kViewerRtShaderEntryCount : 1u)) {
+        return {};
+    }
+    const rt_shader_package_desc package{
+        compute ? rt_pipeline_model::compute_intersector : rt_pipeline_model::native_ray_tracing,
+        modules,
+        module_count,
+        separate_modules ? separate_entry_modules.data() : library_entry_modules.data(),
+        logical_entries.data(),
+        compute ? kComputeEntryCount : logical_entries.size(),
+    };
+    return validate_rt_shader_package_desc(package) ? package : rt_shader_package_desc{};
+}
+
 rt_pipeline_desc viewer_rt_pipeline_desc::pipeline() const {
     return {
         model,

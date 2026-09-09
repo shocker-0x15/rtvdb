@@ -2644,23 +2644,6 @@ const char* camera_projection_label(rtvdb::camera_projection projection) {
     }
 }
 
-void format_camera_projection_label(const rtvdb::viewer_backend::frame_scene &scene, char* buffer, std::size_t buffer_size) {
-    if (buffer == nullptr || buffer_size == 0) {
-        return;
-    }
-    if (scene.projection_blend_from != scene.projection_blend_to && scene.projection_blend_t < 1.0f) {
-        std::snprintf(
-            buffer,
-            buffer_size,
-            "%s -> %s (%.2f)",
-            camera_projection_label(scene.projection_blend_from),
-            camera_projection_label(scene.projection_blend_to),
-            (std::clamp)(scene.projection_blend_t, 0.0f, 1.0f));
-        return;
-    }
-    std::snprintf(buffer, buffer_size, "%s", camera_projection_label(scene.camera.projection));
-}
-
 bool try_compute_triangle_normal(const rtvdb::viewer_backend::triangle &tri, rtvdb::vec3* out_normal) {
     const rtvdb::vec3 face_normal = cross(tri.b - tri.a, tri.c - tri.a);
     const float len_sq = dot(face_normal, face_normal);
@@ -2803,16 +2786,18 @@ std::int32_t user_data_as_i32(std::uint32_t value) {
     return result;
 }
 
-void append_hover_user_data_lines(std::vector<std::string> &lines, std::uint32_t user_data) {
+template <typename... Args>
+void append_overlay_line(std::vector<std::string> &lines, const char* format, Args... args) {
     char buffer[256]{};
-    std::snprintf(buffer, sizeof(buffer), "%8s: %d", "User i32", user_data_as_i32(user_data));
+    std::snprintf(buffer, sizeof(buffer), format, args...);
     lines.emplace_back(buffer);
-    std::snprintf(buffer, sizeof(buffer), "%8s: %u", "u32", user_data);
-    lines.emplace_back(buffer);
-    std::snprintf(buffer, sizeof(buffer), "%8s: %.6g", "f32", user_data_as_f32(user_data));
-    lines.emplace_back(buffer);
-    std::snprintf(buffer, sizeof(buffer), "%8s: 0x%08x", "hex", user_data);
-    lines.emplace_back(buffer);
+}
+
+void append_hover_user_data_lines(std::vector<std::string> &lines, std::uint32_t user_data) {
+    append_overlay_line(lines, "%8s: %d", "User i32", user_data_as_i32(user_data));
+    append_overlay_line(lines, "%8s: %u", "u32", user_data);
+    append_overlay_line(lines, "%8s: %.6g", "f32", user_data_as_f32(user_data));
+    append_overlay_line(lines, "%8s: 0x%08x", "hex", user_data);
 }
 
 const std::string &pick_primitive_layer(const hover_state &state) {
@@ -3035,125 +3020,51 @@ std::vector<std::string> build_full_pick_overlay_lines(const hover_state &state,
         return lines;
     }
 
-    char buffer[256]{};
     if (selection) {
         lines.emplace_back("Selected");
     } else {
-        std::snprintf(buffer, sizeof(buffer), "Mouse: %4d, %4d", state.mouse_x, state.mouse_y);
-        lines.emplace_back(buffer);
+        append_overlay_line(lines, "Mouse: %4d, %4d", state.mouse_x, state.mouse_y);
     }
     const rtvdb::rgba color = pick_primitive_color(state);
-    std::snprintf(buffer, sizeof(buffer), "Kind:  %8s", hover_primitive_label(state.primitive_kind));
-    lines.emplace_back(buffer);
-    std::snprintf(buffer, sizeof(buffer), "Idx:   %8llu", static_cast<unsigned long long>(state.primitive_index));
-    lines.emplace_back(buffer);
+    append_overlay_line(lines, "Kind:  %8s", hover_primitive_label(state.primitive_kind));
+    append_overlay_line(lines, "Idx:   %8llu", static_cast<unsigned long long>(state.primitive_index));
     if (!selection) {
-        std::snprintf(buffer, sizeof(buffer), "Dist:  %8.4f", state.distance);
-        lines.emplace_back(buffer);
-        std::snprintf(
-            buffer,
-            sizeof(buffer),
-            "Hit:   %8.3f %8.3f %8.3f",
-            state.hit_position.x,
-            state.hit_position.y,
-            state.hit_position.z);
-        lines.emplace_back(buffer);
+        append_overlay_line(lines, "Dist:  %8.4f", state.distance);
+        append_overlay_line(
+            lines, "Hit:   %8.3f %8.3f %8.3f", state.hit_position.x, state.hit_position.y, state.hit_position.z);
         if (state.has_normal) {
-            std::snprintf(
-                buffer,
-                sizeof(buffer),
-                "N:     %8.3f %8.3f %8.3f",
-                state.normal.x,
-                state.normal.y,
-                state.normal.z);
-            lines.emplace_back(buffer);
+            append_overlay_line(lines, "N:     %8.3f %8.3f %8.3f", state.normal.x, state.normal.y, state.normal.z);
         } else {
             lines.emplace_back("N:            -        -        -");
         }
     }
-    std::snprintf(
-        buffer,
-        sizeof(buffer),
-        "Color: %8.3f %8.3f %8.3f %8.3f",
-        color.r,
-        color.g,
-        color.b,
-        color.a
-    );
-    lines.emplace_back(buffer);
+    append_overlay_line(lines, "Color: %8.3f %8.3f %8.3f %8.3f", color.r, color.g, color.b, color.a);
     switch (state.primitive_kind) {
     case hover_primitive_kind::triangle:
-        std::snprintf(
-            buffer,
-            sizeof(buffer),
-            "A:     %8.3f %8.3f %8.3f",
-            state.triangle.a.x,
-            state.triangle.a.y,
-            state.triangle.a.z);
-        lines.emplace_back(buffer);
-        std::snprintf(
-            buffer,
-            sizeof(buffer),
-            "B:     %8.3f %8.3f %8.3f",
-            state.triangle.b.x,
-            state.triangle.b.y,
-            state.triangle.b.z);
-        lines.emplace_back(buffer);
-        std::snprintf(
-            buffer,
-            sizeof(buffer),
-            "C:     %8.3f %8.3f %8.3f",
-            state.triangle.c.x,
-            state.triangle.c.y,
-            state.triangle.c.z);
-        lines.emplace_back(buffer);
+        append_overlay_line(
+            lines, "A:     %8.3f %8.3f %8.3f", state.triangle.a.x, state.triangle.a.y, state.triangle.a.z);
+        append_overlay_line(
+            lines, "B:     %8.3f %8.3f %8.3f", state.triangle.b.x, state.triangle.b.y, state.triangle.b.z);
+        append_overlay_line(
+            lines, "C:     %8.3f %8.3f %8.3f", state.triangle.c.x, state.triangle.c.y, state.triangle.c.z);
         if (selection) {
             if (state.has_normal) {
-                std::snprintf(
-                    buffer,
-                    sizeof(buffer),
-                    "Normal:%8.3f %8.3f %8.3f",
-                    state.normal.x,
-                    state.normal.y,
-                    state.normal.z);
-                lines.emplace_back(buffer);
+                append_overlay_line(lines, "Normal:%8.3f %8.3f %8.3f", state.normal.x, state.normal.y, state.normal.z);
             } else {
-                std::snprintf(buffer, sizeof(buffer), "Normal:%8s %8s %8s", "-", "-", "-");
-                lines.emplace_back(buffer);
+                append_overlay_line(lines, "Normal:%8s %8s %8s", "-", "-", "-");
             }
         }
         break;
     case hover_primitive_kind::point:
-        std::snprintf(
-            buffer,
-            sizeof(buffer),
-            "Pos:   %8.3f %8.3f %8.3f",
-            state.point.position.x,
-            state.point.position.y,
-            state.point.position.z);
-        lines.emplace_back(buffer);
-        std::snprintf(buffer, sizeof(buffer), "Rad:   %8.4f", state.point.radius);
-        lines.emplace_back(buffer);
+        append_overlay_line(
+            lines, "Pos:   %8.3f %8.3f %8.3f",
+            state.point.position.x, state.point.position.y, state.point.position.z);
+        append_overlay_line(lines, "Rad:   %8.4f", state.point.radius);
         break;
     case hover_primitive_kind::line:
-        std::snprintf(
-            buffer,
-            sizeof(buffer),
-            "A:     %8.3f %8.3f %8.3f",
-            state.line.a.x,
-            state.line.a.y,
-            state.line.a.z);
-        lines.emplace_back(buffer);
-        std::snprintf(
-            buffer,
-            sizeof(buffer),
-            "B:     %8.3f %8.3f %8.3f",
-            state.line.b.x,
-            state.line.b.y,
-            state.line.b.z);
-        lines.emplace_back(buffer);
-        std::snprintf(buffer, sizeof(buffer), "Rad:   %8.4f", state.line.radius);
-        lines.emplace_back(buffer);
+        append_overlay_line(lines, "A:     %8.3f %8.3f %8.3f", state.line.a.x, state.line.a.y, state.line.a.z);
+        append_overlay_line(lines, "B:     %8.3f %8.3f %8.3f", state.line.b.x, state.line.b.y, state.line.b.z);
+        append_overlay_line(lines, "Rad:   %8.4f", state.line.radius);
         break;
     }
     append_hover_user_data_lines(lines, pick_primitive_user_data(state));
@@ -3165,26 +3076,13 @@ std::vector<std::string> build_compact_hover_overlay_lines() {
     if (!g_hover.has_hit) {
         return lines;
     }
-    char buffer[256]{};
-    std::snprintf(
-        buffer,
-        sizeof(buffer),
-        "%s #%llu",
-        hover_primitive_label(g_hover.primitive_kind),
-        static_cast<unsigned long long>(g_hover.primitive_index));
-    lines.emplace_back(buffer);
+    append_overlay_line(
+        lines, "%s #%llu", hover_primitive_label(g_hover.primitive_kind), static_cast<unsigned long long>(g_hover.primitive_index));
     lines.emplace_back("Layer: " + pick_primitive_layer(g_hover));
-    std::snprintf(
-        buffer,
-        sizeof(buffer),
-        "Hit: %.3f  %.3f  %.3f",
-        g_hover.hit_position.x,
-        g_hover.hit_position.y,
-        g_hover.hit_position.z);
-    lines.emplace_back(buffer);
+    append_overlay_line(
+        lines, "Hit: %.3f  %.3f  %.3f", g_hover.hit_position.x, g_hover.hit_position.y, g_hover.hit_position.z);
     const std::uint32_t user_data = pick_primitive_user_data(g_hover);
-    std::snprintf(buffer, sizeof(buffer), "User: %u / 0x%08x", user_data, user_data);
-    lines.emplace_back(buffer);
+    append_overlay_line(lines, "User: %u / 0x%08x", user_data, user_data);
     return lines;
 }
 
@@ -3471,52 +3369,29 @@ void show_status_tooltip(const char* tooltip, bool item_hovered) {
     ImGui::EndTooltip();
 }
 
-void draw_status_value(const char* label, double value_ms, float value_column, const char* tooltip) {
+template <typename Value>
+void draw_status_number(
+    const char* label, Value value, float value_column, const char* tooltip, const char* format)
+{
     const float tree_label_spacing = draw_status_leaf_label(label);
     const bool label_hovered = ImGui::IsItemHovered();
     ImGui::SameLine(value_column);
-    draw_status_text("%7.2f ms", value_ms);
+    draw_status_text(format, value);
     const bool value_hovered = ImGui::IsItemHovered();
     ImGui::Unindent(tree_label_spacing);
     show_status_tooltip(tooltip, label_hovered || value_hovered);
+}
+
+void draw_status_value(const char* label, double value_ms, float value_column, const char* tooltip) {
+    draw_status_number(label, value_ms, value_column, tooltip, "%7.2f ms");
 }
 
 void draw_status_detail_value(const char* label, double value_ms, const char* tooltip) {
     draw_status_value(label, value_ms, kStatusDetailsValueColumn, tooltip);
 }
 
-void draw_status_summary_value(
-    const char* label,
-    double value_ms,
-    float value_column,
-    const char* tooltip)
-{
-    draw_status_value(label, value_ms, value_column, tooltip);
-}
-
-void draw_status_summary_rate(
-    const char* label,
-    double frames_per_second,
-    float value_column,
-    const char* tooltip)
-{
-    const float tree_label_spacing = draw_status_leaf_label(label);
-    const bool label_hovered = ImGui::IsItemHovered();
-    ImGui::SameLine(value_column);
-    draw_status_text("%7.1f fps", frames_per_second);
-    const bool value_hovered = ImGui::IsItemHovered();
-    ImGui::Unindent(tree_label_spacing);
-    show_status_tooltip(tooltip, label_hovered || value_hovered);
-}
-
 void draw_status_detail_rate(const char* label, double frames_per_second, const char* tooltip) {
-    const float tree_label_spacing = draw_status_leaf_label(label);
-    const bool label_hovered = ImGui::IsItemHovered();
-    ImGui::SameLine(kStatusDetailsValueColumn);
-    draw_status_text("%7.1f fps", frames_per_second);
-    const bool value_hovered = ImGui::IsItemHovered();
-    ImGui::Unindent(tree_label_spacing);
-    show_status_tooltip(tooltip, label_hovered || value_hovered);
+    draw_status_number(label, frames_per_second, kStatusDetailsValueColumn, tooltip, "%7.1f fps");
 }
 
 void draw_status_summary_count(
@@ -3541,13 +3416,7 @@ void draw_status_summary_count(
 }
 
 void draw_status_detail_count(const char* label, std::size_t value, const char* tooltip) {
-    const float tree_label_spacing = draw_status_leaf_label(label);
-    const bool label_hovered = ImGui::IsItemHovered();
-    ImGui::SameLine(kStatusDetailsValueColumn);
-    draw_status_text("%8llu", static_cast<unsigned long long>(value));
-    const bool value_hovered = ImGui::IsItemHovered();
-    ImGui::Unindent(tree_label_spacing);
-    show_status_tooltip(tooltip, label_hovered || value_hovered);
+    draw_status_number(label, static_cast<unsigned long long>(value), kStatusDetailsValueColumn, tooltip, "%8llu");
 }
 
 bool begin_status_detail_group(
@@ -3637,7 +3506,7 @@ void draw_status_overlay(
         const float summary_value_column =
             details_open ? kStatusDetailsValueColumn : kStatusSummaryValueColumn;
 
-        draw_status_summary_value(
+        draw_status_value(
             "RT GPU busy",
             build_info.dispatch_gpu_ms,
             summary_value_column,
@@ -4027,21 +3896,25 @@ std::size_t visible_display_mode_count() {
     return count;
 }
 
-bool copy_effective_present_scene(rtvdb::viewer_backend::frame_scene* out_scene, bool* out_has_frame) {
-    progress_camera_animation();
-    rtvdb::viewer_backend::frame_scene scene{};
-    bool has_frame = false;
-    rtvdb::viewer_backend::copy_present_scene(&scene, &has_frame);
+void apply_camera_override(rtvdb::viewer_backend::frame_scene &scene, bool apply_override) {
     scene.projection_blend_from = scene.camera.projection;
     scene.projection_blend_to = scene.camera.projection;
     scene.projection_blend_t = 1.0f;
-    if (has_frame && g_camera_override.active) {
+    if (apply_override) {
         scene.camera = g_camera_override.camera;
         scene.projection_blend_from = g_camera_override.projection_blend_from;
         scene.projection_blend_to = g_camera_override.projection_blend_to;
         scene.projection_blend_t = g_camera_override.projection_blend_t;
     }
     scene.view_revision = g_camera_override.active ? g_camera_override.revision : g_view_revision;
+}
+
+bool copy_effective_present_scene(rtvdb::viewer_backend::frame_scene* out_scene, bool* out_has_frame) {
+    progress_camera_animation();
+    rtvdb::viewer_backend::frame_scene scene{};
+    bool has_frame = false;
+    rtvdb::viewer_backend::copy_present_scene(&scene, &has_frame);
+    apply_camera_override(scene, has_frame && g_camera_override.active);
     if (out_scene != nullptr) {
         *out_scene = scene;
     }
@@ -4056,16 +3929,7 @@ bool copy_effective_present_render_scene(rtvdb::viewer_backend::frame_scene* out
     rtvdb::viewer_backend::frame_scene scene{};
     bool has_frame = false;
     rtvdb::viewer_backend::copy_present_render_scene(&scene, &has_frame);
-    scene.projection_blend_from = scene.camera.projection;
-    scene.projection_blend_to = scene.camera.projection;
-    scene.projection_blend_t = 1.0f;
-    if (has_frame && g_camera_override.active) {
-        scene.camera = g_camera_override.camera;
-        scene.projection_blend_from = g_camera_override.projection_blend_from;
-        scene.projection_blend_to = g_camera_override.projection_blend_to;
-        scene.projection_blend_t = g_camera_override.projection_blend_t;
-    }
-    scene.view_revision = g_camera_override.active ? g_camera_override.revision : g_view_revision;
+    apply_camera_override(scene, has_frame && g_camera_override.active);
     if (out_scene != nullptr) {
         *out_scene = scene;
     }
@@ -4127,16 +3991,7 @@ void apply_effective_camera_to_render_scene(
     if (out_scene == nullptr) {
         return;
     }
-    out_scene->projection_blend_from = out_scene->camera.projection;
-    out_scene->projection_blend_to = out_scene->camera.projection;
-    out_scene->projection_blend_t = 1.0f;
-    if (should_apply_camera_override_to_render_scene(render_scene_revision)) {
-        out_scene->camera = g_camera_override.camera;
-        out_scene->projection_blend_from = g_camera_override.projection_blend_from;
-        out_scene->projection_blend_to = g_camera_override.projection_blend_to;
-        out_scene->projection_blend_t = g_camera_override.projection_blend_t;
-    }
-    out_scene->view_revision = g_camera_override.active ? g_camera_override.revision : g_view_revision;
+    apply_camera_override(*out_scene, should_apply_camera_override_to_render_scene(render_scene_revision));
 }
 
 void request_present_rebuild_for_auto_frame() {
@@ -4539,24 +4394,6 @@ void reset_view_for_new_connection(std::uint64_t connection_serial) {
     rtvdb::viewer_backend::set_auto_frame_enabled(true);
 }
 
-void focus_camera_on_point(const rtvdb::vec3 &focus_point) {
-    if (client_capture_lock_active()) {
-        return;
-    }
-    disable_auto_frame_for_manual_camera();
-    stop_camera_animation();
-    rtvdb::camera &camera = g_camera_override.camera;
-    const rtvdb::camera previous = camera;
-    const rtvdb::vec3 offset = camera.origin - camera.target;
-    camera.target = focus_point;
-    camera.origin = focus_point + offset;
-    if (!is_finite(camera)) {
-        camera = previous;
-        return;
-    }
-    record_camera_update("focus");
-}
-
 void apply_camera_from_viewer_ui(const rtvdb::camera &target_camera, const char* update_reason, bool animated) {
     if (client_capture_lock_active() || !is_finite(target_camera)) {
         return;
@@ -4810,153 +4647,6 @@ void align_camera_to_axis(
     target_camera.up = normalize_or(up, {0.0f, 0.0f, 1.0f});
     clear_camera_focus();
     apply_camera_from_viewer_ui(target_camera, update_reason, true);
-}
-
-bool intersect_triangle(
-    const rtvdb::vec3 &origin,
-    const rtvdb::vec3 &direction,
-    const rtvdb::viewer_backend::triangle &tri,
-    float* out_t,
-    rtvdb::vec3* out_hit)
-{
-    const rtvdb::vec3 edge1 = tri.b - tri.a;
-    const rtvdb::vec3 edge2 = tri.c - tri.a;
-    const rtvdb::vec3 p = cross(direction, edge2);
-    const float det = dot(edge1, p);
-    if (std::fabs(det) <= 1.0e-7f) {
-        return false;
-    }
-
-    const float inv_det = 1.0f / det;
-    const rtvdb::vec3 tvec = origin - tri.a;
-    const float u = dot(tvec, p) * inv_det;
-    if (u < 0.0f || u > 1.0f) {
-        return false;
-    }
-
-    const rtvdb::vec3 q = cross(tvec, edge1);
-    const float v = dot(direction, q) * inv_det;
-    if (v < 0.0f || (u + v) > 1.0f) {
-        return false;
-    }
-
-    const float t = dot(edge2, q) * inv_det;
-    if (t <= 0.001f) {
-        return false;
-    }
-
-    if (out_t != nullptr) {
-        *out_t = t;
-    }
-    if (out_hit != nullptr) {
-        *out_hit = origin + direction * t;
-    }
-    return true;
-}
-
-bool intersect_point(
-    const rtvdb::vec3 &origin,
-    const rtvdb::vec3 &direction,
-    const rtvdb::viewer_backend::point &point,
-    float* out_t,
-    rtvdb::vec3* out_hit)
-{
-    const rtvdb::vec3 oc = origin - point.position;
-    const float a = dot(direction, direction);
-    const float b = dot(oc, direction);
-    const float c = dot(oc, oc) - point.radius * point.radius;
-    const float h = b * b - a * c;
-    if (h < 0.0f) {
-        return false;
-    }
-
-    const float sqrt_h = std::sqrt(h);
-    const float inv_a = 1.0f / a;
-    float t = (-b - sqrt_h) * inv_a;
-    if (t <= 0.001f) {
-        t = (-b + sqrt_h) * inv_a;
-        if (t <= 0.001f) {
-            return false;
-        }
-    }
-
-    if (out_t != nullptr) {
-        *out_t = t;
-    }
-    if (out_hit != nullptr) {
-        *out_hit = origin + direction * t;
-    }
-    return true;
-}
-
-bool intersect_line(
-    const rtvdb::vec3 &origin,
-    const rtvdb::vec3 &direction,
-    const rtvdb::viewer_backend::line &line,
-    float* out_t,
-    rtvdb::vec3* out_hit)
-{
-    const rtvdb::vec3 pa = line.a;
-    const rtvdb::vec3 pb = line.b;
-    const float radius = line.radius;
-    const rtvdb::vec3 ba = pb - pa;
-    const rtvdb::vec3 oa = origin - pa;
-    const float baba = dot(ba, ba);
-    const float bard = dot(ba, direction);
-    const float baoa = dot(ba, oa);
-    const float rdoa = dot(direction, oa);
-    const float oaoa = dot(oa, oa);
-    const float radius_sq = radius * radius;
-
-    if (baba <= kPickNormalMinLengthSq) {
-        const rtvdb::viewer_backend::point endpoint{line.a, line.radius, line.color, line.user_data};
-        return intersect_point(origin, direction, endpoint, out_t, out_hit);
-    }
-
-    const float a = baba - bard * bard;
-    const float b = baba * rdoa - baoa * bard;
-    const float c = baba * oaoa - baoa * baoa - radius_sq * baba;
-    const float h = b * b - a * c;
-    if (h >= 0.0f && std::fabs(a) > 1.0e-8f) {
-        const float t = (-b - std::sqrt(h)) / a;
-        const float y = baoa + t * bard;
-        if (t > 0.001f && y > 0.0f && y < baba) {
-            if (out_t != nullptr) {
-                *out_t = t;
-            }
-            if (out_hit != nullptr) {
-                *out_hit = origin + direction * t;
-            }
-            return true;
-        }
-    }
-
-    float best_t = 0.0f;
-    rtvdb::vec3 best_hit{};
-    bool found = false;
-    for (const rtvdb::vec3 &endpoint_position : {line.a, line.b}) {
-        const rtvdb::viewer_backend::point endpoint{endpoint_position, line.radius, line.color, line.user_data};
-        float t = 0.0f;
-        rtvdb::vec3 hit{};
-        if (!intersect_point(origin, direction, endpoint, &t, &hit)) {
-            continue;
-        }
-        if (!found || t < best_t) {
-            found = true;
-            best_t = t;
-            best_hit = hit;
-        }
-    }
-    if (!found) {
-        return false;
-    }
-    if (out_t != nullptr) {
-        *out_t = best_t;
-    }
-    if (out_hit != nullptr) {
-        *out_hit = best_hit;
-    }
-    return true;
 }
 
 void clear_hover_pick_state() {

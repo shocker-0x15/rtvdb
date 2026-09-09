@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 namespace rtvdb::viewer_backend {
 
@@ -446,6 +447,15 @@ struct rt_blas_geometry_counts {
     std::size_t actual = 0;
     std::size_t allocation = 0;
 };
+
+struct rt_shader_table_plan {
+    std::vector<std::uint32_t> ray_generation_groups;
+    std::vector<std::uint32_t> miss_groups;
+    std::vector<std::uint32_t> hit_groups;
+    std::vector<std::uint32_t> callable_groups;
+};
+
+bool make_rt_shader_table_plan(const rt_pipeline_desc &desc, rt_shader_table_plan* out_plan);
 
 bool get_rt_blas_geometry_counts(
     const rt_blas_build_desc &desc,

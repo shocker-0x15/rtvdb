@@ -26,38 +26,12 @@ constexpr std::array<rt_shader_module_desc, kViewerRtShaderEntryCount> kVulkanRt
     {rt_shader_binary_format::spirv, kVulkanRtLineClosestHitSpirv, kVulkanRtLineClosestHitSpirvSize},
     {rt_shader_binary_format::spirv, kVulkanRtLineIntersectionSpirv, kVulkanRtLineIntersectionSpirvSize},
 }};
-constexpr std::array<std::uint32_t, kViewerRtShaderEntryCount> kVulkanRtShaderEntryModules{{
-    0,
-    1,
-    2,
-    3,
-    4,
-    5,
-    6,
-    7,
-}};
-constexpr std::array<rt_logical_shader_entry, kViewerRtShaderEntryCount> kVulkanRtLogicalEntries{{
-    rt_logical_shader_entry::render,
-    rt_logical_shader_entry::pick,
-    rt_logical_shader_entry::miss,
-    rt_logical_shader_entry::triangle_closest_hit,
-    rt_logical_shader_entry::point_closest_hit,
-    rt_logical_shader_entry::point_intersection,
-    rt_logical_shader_entry::line_closest_hit,
-    rt_logical_shader_entry::line_intersection,
-}};
-
 } // namespace
 
 rt_shader_package_desc vulkan_rt_shader_package() {
-    return {
-        rt_pipeline_model::native_ray_tracing,
+    return make_viewer_rt_shader_package(
         kVulkanRtShaderModules.data(),
-        kVulkanRtShaderModules.size(),
-        kVulkanRtShaderEntryModules.data(),
-        kVulkanRtLogicalEntries.data(),
-        kVulkanRtShaderEntryModules.size(),
-    };
+        kVulkanRtShaderModules.size());
 }
 
 } // namespace rtvdb::viewer_backend

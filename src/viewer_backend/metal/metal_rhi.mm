@@ -5,6 +5,8 @@
 #include "viewer_backend/metal/metal_rt_shaders.h"
 #include "viewer_backend/rt_object_registry.h"
 #include "viewer_backend/rt_rhi_device.h"
+#include "viewer_backend/rt_scope_exit.h"
+#include "viewer_backend/rt_binding_validation.h"
 
 #include <dispatch/dispatch.h>
 
@@ -853,9 +855,7 @@ bool metal_rhi_device::initialize(
     const rt_rhi_device_desc &desc,
     rt_rhi_error* out_error)
 {
-    if (out_error != nullptr) {
-        *out_error = {rt_rhi_operation::initialize, 0, {}};
-    }
+    reset_rt_rhi_error(out_error, rt_rhi_operation::initialize);
     if (initialized_) {
         if (out_error != nullptr) {
             out_error->detail = "Metal RHI is already initialized";
@@ -933,9 +933,7 @@ bool metal_rhi_device::initialize(
 }
 
 bool metal_rhi_device::shutdown(rt_rhi_error* out_error) {
-    if (out_error != nullptr) {
-        *out_error = {rt_rhi_operation::shutdown, 0, {}};
-    }
+    reset_rt_rhi_error(out_error, rt_rhi_operation::shutdown);
     rt_rhi_timing timing{};
     rt_rhi_error wait_error{};
     const bool wait_succeeded = wait_idle(&timing, &wait_error);
@@ -952,11 +950,9 @@ bool metal_rhi_device::wait_idle(
     rt_rhi_timing* out_timing,
     rt_rhi_error* out_error)
 {
+    reset_rt_rhi_error(out_error, rt_rhi_operation::wait_idle);
     if (out_timing != nullptr) {
         *out_timing = {};
-    }
-    if (out_error != nullptr) {
-        *out_error = {rt_rhi_operation::wait_idle, 0, {}};
     }
     if (!initialized_) {
         return true;
@@ -1407,11 +1403,9 @@ bool metal_rhi_device::begin_commands(
     rt_command_encoder* out_encoder,
     rt_rhi_error* out_error)
 {
+    reset_rt_rhi_error(out_error, rt_rhi_operation::begin_commands);
     if (out_encoder != nullptr) {
         *out_encoder = {};
-    }
-    if (out_error != nullptr) {
-        *out_error = {rt_rhi_operation::begin_commands, 0, {}};
     }
     if (!initialized_ || command_queue_ == nil || out_encoder == nullptr ||
         queue != rt_queue_class::graphics) {
@@ -1450,14 +1444,12 @@ bool metal_rhi_device::submit_commands(
     rt_rhi_timing* out_timing,
     rt_rhi_error* out_error)
 {
+    reset_rt_rhi_error(out_error, rt_rhi_operation::submit_commands);
     if (out_submission != nullptr) {
         *out_submission = {};
     }
     if (out_timing != nullptr) {
         *out_timing = {};
-    }
-    if (out_error != nullptr) {
-        *out_error = {rt_rhi_operation::submit_commands, 0, {}};
     }
     metal_command_slot* const slot = command_slot(
         encoder,
@@ -1508,11 +1500,9 @@ bool metal_rhi_device::is_complete(
     bool* out_complete,
     rt_rhi_error* out_error)
 {
+    reset_rt_rhi_error(out_error, rt_rhi_operation::query_submission);
     if (out_complete != nullptr) {
         *out_complete = false;
-    }
-    if (out_error != nullptr) {
-        *out_error = {rt_rhi_operation::query_submission, 0, {}};
     }
     if (!submission || out_complete == nullptr || submission.serial >= next_submission_serial_) {
         if (out_error != nullptr) {
@@ -1536,11 +1526,9 @@ bool metal_rhi_device::wait(
     rt_rhi_timing* out_timing,
     rt_rhi_error* out_error)
 {
+    reset_rt_rhi_error(out_error, rt_rhi_operation::wait_submission);
     if (out_timing != nullptr) {
         *out_timing = {};
-    }
-    if (out_error != nullptr) {
-        *out_error = {rt_rhi_operation::wait_submission, 0, {}};
     }
     if (!submission || submission.serial >= next_submission_serial_) {
         if (out_error != nullptr) {
@@ -1626,9 +1614,7 @@ bool metal_rhi_device::barrier(
     std::size_t barrier_count,
     rt_rhi_error* out_error)
 {
-    if (out_error != nullptr) {
-        *out_error = {rt_rhi_operation::transition_resource, 0, {}};
-    }
+    reset_rt_rhi_error(out_error, rt_rhi_operation::transition_resource);
     metal_command_slot* const slot = command_slot(
         encoder,
         rt_rhi_operation::transition_resource,
@@ -1671,9 +1657,7 @@ bool metal_rhi_device::copy_buffer(
     const rt_buffer_copy_region &region,
     rt_rhi_error* out_error)
 {
-    if (out_error != nullptr) {
-        *out_error = {rt_rhi_operation::copy_resource, 0, {}};
-    }
+    reset_rt_rhi_error(out_error, rt_rhi_operation::copy_resource);
     metal_command_slot* const slot = command_slot(
         encoder,
         rt_rhi_operation::copy_resource,
@@ -1718,9 +1702,7 @@ bool metal_rhi_device::copy_texture_to_buffer(
     const rt_texture_buffer_copy_region &region,
     rt_rhi_error* out_error)
 {
-    if (out_error != nullptr) {
-        *out_error = {rt_rhi_operation::copy_resource, 0, {}};
-    }
+    reset_rt_rhi_error(out_error, rt_rhi_operation::copy_resource);
     metal_command_slot* const slot = command_slot(
         encoder,
         rt_rhi_operation::copy_resource,
@@ -1781,9 +1763,7 @@ bool metal_rhi_device::clear_texture(
     const float color[4],
     rt_rhi_error* out_error)
 {
-    if (out_error != nullptr) {
-        *out_error = {rt_rhi_operation::clear_texture, 0, {}};
-    }
+    reset_rt_rhi_error(out_error, rt_rhi_operation::clear_texture);
     metal_command_slot* const slot = command_slot(
         encoder,
         rt_rhi_operation::clear_texture,
@@ -1830,9 +1810,7 @@ bool metal_rhi_device::trace_rays(
     const rt_trace_rays_desc &desc,
     rt_rhi_error* out_error)
 {
-    if (out_error != nullptr) {
-        *out_error = {rt_rhi_operation::trace_rays, 0, {}};
-    }
+    reset_rt_rhi_error(out_error, rt_rhi_operation::trace_rays);
     const auto record_begin = std::chrono::steady_clock::now();
     metal_command_slot* const slot = command_slot(
         encoder,
@@ -2037,6 +2015,7 @@ bool metal_rhi_device::create_buffer(
     rt_buffer_handle* out_buffer,
     rt_rhi_error* out_error)
 {
+    reset_rt_rhi_error(out_error, rt_rhi_operation::create_resource);
     if (out_buffer != nullptr) {
         *out_buffer = {};
     }
@@ -2053,6 +2032,7 @@ bool metal_rhi_device::create_buffer(
     }
     id<MTLBuffer> resource = [device_ newBufferWithLength:desc.size
                                                   options:metal_buffer_options(desc.memory_domain)];
+    rt_scope_exit cleanup([&resource] { [resource release]; });
     if (resource == nil) {
         if (out_error != nullptr) {
             *out_error = {
@@ -2063,7 +2043,6 @@ bool metal_rhi_device::create_buffer(
         return false;
     }
     if (!buffer_registry_.insert({resource, desc}, out_buffer)) {
-        [resource release];
         if (out_error != nullptr) {
             *out_error = {
                 rt_rhi_operation::create_resource,
@@ -2072,6 +2051,7 @@ bool metal_rhi_device::create_buffer(
         }
         return false;
     }
+    cleanup.release();
     return true;
 }
 
@@ -2082,6 +2062,7 @@ bool metal_rhi_device::upload_buffer(
     std::size_t size,
     rt_rhi_error* out_error)
 {
+    reset_rt_rhi_error(out_error, rt_rhi_operation::upload_scene_buffers);
     metal_buffer* const target = buffer_registry_.get(buffer);
     if (target == nullptr || target->resource == nil ||
         target->desc.memory_domain == rt_memory_domain::device || data == nullptr ||
@@ -2115,6 +2096,7 @@ bool metal_rhi_device::read_buffer(
     std::size_t size,
     rt_rhi_error* out_error)
 {
+    reset_rt_rhi_error(out_error, rt_rhi_operation::readback);
     const metal_buffer* const source = buffer_registry_.get(buffer);
     if (source == nullptr || source->resource == nil ||
         source->desc.memory_domain == rt_memory_domain::device || data == nullptr ||
@@ -2153,6 +2135,7 @@ bool metal_rhi_device::create_texture(
     rt_texture_handle* out_texture,
     rt_rhi_error* out_error)
 {
+    reset_rt_rhi_error(out_error, rt_rhi_operation::create_resource);
     if (out_texture != nullptr) {
         *out_texture = {};
     }
@@ -2210,6 +2193,7 @@ bool metal_rhi_device::get_texture_copy_footprint(
     rt_texture_copy_footprint* out_footprint,
     rt_rhi_error* out_error)
 {
+    reset_rt_rhi_error(out_error, rt_rhi_operation::readback);
     if (out_footprint != nullptr) {
         *out_footprint = {};
     }
@@ -2252,6 +2236,7 @@ bool metal_rhi_device::create_blas(
     rt_blas_handle* out_blas,
     rt_rhi_error* out_error)
 {
+    reset_rt_rhi_error(out_error, rt_rhi_operation::create_resource);
     if (out_blas != nullptr) {
         *out_blas = {};
     }
@@ -2290,6 +2275,7 @@ bool metal_rhi_device::create_tlas(
     rt_tlas_handle* out_tlas,
     rt_rhi_error* out_error)
 {
+    reset_rt_rhi_error(out_error, rt_rhi_operation::create_resource);
     if (out_tlas != nullptr) {
         *out_tlas = {};
     }
@@ -2337,11 +2323,9 @@ bool metal_rhi_device::build_blas(
     rt_blas_build_result* out_result,
     rt_rhi_error* out_error)
 {
+    reset_rt_rhi_error(out_error, rt_rhi_operation::build_blas);
     if (out_result != nullptr) {
         *out_result = {};
-    }
-    if (out_error != nullptr) {
-        *out_error = {rt_rhi_operation::build_blas, 0, {}};
     }
     const auto build_begin = std::chrono::steady_clock::now();
     metal_command_slot* const slot = command_slot(
@@ -2523,9 +2507,7 @@ bool metal_rhi_device::build_tlas(
     const rt_tlas_build_desc &desc,
     rt_rhi_error* out_error)
 {
-    if (out_error != nullptr) {
-        *out_error = {rt_rhi_operation::build_tlas, 0, {}};
-    }
+    reset_rt_rhi_error(out_error, rt_rhi_operation::build_tlas);
     const auto build_begin = std::chrono::steady_clock::now();
     metal_command_slot* const slot = command_slot(
         encoder,
@@ -2704,14 +2686,15 @@ bool metal_rhi_device::update_bindings(
     const rt_binding_update_request &request,
     rt_rhi_error* out_error)
 {
-    if (out_error != nullptr) {
-        *out_error = {rt_rhi_operation::update_bindings, 0, {}};
+    reset_rt_rhi_error(out_error, rt_rhi_operation::update_bindings);
+    if (!validate_rt_binding_request(request, out_error)) {
+        return false;
     }
     std::vector<metal_binding> next_bindings;
-    const auto fail = [&next_bindings, out_error](
+    rt_scope_exit cleanup([&next_bindings] { release_metal_bindings(next_bindings); });
+    const auto fail = [out_error](
                           const rt_binding_write* write,
                           const char* reason) {
-        release_metal_bindings(next_bindings);
         if (out_error != nullptr) {
             *out_error = {
                 rt_rhi_operation::update_bindings,
@@ -2727,7 +2710,7 @@ bool metal_rhi_device::update_bindings(
         }
         return false;
     };
-    if (!initialized_ || request.writes == nullptr || request.write_count == 0) {
+    if (!initialized_) {
         return fail(nullptr, "binding writes are unavailable");
     }
     try {
@@ -2738,25 +2721,15 @@ bool metal_rhi_device::update_bindings(
 
     for (std::size_t write_index = 0; write_index < request.write_count; ++write_index) {
         const rt_binding_write &write = request.writes[write_index];
-        const auto duplicate = std::find_if(
-            next_bindings.begin(),
-            next_bindings.end(),
-            [&write](const metal_binding &binding) {
-                return binding.location == write.location;
-            });
-        if (duplicate != next_bindings.end()) {
-            return fail(&write, "binding location is duplicated");
-        }
-
         metal_binding binding{};
+        rt_scope_exit binding_cleanup([&binding] { release_metal_binding(binding); });
         binding.location = write.location;
         binding.type = write.type;
         binding.element_count = write.element_count;
         binding.element_stride = write.element_stride;
         if (write.type == rt_descriptor_type::acceleration_structure) {
             const metal_tlas* const tlas = tlas_registry_.get(write.acceleration);
-            if (write.element_count != 1 || write.element_stride != 0 ||
-                tlas == nullptr || tlas->resource == nil || tlas->instance_kind_buffer == nil) {
+            if (tlas == nullptr || tlas->resource == nil || tlas->instance_kind_buffer == nil) {
                 return fail(&write, "specified TLAS is unavailable or the element range is invalid");
             }
             binding.acceleration = [tlas->resource retain];
@@ -2764,53 +2737,37 @@ bool metal_rhi_device::update_bindings(
             if (!retain_acceleration_list(
                     tlas->referenced_accelerations,
                     &binding.referenced_accelerations)) {
-                release_metal_binding(binding);
                 return fail(&write, "specified TLAS binding bundle allocation failed");
             }
         } else if (write.type == rt_descriptor_type::storage_texture) {
             const metal_texture* const texture = texture_registry_.get(write.texture);
-            if (write.element_count != 1 || write.element_stride != 0 ||
-                texture == nullptr || texture->resource == nil ||
+            if (texture == nullptr || texture->resource == nil ||
                 (texture->desc.usage & rt_texture_usage_shader_write) == 0u) {
                 return fail(&write, "storage texture is unavailable or lacks shader-write usage");
             }
             binding.texture = [texture->resource retain];
-        } else if (write.type == rt_descriptor_type::structured_buffer) {
-            if (write.element_count == 0) {
+        } else if (write.type == rt_descriptor_type::structured_buffer ||
+            write.type == rt_descriptor_type::storage_buffer || write.type == rt_descriptor_type::uniform_buffer) {
+            if (write.type == rt_descriptor_type::structured_buffer && write.element_count == 0) {
                 next_bindings.push_back(std::move(binding));
+                binding_cleanup.release();
                 continue;
             }
             const metal_buffer* const buffer = buffer_registry_.get(write.resource);
-            std::size_t range_size = 0;
-            if (write.element_stride == 0 ||
-                !size_product(write.element_count, write.element_stride, &range_size) ||
-                buffer == nullptr || buffer->resource == nil || range_size > buffer->desc.size ||
-                (buffer->desc.usage & rt_buffer_usage_shader_read) == 0u) {
-                return fail(&write, "structured buffer range or shader-read usage is invalid");
-            }
-            binding.buffer = [buffer->resource retain];
-        } else if (write.type == rt_descriptor_type::storage_buffer ||
-            write.type == rt_descriptor_type::uniform_buffer) {
-            const metal_buffer* const buffer = buffer_registry_.get(write.resource);
-            std::size_t range_size = 0;
-            const std::uint32_t required_usage = write.type == rt_descriptor_type::storage_buffer
-                ? rt_buffer_usage_shader_write
-                : rt_buffer_usage_uniform;
-            if (write.element_count == 0 || write.element_stride == 0 ||
-                !size_product(write.element_count, write.element_stride, &range_size) ||
-                buffer == nullptr || buffer->resource == nil || range_size > buffer->desc.size ||
-                (buffer->desc.usage & required_usage) == 0u) {
-                return fail(&write, "buffer range or descriptor usage is invalid");
+            if (!validate_rt_binding_buffer(write, buffer != nullptr ? &buffer->desc : nullptr, out_error)) {
+                return false;
             }
             binding.buffer = [buffer->resource retain];
         } else {
             return fail(&write, "descriptor type is unsupported");
         }
         next_bindings.push_back(std::move(binding));
+        binding_cleanup.release();
     }
 
     release_binding_state();
     bindings_ = std::move(next_bindings);
+    cleanup.release();
     return true;
 }
 
@@ -2819,11 +2776,9 @@ bool metal_rhi_device::create_shader_module(
     rt_shader_module_handle* out_module,
     rt_rhi_error* out_error)
 {
+    reset_rt_rhi_error(out_error, rt_rhi_operation::create_shader_module);
     if (out_module != nullptr) {
         *out_module = {};
-    }
-    if (out_error != nullptr) {
-        *out_error = {rt_rhi_operation::create_shader_module, 0, {}};
     }
     if (!initialized_ || device_ == nil || out_module == nullptr ||
         desc.format != rt_shader_binary_format::metallib ||
@@ -2878,11 +2833,9 @@ bool metal_rhi_device::create_pipeline(
     rt_pipeline_handle* out_pipeline,
     rt_rhi_error* out_error)
 {
+    reset_rt_rhi_error(out_error, rt_rhi_operation::prepare_pipeline);
     if (out_pipeline != nullptr) {
         *out_pipeline = {};
-    }
-    if (out_error != nullptr) {
-        *out_error = {rt_rhi_operation::prepare_pipeline, 0, {}};
     }
     if (desc.model == rt_pipeline_model::native_ray_tracing) {
         if (out_error != nullptr) {
@@ -2977,11 +2930,9 @@ bool metal_rhi_device::publish_texture(
     rt_rhi_timing* out_timing,
     rt_rhi_error* out_error)
 {
+    reset_rt_rhi_error(out_error, rt_rhi_operation::native_texture);
     if (out_timing != nullptr) {
         *out_timing = {};
-    }
-    if (out_error != nullptr) {
-        *out_error = {rt_rhi_operation::native_texture, 0, {}};
     }
     if (desc.out_submission != nullptr) {
         *desc.out_submission = {};

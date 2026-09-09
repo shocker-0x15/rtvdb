@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <limits>
+#include <utility>
 
 namespace rtvdb::viewer_backend {
 
@@ -199,6 +200,37 @@ bool get_rt_pipeline_dispatch_entry_index(
         }
     }
     return false;
+}
+
+bool make_rt_shader_table_plan(const rt_pipeline_desc &desc, rt_shader_table_plan* out_plan) {
+    if (out_plan == nullptr) {
+        return false;
+    }
+    *out_plan = {};
+    if (desc.model != rt_pipeline_model::native_ray_tracing || !validate_rt_pipeline_desc(desc)) {
+        return false;
+    }
+    rt_shader_table_plan plan{};
+    for (rt_logical_dispatch_entry logical_entry :
+            {rt_logical_dispatch_entry::render, rt_logical_dispatch_entry::pick}) {
+        std::uint32_t group_index = kRtUnusedShaderIndex;
+        if (!get_rt_pipeline_dispatch_entry_index(desc, logical_entry, &group_index)) {
+            return false;
+        }
+        plan.ray_generation_groups.push_back(group_index);
+    }
+    for (std::size_t group_index = 0; group_index < desc.group_count; ++group_index) {
+        const rt_shader_group_desc &group = desc.groups[group_index];
+        if (group.type != rt_shader_group_type::general) {
+            plan.hit_groups.push_back(static_cast<std::uint32_t>(group_index));
+        } else if (desc.shaders[group.general_shader].stage == rt_shader_stage::miss) {
+            plan.miss_groups.push_back(static_cast<std::uint32_t>(group_index));
+        } else if (desc.shaders[group.general_shader].stage == rt_shader_stage::callable) {
+            plan.callable_groups.push_back(static_cast<std::uint32_t>(group_index));
+        }
+    }
+    *out_plan = std::move(plan);
+    return true;
 }
 
 bool get_rt_blas_geometry_counts(

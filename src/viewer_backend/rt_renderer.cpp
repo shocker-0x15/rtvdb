@@ -1,4 +1,6 @@
 ﻿#include "viewer_backend/rt_renderer.h"
+#include "viewer_backend/rt_command_recording.h"
+#include "viewer_backend/rt_resource_pool.h"
 
 #include <algorithm>
 #include <chrono>
@@ -224,22 +226,6 @@ std::size_t blas_cache_capacity_bytes(const rt_blas_cache_state &state) {
     return total;
 }
 
-std::size_t scene_buffer_pool_capacity_bytes(const rt_renderer &renderer) {
-    std::size_t total = 0;
-    for (const rt_scene_buffer_pool_entry &entry : renderer.scene_buffer_pool) {
-        total = add_diagnostic_capacity(total, entry.capacity_bytes);
-    }
-    return total;
-}
-
-std::size_t blas_storage_pool_capacity_bytes(const rt_renderer &renderer) {
-    std::size_t total = 0;
-    for (const rt_blas_storage_pool_entry &entry : renderer.blas_storage_pool) {
-        total = add_diagnostic_capacity(total, entry.capacity_bytes);
-    }
-    return total;
-}
-
 bool rt_submission_is_complete(rt_renderer* renderer, rt_submission_token submission) {
     if (renderer == nullptr || renderer->rhi == nullptr || !submission) {
         return true;
@@ -257,18 +243,11 @@ void collect_rt_resource_pools(rt_renderer* renderer) {
     if (renderer == nullptr || renderer->rhi == nullptr) {
         return;
     }
-    for (rt_scene_buffer_pool_entry &entry : renderer->scene_buffer_pool) {
-        if (entry.retirement_submission &&
-            rt_submission_is_complete(renderer, entry.retirement_submission)) {
-            entry.retirement_submission = {};
-        }
-    }
-    for (rt_blas_storage_pool_entry &entry : renderer->blas_storage_pool) {
-        if (entry.retirement_submission &&
-            rt_submission_is_complete(renderer, entry.retirement_submission)) {
-            entry.retirement_submission = {};
-        }
-    }
+    const auto is_complete = [renderer](rt_submission_token submission) {
+        return rt_submission_is_complete(renderer, submission);
+    };
+    collect_rt_resource_pool(renderer->scene_buffer_pool, is_complete);
+    collect_rt_resource_pool(renderer->blas_storage_pool, is_complete);
 }
 
 void trim_scene_buffer_pool(rt_renderer* renderer) {
@@ -276,25 +255,12 @@ void trim_scene_buffer_pool(rt_renderer* renderer) {
         return;
     }
     collect_rt_resource_pools(renderer);
-    while (renderer->scene_buffer_pool.size() > kRtSceneBufferPoolMaxEntries ||
-           scene_buffer_pool_capacity_bytes(*renderer) > kRtSceneBufferPoolMaxBytes) {
-        std::size_t oldest_index = renderer->scene_buffer_pool.size();
-        for (std::size_t index = 0; index < renderer->scene_buffer_pool.size(); ++index) {
-            const rt_scene_buffer_pool_entry &entry = renderer->scene_buffer_pool[index];
-            if (!entry.retirement_submission &&
-                (oldest_index == renderer->scene_buffer_pool.size() ||
-                    entry.sequence < renderer->scene_buffer_pool[oldest_index].sequence)) {
-                oldest_index = index;
-            }
-        }
-        if (oldest_index == renderer->scene_buffer_pool.size()) {
-            return;
-        }
-        renderer->rhi->destroy_buffer(renderer->scene_buffer_pool[oldest_index].buffer);
-        ++renderer->resource_pool_eviction_count;
-        renderer->scene_buffer_pool[oldest_index] = renderer->scene_buffer_pool.back();
-        renderer->scene_buffer_pool.pop_back();
-    }
+    trim_rt_resource_pool(
+        renderer->scene_buffer_pool, kRtSceneBufferPoolMaxEntries, kRtSceneBufferPoolMaxBytes,
+        [renderer](const rt_scene_buffer_pool_entry &entry) {
+            renderer->rhi->destroy_buffer(entry.buffer);
+            ++renderer->resource_pool_eviction_count;
+        });
 }
 
 void trim_blas_storage_pool(rt_renderer* renderer) {
@@ -302,25 +268,12 @@ void trim_blas_storage_pool(rt_renderer* renderer) {
         return;
     }
     collect_rt_resource_pools(renderer);
-    while (renderer->blas_storage_pool.size() > kRtBlasStoragePoolMaxEntries ||
-           blas_storage_pool_capacity_bytes(*renderer) > kRtBlasStoragePoolMaxBytes) {
-        std::size_t oldest_index = renderer->blas_storage_pool.size();
-        for (std::size_t index = 0; index < renderer->blas_storage_pool.size(); ++index) {
-            const rt_blas_storage_pool_entry &entry = renderer->blas_storage_pool[index];
-            if (!entry.retirement_submission &&
-                (oldest_index == renderer->blas_storage_pool.size() ||
-                    entry.sequence < renderer->blas_storage_pool[oldest_index].sequence)) {
-                oldest_index = index;
-            }
-        }
-        if (oldest_index == renderer->blas_storage_pool.size()) {
-            return;
-        }
-        renderer->rhi->destroy_blas(renderer->blas_storage_pool[oldest_index].acceleration);
-        ++renderer->resource_pool_eviction_count;
-        renderer->blas_storage_pool[oldest_index] = renderer->blas_storage_pool.back();
-        renderer->blas_storage_pool.pop_back();
-    }
+    trim_rt_resource_pool(
+        renderer->blas_storage_pool, kRtBlasStoragePoolMaxEntries, kRtBlasStoragePoolMaxBytes,
+        [renderer](const rt_blas_storage_pool_entry &entry) {
+            renderer->rhi->destroy_blas(entry.acceleration);
+            ++renderer->resource_pool_eviction_count;
+        });
 }
 
 void enqueue_scene_buffer_pool_entry(
@@ -2399,6 +2352,7 @@ bool readback_rt_output(
     if (!begin_rt_commands(renderer, rt_queue_class::graphics, &encoder, out_error)) {
         return false;
     }
+    rt_command_recording recording(*renderer->rhi, encoder);
     const rt_texture_copy_footprint footprint = renderer->output_readback_footprint;
     const bool recorded =
         transition_rt_texture(
@@ -2425,13 +2379,12 @@ bool readback_rt_output(
             rt_resource_usage::shader_read,
             out_error);
     if (!recorded) {
-        discard_rt_commands(renderer, encoder);
         return false;
     }
     rt_rhi_timing timing{};
     if (!submit_rt_commands(
             renderer,
-            encoder,
+            recording.release(),
             &renderer->output_readback_submission,
             &timing,
             out_error)) {

@@ -83,6 +83,11 @@ struct rt_dispatch_plan {
     bool uses_accumulation = false;
 };
 
+// Module storage must outlive the returned package. Entry mappings have static lifetime.
+rt_shader_package_desc make_viewer_rt_shader_package(
+    const rt_shader_module_desc* modules,
+    std::size_t module_count);
+
 viewer_rt_pipeline_desc make_viewer_rt_pipeline_desc(
     rt_pipeline_model model,
     const std::array<rt_shader_module_handle, kViewerRtShaderEntryCount> &entry_modules);

@@ -1,6 +1,7 @@
 ﻿#pragma once
 
 #include "rtvdb/rtvdb.h"
+#include "viewer_backend/rt_native_interop.h"
 #include "viewer_shell/shell.h"
 
 #include <cstddef>
@@ -248,14 +249,6 @@ struct pick_result {
 struct d3d12_interop_config {
     void* device = nullptr;
     void* command_queue = nullptr;
-};
-
-struct vulkan_renderer_interop {
-    void* instance = nullptr;
-    void* physical_device = nullptr;
-    void* device = nullptr;
-    std::uint32_t graphics_queue_family_index = 0;
-    std::uint32_t present_queue_family_index = 0;
 };
 
 using scene_ready_callback = void (*)(const frame_scene* scene, bool has_frame, void* user_data);
