@@ -60,6 +60,7 @@ struct session_config {
 };
 
 bool start_session(const session_callbacks &callbacks, const session_config &config);
+void stop_session();
 void copy_latest_scene(viewer_backend::frame_scene* out_scene, bool* out_has_frame);
 bool acquire_latest_scene(
     std::shared_ptr<const viewer_backend::frame_scene>* out_scene,

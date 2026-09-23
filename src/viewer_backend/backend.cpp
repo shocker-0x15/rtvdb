@@ -750,6 +750,17 @@ void copy_present_scene(frame_scene* out_scene, bool* out_has_frame) {
     }
 }
 
+bool acquire_present_client_scene(std::shared_ptr<const frame_scene>* out_scene, bool* out_has_frame) {
+    std::scoped_lock lock(g_backend.mutex);
+    if (out_scene != nullptr) {
+        *out_scene = g_backend.present_client_scene;
+    }
+    if (out_has_frame != nullptr) {
+        *out_has_frame = g_backend.present_client_has_frame;
+    }
+    return g_backend.present_client_scene != nullptr;
+}
+
 void copy_present_camera(
     rtvdb::camera* out_camera,
     rtvdb::camera_projection* out_projection_blend_from,

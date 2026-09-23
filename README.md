@@ -70,7 +70,7 @@ bool line(
     float bx, float by, float bz,
     std::uint32_t user_data = 0);
 
-void set_color(float r, float g, float b, float a = 0.0f);
+void set_color(float r, float g, float b, float a = 1.0f);
 ```
 
 - 主 API は raw `float` 引数ですが、`triangle()` / `point()` / `line()` は `.x/.y/.z` を持つ任意型も受け取れます。\
@@ -85,6 +85,8 @@ The main API uses raw `float` arguments, but `triangle()`, `point()`, and `line(
 bool connect(const config* cfg = nullptr, const char* app_name = kImplicitAppName); // Use this to explicitly specify the destination or app_name
 void disconnect(); // Close the connection and reset client-side state
 bool is_connected(); // Check the current connection state
+const char* last_error(); // Latest client error, or an empty string
+void clear_error(); // Explicitly clear the stored error
 
 bool clear(); // Clear the current scene contents
 bool flush(); // Send pending primitive batches immediately
@@ -152,6 +154,36 @@ setting, so the viewer's `XYZ Grid` setting in the Display UI remains freely edi
 `request_capture()` snapshots the client scene from before the request, then waits for that scene to finish building before rendering and saving it with the last client `set_camera()` call before the request (or the viewer camera at request time when no client camera was specified). Viewer camera interaction and presentation of later client scenes are paused until the image is saved. Later scenes received during the save are applied after it completes. `request_capture(false)` saves the first sample after the scene build instead of waiting for accumulation to finish.
 - 保存要求があった場合だけ、Windows/Linux では viewer 実行ファイルと同じディレクトリに、macOS では `~/Library/Application Support/rtvdb/sessions/` にセッションディレクトリを作成します。\
 Capture session directories are created only after a request: beside the viewer executable on Windows/Linux, and under `~/Library/Application Support/rtvdb/sessions/` on macOS.
+
+### Client errors
+
+`last_error()` は最後に検出したクライアント側エラーの説明を返します。初期状態と `clear_error()` の直後は空文字列です。
+成功したAPI呼び出し、`is_connected()`、`disconnect()` はエラーを消しません。次のエラーで上書きされます。
+戻り値はライブラリが所有し、次のエラーまたは `clear_error()` まで有効です。長く保持する場合はコピーしてください。
+クライアントAPIとエラー状態はスレッドセーフではありません。エラー文字列の完全一致をプログラムの判定条件にしないでください。\
+`last_error()` returns the latest detected client-side error, or an empty string initially and after `clear_error()`.
+Successful calls, `is_connected()`, and `disconnect()` preserve it; the next error replaces it. The library owns the
+returned text, which remains valid until the next error or `clear_error()`. Copy it if needed longer. Client APIs and
+error state are not thread-safe. Do not depend on exact error text for programmatic decisions.
+
+```cpp
+if (!rtvdb::push_layer("mesh/part")) {
+    std::fprintf(stderr, "rtvdb: %s\n", rtvdb::last_error());
+}
+```
+
+接続・送信失敗、frame/layer操作ミス、レイヤー名・接続先の不正値を報告します。`void`を返す半径設定APIも、
+値を拒否した場合や内部送信に失敗した場合にエラーを設定します。通信失敗はWindowsではWSA、他環境ではerrnoの番号を含みます。
+暗黙接続の再試行待ちも個別のエラーになります。接続失敗を標準エラーへ自動出力せず、利用者が必要に応じて記録します。\
+Errors cover connection/send failures, frame/layer misuse, and invalid layer names or hosts. The void radius setters
+also record rejected values and internal send failures. Transport errors include a WSA code on Windows or errno on
+other platforms. A delayed implicit connection retry reports its own error. Connection failures are not automatically
+printed to stderr; applications can log them as needed.
+
+これはViewerからの完了通知ではありません。送信やキュー投入の成功は描画・PNG保存の成功を保証せず、
+Viewer側の失敗やC++例外はこのAPIの対象外です。\
+This is not a Viewer acknowledgement: successful sending or enqueueing does not guarantee rendering or PNG saving.
+Viewer-side failures and C++ exceptions are outside this API's scope.
 
 ## Samples
 

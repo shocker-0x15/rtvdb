@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -314,7 +315,9 @@ int main(int argc, char** argv) {
     }
 
     const std::string app_name = opts.mesh_path.stem().string();
+    rtvdb::clear_error();
     if (!rtvdb::connect(nullptr, app_name.c_str())) {
+        std::fprintf(stderr, "rtvdb_obj_stream_client: connect: %s\n", rtvdb::last_error());
         return static_cast<int>(exit_code::connection_failed);
     }
 
@@ -344,6 +347,7 @@ int main(int argc, char** argv) {
             for (; submitted < batch_end; ++submitted) {
                 const streamed_edge &edge = mesh.edges[submitted];
                 if (!rtvdb::line(edge.a, edge.b)) {
+                    std::fprintf(stderr, "rtvdb_obj_stream_client: line: %s\n", rtvdb::last_error());
                     rtvdb::disconnect();
                     return static_cast<int>(exit_code::line_send_failed);
                 }
@@ -363,6 +367,7 @@ int main(int argc, char** argv) {
                 const streamed_triangle &tri = mesh.triangles[submitted];
                 rtvdb::set_color(tri.color);
                 if (!rtvdb::triangle(tri.a, tri.b, tri.c)) {
+                    std::fprintf(stderr, "rtvdb_obj_stream_client: triangle: %s\n", rtvdb::last_error());
                     rtvdb::disconnect();
                     return static_cast<int>(exit_code::triangle_send_failed);
                 }

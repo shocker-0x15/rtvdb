@@ -9,6 +9,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace rtvdb::viewer_backend {
@@ -121,6 +122,48 @@ struct scene_bounds {
     bool valid = false;
 };
 
+template <typename T>
+class cow_vector {
+public:
+    const std::vector<T> &read() const {
+        static const std::vector<T> empty;
+        return storage_ != nullptr ? *storage_ : empty;
+    }
+
+    std::vector<T> &write() {
+        if (storage_ == nullptr) {
+            storage_ = std::make_shared<std::vector<T>>();
+        } else if (storage_.use_count() != 1) {
+            storage_ = std::make_shared<std::vector<T>>(*storage_);
+        }
+        return *storage_;
+    }
+
+    std::size_t size() const { return read().size(); }
+    bool empty() const { return read().empty(); }
+    void reserve(std::size_t count) { write().reserve(count); }
+    void clear() {
+        if (storage_ != nullptr && storage_.use_count() != 1) {
+            storage_.reset();
+        } else if (storage_ != nullptr) {
+            storage_->clear();
+        }
+    }
+    void push_back(const T &value) { write().push_back(value); }
+    void push_back(T &&value) { write().push_back(std::move(value)); }
+    template <typename... Args>
+    T &emplace_back(Args &&...args) { return write().emplace_back(std::forward<Args>(args)...); }
+    T &operator[](std::size_t index) { return write()[index]; }
+    const T &operator[](std::size_t index) const { return read()[index]; }
+    auto begin() { return write().begin(); }
+    auto end() { return write().end(); }
+    auto begin() const { return read().begin(); }
+    auto end() const { return read().end(); }
+
+private:
+    std::shared_ptr<std::vector<T>> storage_;
+};
+
 struct frame_scene {
     std::uint64_t frame_serial = 0;
     std::uint64_t connection_serial = 0;
@@ -134,9 +177,9 @@ struct frame_scene {
     rtvdb::vec3 helper_overlay_bounds_min{};
     rtvdb::vec3 helper_overlay_bounds_max{};
     bool helper_overlay_bounds_valid = false;
-    std::vector<triangle> triangles;
-    std::vector<point> points;
-    std::vector<line> lines;
+    cow_vector<triangle> triangles;
+    cow_vector<point> points;
+    cow_vector<line> lines;
 };
 
 using layer_visibility_map = std::unordered_map<std::string, bool>;
@@ -295,6 +338,7 @@ struct render_scene_context {
     std::shared_ptr<const rt_scene_build> build_snapshot;
 };
 void copy_present_scene(frame_scene* out_scene, bool* out_has_frame);
+bool acquire_present_client_scene(std::shared_ptr<const frame_scene>* out_scene, bool* out_has_frame);
 void copy_present_render_scene(frame_scene* out_scene, bool* out_has_frame);
 bool acquire_present_render_scene(
     std::shared_ptr<const frame_scene>* out_scene,

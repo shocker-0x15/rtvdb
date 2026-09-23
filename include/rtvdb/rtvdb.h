@@ -29,6 +29,9 @@ bool connect(const config* cfg = nullptr, const char* app_name = kImplicitAppNam
 void disconnect();
 bool is_connected();
 
+const char* last_error();
+void clear_error();
+
 bool begin_frame();
 bool end_frame();
 
@@ -129,6 +132,8 @@ concept copyable_32bit =
 
 namespace detail {
 
+bool set_error(const char* message);
+
 template <copyable_32bit T>
 inline std::uint32_t encode_user_data(const T &value) {
     return std::bit_cast<std::uint32_t>(value);
@@ -226,7 +231,7 @@ inline bool set_camera(const camera &value) {
 
 inline bool push_layerf(const char* format, ...) {
     if (format == nullptr) {
-        return false;
+        return detail::set_error("push_layerf: format must not be null");
     }
 
     va_list args;
@@ -234,7 +239,7 @@ inline bool push_layerf(const char* format, ...) {
     const int length = std::vsnprintf(nullptr, 0, format, args);
     va_end(args);
     if (length < 0) {
-        return false;
+        return detail::set_error("push_layerf: could not format layer name");
     }
 
     std::vector<char> formatted_name(static_cast<std::size_t>(length) + 1);
@@ -242,7 +247,7 @@ inline bool push_layerf(const char* format, ...) {
     const int written = std::vsnprintf(formatted_name.data(), formatted_name.size(), format, args);
     va_end(args);
     if (written != length) {
-        return false;
+        return detail::set_error("push_layerf: could not format layer name");
     }
     return push_layer(formatted_name.data());
 }
@@ -426,12 +431,37 @@ struct line_payload {
 #endif
 
 #include <chrono>
+#include <cerrno>
 #include <cstring>
 #include <string>
 
 namespace rtvdb {
 
 namespace detail {
+
+constexpr std::size_t kErrorMessageCapacity = 256;
+
+inline char* error_storage() {
+    static char message[kErrorMessageCapacity]{};
+    return message;
+}
+
+bool set_error(const char* message) {
+    std::snprintf(error_storage(), kErrorMessageCapacity, "%s", message);
+    return false;
+}
+
+inline bool set_network_error(const char* operation) {
+#if defined(_WIN32)
+    const int code = WSAGetLastError();
+    const char* source = "WSA";
+#else
+    const int code = errno;
+    const char* source = "errno";
+#endif
+    std::snprintf(error_storage(), kErrorMessageCapacity, "%s failed (%s=%d)", operation, source, code);
+    return false;
+}
 
 #if defined(_WIN32)
 using platform_socket = SOCKET;
@@ -467,10 +497,15 @@ inline bool ensure_network_started() {
 #if defined(_WIN32)
     static bool initialized = false;
     static bool success = false;
+    static int startup_error = 0;
     if (!initialized) {
         initialized = true;
         WSADATA data{};
-        success = (WSAStartup(MAKEWORD(2, 2), &data) == 0);
+        startup_error = WSAStartup(MAKEWORD(2, 2), &data);
+        success = (startup_error == 0);
+    }
+    if (!success) {
+        std::snprintf(error_storage(), kErrorMessageCapacity, "WSAStartup failed (WSA=%d)", startup_error);
     }
     return success;
 #else
@@ -535,7 +570,7 @@ inline bool configure_socket_for_send(platform_socket socket_value) {
 #if !defined(_WIN32) && defined(SO_NOSIGPIPE)
     const int enabled = 1;
     if (setsockopt(socket_value, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled)) != 0) {
-        return false;
+        return set_network_error("setsockopt(SO_NOSIGPIPE)");
     }
 #endif
     (void)socket_value;
@@ -551,8 +586,11 @@ inline bool send_platform_bytes(platform_socket socket_value, const char* bytes,
             bytes + total_sent,
             static_cast<platform_send_size>(remaining),
             platform_send_flags());
-        if (chunk <= 0) {
-            return false;
+        if (chunk < 0) {
+            return set_network_error("send");
+        }
+        if (chunk == 0) {
+            return set_error("send: connection closed before all bytes were sent");
         }
         total_sent += static_cast<std::uint32_t>(chunk);
     }
@@ -566,7 +604,7 @@ inline bool send_message_raw(
     std::uint32_t payload_size)
 {
     if (c == nullptr || c->socket == nullptr) {
-        return false;
+        return set_error("send: client is not connected");
     }
 
     const platform_socket sock = *socket_ptr(c->socket);
@@ -631,7 +669,7 @@ inline bool connect_client(client_state* c, const config* cfg, const char* app_n
     const config* effective = (cfg != nullptr) ? cfg : &fallback;
 
     if (effective->host == nullptr || effective->host[0] == '\0') {
-        return false;
+        return set_error("connect: host must not be null or empty");
     }
 
     sockaddr_in addr{};
@@ -643,15 +681,15 @@ inline bool connect_client(client_state* c, const config* cfg, const char* app_n
         host_text = "127.0.0.1";
     }
     if (inet_pton(AF_INET, host_text, &addr.sin_addr) != 1) {
-        return false;
+        return set_error("connect: host must be an IPv4 address or localhost");
     }
 
     detail::platform_socket sock = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (sock == detail::kInvalidSocket) {
-        return false;
+        return set_network_error("socket");
     }
     if (::connect(sock, reinterpret_cast<const sockaddr*>(&addr), static_cast<socklen_t>(sizeof(addr))) != 0) {
-        std::fprintf(stderr, "connect failed: errno=%d (%s)\n", errno, std::strerror(errno));
+        set_network_error("connect");
         detail::close_platform_socket(sock);
         return false;
     }
@@ -693,7 +731,7 @@ inline bool ensure_implicit_connection(client_state* c) {
 
     const std::uint64_t now_tick = current_tick_ms();
     if (now_tick < c->next_implicit_connect_tick) {
-        return false;
+        return set_error("connect: implicit connection retry is delayed after a failed attempt");
     }
 
     if (connect_client(c, nullptr, kImplicitAppName)) {
@@ -839,12 +877,20 @@ bool is_connected() {
     return detail::global_client().socket != nullptr;
 }
 
+const char* last_error() {
+    return detail::error_storage();
+}
+
+void clear_error() {
+    detail::error_storage()[0] = '\0';
+}
+
 
 
 bool begin_frame() {
     detail::client_state &c = detail::global_client();
     if (c.explicit_frame_open) {
-        return false;
+        return detail::set_error("begin_frame: a frame is already open");
     }
     if (!detail::send_control_message(message_kind::begin_frame, nullptr, 0)) {
         return false;
@@ -856,7 +902,7 @@ bool begin_frame() {
 bool end_frame() {
     detail::client_state &c = detail::global_client();
     if (!c.explicit_frame_open) {
-        return false;
+        return detail::set_error("end_frame: no frame is open");
     }
     if (!detail::send_control_message(message_kind::end_frame, nullptr, 0)) {
         return false;
@@ -946,11 +992,11 @@ bool request_capture(bool full_accumulation) {
 bool push_layer(const char* name) {
     detail::client_state &c = detail::global_client();
     if (name == nullptr || name[0] == '\0' || std::strchr(name, '/') != nullptr) {
-        return false;
+        return detail::set_error("push_layer: name must be nonempty and must not contain '/'");
     }
     const std::size_t length = std::strlen(name);
     if (length >= kLayerNameCapacity) {
-        return false;
+        return detail::set_error("push_layer: name exceeds the 63-byte limit");
     }
     if (!detail::ensure_implicit_connection(&c)) {
         return false;
@@ -966,8 +1012,11 @@ bool push_layer(const char* name) {
 
 bool pop_layer() {
     detail::client_state &c = detail::global_client();
-    if (c.socket == nullptr || c.layer_stack.empty()) {
-        return false;
+    if (c.socket == nullptr) {
+        return detail::set_error("pop_layer: client is not connected");
+    }
+    if (c.layer_stack.empty()) {
+        return detail::set_error("pop_layer: layer stack is empty");
     }
     if (!detail::send_control_message(message_kind::pop_layer, nullptr, 0)) {
         return false;
@@ -995,6 +1044,7 @@ void set_color(float r, float g, float b, float a) {
 
 void set_point_radius(float value) {
     if (!(value > 0.0f)) {
+        detail::set_error("set_point_radius: radius must be greater than zero");
         return;
     }
     detail::client_state &c = detail::global_client();
@@ -1009,6 +1059,7 @@ void set_point_radius(float value) {
 
 void set_line_radius(float value) {
     if (!(value > 0.0f)) {
+        detail::set_error("set_line_radius: radius must be greater than zero");
         return;
     }
     detail::client_state &c = detail::global_client();
@@ -1060,7 +1111,7 @@ bool triangle(
 bool point(float x, float y, float z, std::uint32_t user_data) {
     detail::client_state &c = detail::global_client();
     if (!(c.current_point_radius > 0.0f)) {
-        return false;
+        return detail::set_error("point: radius must be greater than zero");
     }
     if (!detail::ensure_implicit_connection(&c)) {
         return false;
@@ -1088,7 +1139,7 @@ bool point(float x, float y, float z, std::uint32_t user_data) {
 bool line(float ax, float ay, float az, float bx, float by, float bz, std::uint32_t user_data) {
     detail::client_state &c = detail::global_client();
     if (!(c.current_line_radius > 0.0f)) {
-        return false;
+        return detail::set_error("line: radius must be greater than zero");
     }
     if (!detail::ensure_implicit_connection(&c)) {
         return false;
@@ -1116,7 +1167,7 @@ bool line(float ax, float ay, float az, float bx, float by, float bz, std::uint3
 bool flush() {
     detail::client_state &c = detail::global_client();
     if (c.socket == nullptr) {
-        return false;
+        return detail::set_error("flush: client is not connected");
     }
     return detail::flush_pending_primitive_batches(&c);
 }

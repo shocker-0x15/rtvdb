@@ -59,8 +59,8 @@ struct rt_scene_build {
     std::size_t reused_triangle_chunk_count = 0;
     std::size_t rebuilt_triangle_chunk_count = 0;
     scene_bounds bounds{};
-    std::vector<rt_scene_vertex> vertices;
-    std::vector<std::uint32_t> indices;
+    cow_vector<rt_scene_vertex> vertices;
+    cow_vector<std::uint32_t> indices;
     std::vector<rt_triangle_chunk> triangle_chunks;
     std::vector<point> points;
     std::vector<line> lines;

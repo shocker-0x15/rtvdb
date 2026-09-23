@@ -815,6 +815,20 @@ bool create_scene_uploaded_buffer(
     return true;
 }
 
+template <typename T>
+const T* scene_upload_data(
+    const std::vector<T> &source,
+    std::size_t capacity_bytes,
+    std::vector<T>* padding)
+{
+    if (capacity_bytes <= source.size() * sizeof(T)) {
+        return source.data();
+    }
+    *padding = source;
+    padding->resize(capacity_bytes / sizeof(T));
+    return padding->data();
+}
+
 bool upload_scene_buffers(
     rt_renderer* renderer,
     const rt_scene_resource_data &resources,
@@ -909,18 +923,9 @@ bool upload_scene_buffers(
             }
         }
     }
-    std::vector<std::uint32_t> padded_indices = resources.indices;
-    if (indices_capacity_bytes > padded_indices.size() * sizeof(std::uint32_t)) {
-        padded_indices.resize(indices_capacity_bytes / sizeof(std::uint32_t), 0u);
-    }
-    std::vector<rt_scene_gpu_aabb> padded_point_aabbs = resources.point_aabbs;
-    if (point_aabbs_capacity_bytes > padded_point_aabbs.size() * sizeof(rt_scene_gpu_aabb)) {
-        padded_point_aabbs.resize(point_aabbs_capacity_bytes / sizeof(rt_scene_gpu_aabb));
-    }
-    std::vector<rt_scene_gpu_aabb> padded_line_aabbs = resources.line_aabbs;
-    if (line_aabbs_capacity_bytes > padded_line_aabbs.size() * sizeof(rt_scene_gpu_aabb)) {
-        padded_line_aabbs.resize(line_aabbs_capacity_bytes / sizeof(rt_scene_gpu_aabb));
-    }
+    std::vector<std::uint32_t> padded_indices;
+    const std::uint32_t* index_upload_data =
+        scene_upload_data(resources.indices, indices_capacity_bytes, &padded_indices);
     if (!create_scene_uploaded_buffer(
             renderer,
             &next,
@@ -941,8 +946,8 @@ bool upload_scene_buffers(
             "indices",
             rt_scene_buffer_role::indices,
             sizeof(std::uint32_t),
-            {padded_indices.size() * sizeof(std::uint32_t), geometry_usage},
-            padded_indices.data(),
+            {indices_capacity_bytes, geometry_usage},
+            index_upload_data,
             rt_resource_usage::acceleration_build_input,
             current.indices_capacity_bytes,
             indices_capacity_bytes,
@@ -1022,6 +1027,14 @@ bool upload_scene_buffers(
         current.line_aabbs &&
         current.line_geometry_fingerprint == build_plan.line_geometry_fingerprint &&
         current.line_aabb_count == resources.line_aabbs.size();
+    std::vector<rt_scene_gpu_aabb> padded_point_aabbs;
+    const rt_scene_gpu_aabb* point_aabb_upload_data = reuse_point_aabbs
+        ? nullptr
+        : scene_upload_data(resources.point_aabbs, point_aabbs_capacity_bytes, &padded_point_aabbs);
+    std::vector<rt_scene_gpu_aabb> padded_line_aabbs;
+    const rt_scene_gpu_aabb* line_aabb_upload_data = reuse_line_aabbs
+        ? nullptr
+        : scene_upload_data(resources.line_aabbs, line_aabbs_capacity_bytes, &padded_line_aabbs);
     const auto aabb_upload_start = std::chrono::steady_clock::now();
     if ((!reuse_point_aabbs && !resources.point_aabbs.empty() &&
             !create_scene_uploaded_buffer(
@@ -1030,8 +1043,8 @@ bool upload_scene_buffers(
                 "point_aabbs",
                 rt_scene_buffer_role::point_aabbs,
                 sizeof(rt_scene_gpu_aabb),
-                {padded_point_aabbs.size() * sizeof(rt_scene_gpu_aabb), acceleration_input_usage},
-                padded_point_aabbs.data(),
+                {point_aabbs_capacity_bytes, acceleration_input_usage},
+                point_aabb_upload_data,
                 rt_resource_usage::acceleration_build_input,
                 current.point_aabbs_capacity_bytes,
                 point_aabbs_capacity_bytes,
@@ -1045,8 +1058,8 @@ bool upload_scene_buffers(
                 "line_aabbs",
                 rt_scene_buffer_role::line_aabbs,
                 sizeof(rt_scene_gpu_aabb),
-                {padded_line_aabbs.size() * sizeof(rt_scene_gpu_aabb), acceleration_input_usage},
-                padded_line_aabbs.data(),
+                {line_aabbs_capacity_bytes, acceleration_input_usage},
+                line_aabb_upload_data,
                 rt_resource_usage::acceleration_build_input,
                 current.line_aabbs_capacity_bytes,
                 line_aabbs_capacity_bytes,

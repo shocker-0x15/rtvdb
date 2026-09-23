@@ -217,14 +217,15 @@ void compute_chunk_metadata(
         return;
     }
 
+    const std::vector<triangle> &triangles = scene.triangles.read();
     rt_triangle_chunk chunk{};
     chunk.first_triangle = first_triangle;
     chunk.triangle_count = triangle_count;
-    chunk.layer = scene.triangles[first_triangle].layer;
-    chunk.visible = scene.triangles[first_triangle].visible;
+    chunk.layer = triangles[first_triangle].layer;
+    chunk.visible = triangles[first_triangle].visible;
     chunk.fingerprint = kFnvOffset;
     for (std::size_t i = 0; i < triangle_count; ++i) {
-        const triangle &tri = scene.triangles[first_triangle + i];
+        const triangle &tri = triangles[first_triangle + i];
         expand_bounds(&chunk.bounds, tri);
         if (tri.visible) {
             expand_bounds(out_build_bounds, tri);
@@ -273,19 +274,23 @@ void append_reused_chunk_geometry(
         return;
     }
 
-    chunk->vertex_offset = build->vertices.size();
-    chunk->index_offset = build->indices.size();
+    std::vector<rt_scene_vertex> &vertices = build->vertices.write();
+    std::vector<std::uint32_t> &indices = build->indices.write();
+    const std::vector<rt_scene_vertex> &previous_vertices = previous_build.vertices.read();
+    const std::vector<std::uint32_t> &previous_indices = previous_build.indices.read();
+    chunk->vertex_offset = vertices.size();
+    chunk->index_offset = indices.size();
 
-    build->vertices.insert(
-        build->vertices.end(),
-        previous_build.vertices.begin() + static_cast<std::ptrdiff_t>(previous_chunk.vertex_offset),
-        previous_build.vertices.begin() +
+    vertices.insert(
+        vertices.end(),
+        previous_vertices.begin() + static_cast<std::ptrdiff_t>(previous_chunk.vertex_offset),
+        previous_vertices.begin() +
             static_cast<std::ptrdiff_t>(previous_chunk.vertex_offset + previous_chunk.vertex_count));
 
     const std::uint32_t base_vertex = static_cast<std::uint32_t>(chunk->vertex_offset);
     for (std::size_t i = 0; i < previous_chunk.index_count; ++i) {
-        const std::uint32_t old_index = previous_build.indices[previous_chunk.index_offset + i];
-        build->indices.push_back(base_vertex + (old_index - static_cast<std::uint32_t>(previous_chunk.vertex_offset)));
+        const std::uint32_t old_index = previous_indices[previous_chunk.index_offset + i];
+        indices.push_back(base_vertex + (old_index - static_cast<std::uint32_t>(previous_chunk.vertex_offset)));
     }
 
     chunk->vertex_count = previous_chunk.vertex_count;
@@ -297,20 +302,23 @@ void append_new_chunk_geometry(const frame_scene &scene, rt_scene_build* build, 
         return;
     }
 
-    chunk->vertex_offset = build->vertices.size();
-    chunk->index_offset = build->indices.size();
+    const std::vector<triangle> &triangles = scene.triangles.read();
+    std::vector<rt_scene_vertex> &vertices = build->vertices.write();
+    std::vector<std::uint32_t> &indices = build->indices.write();
+    chunk->vertex_offset = vertices.size();
+    chunk->index_offset = indices.size();
     for (std::size_t i = 0; i < chunk->triangle_count; ++i) {
-        const triangle &tri = scene.triangles[chunk->first_triangle + i];
-        const std::uint32_t base_vertex = static_cast<std::uint32_t>(build->vertices.size());
-        build->vertices.push_back({tri.a, tri.color});
-        build->vertices.push_back({tri.b, tri.color});
-        build->vertices.push_back({tri.c, tri.color});
-        build->indices.push_back(base_vertex + 0);
-        build->indices.push_back(base_vertex + 1);
-        build->indices.push_back(base_vertex + 2);
+        const triangle &tri = triangles[chunk->first_triangle + i];
+        const std::uint32_t base_vertex = static_cast<std::uint32_t>(vertices.size());
+        vertices.push_back({tri.a, tri.color});
+        vertices.push_back({tri.b, tri.color});
+        vertices.push_back({tri.c, tri.color});
+        indices.push_back(base_vertex + 0);
+        indices.push_back(base_vertex + 1);
+        indices.push_back(base_vertex + 2);
     }
-    chunk->vertex_count = build->vertices.size() - chunk->vertex_offset;
-    chunk->index_count = build->indices.size() - chunk->index_offset;
+    chunk->vertex_count = vertices.size() - chunk->vertex_offset;
+    chunk->index_count = indices.size() - chunk->index_offset;
 }
 
 } // namespace
@@ -335,30 +343,33 @@ bool build_rt_scene_input(
         return false;
     }
 
+    const std::vector<triangle> &triangles = scene.triangles.read();
+    const std::vector<point> &points = scene.points.read();
+    const std::vector<line> &lines = scene.lines.read();
     rt_scene_build build{};
     build.revision = revision;
     build.connection_serial = scene.connection_serial;
-    build.triangle_count = scene.triangles.size();
-    build.point_count = scene.points.size();
-    build.line_count = scene.lines.size();
-    build.vertices.reserve(scene.triangles.size() * 3);
-    build.indices.reserve(scene.triangles.size() * 3);
-    build.points = scene.points;
-    build.lines = scene.lines;
+    build.triangle_count = triangles.size();
+    build.point_count = points.size();
+    build.line_count = lines.size();
+    build.vertices.reserve(triangles.size() * 3);
+    build.indices.reserve(triangles.size() * 3);
+    build.points = points;
+    build.lines = lines;
 
     const rt_scene_build* session_previous_build = previous_build != nullptr &&
             previous_build->connection_serial == scene.connection_serial
         ? previous_build
         : nullptr;
     const std::size_t effective_chunk_size = (std::max)(std::size_t{1}, triangle_chunk_primitive_count);
-    for (std::size_t first = 0; first < scene.triangles.size();) {
+    for (std::size_t first = 0; first < triangles.size();) {
         if (should_cancel()) {
             return false;
         }
         std::size_t layer_end = first + 1;
-        while (layer_end < scene.triangles.size() &&
-               scene.triangles[layer_end].layer == scene.triangles[first].layer &&
-               scene.triangles[layer_end].visible == scene.triangles[first].visible) {
+        while (layer_end < triangles.size() &&
+               triangles[layer_end].layer == triangles[first].layer &&
+               triangles[layer_end].visible == triangles[first].visible) {
             ++layer_end;
         }
         const std::size_t triangle_count = (std::min)(effective_chunk_size, layer_end - first);
@@ -386,54 +397,54 @@ bool build_rt_scene_input(
 
     const std::size_t effective_procedural_group_size =
         (std::max)(std::size_t{1}, kDefaultRtSceneProceduralChunkPrimitives);
-    for (std::size_t first = 0; first < scene.points.size();) {
+    for (std::size_t first = 0; first < points.size();) {
         if (should_cancel()) {
             return false;
         }
         std::size_t end = first + 1;
-        while (end < scene.points.size() && end - first < effective_procedural_group_size &&
-               scene.points[end].layer == scene.points[first].layer &&
-               scene.points[end].visible == scene.points[first].visible) {
+        while (end < points.size() && end - first < effective_procedural_group_size &&
+               points[end].layer == points[first].layer &&
+               points[end].visible == points[first].visible) {
             ++end;
         }
         rt_procedural_chunk group{};
         group.first_primitive = first;
         group.primitive_count = end - first;
-        group.layer = scene.points[first].layer;
-        group.visible = scene.points[first].visible;
+        group.layer = points[first].layer;
+        group.visible = points[first].visible;
         for (std::size_t index = first; index < end; ++index) {
-            expand_bounds(&group.bounds, scene.points[index]);
+            expand_bounds(&group.bounds, points[index]);
         }
         build.point_chunks.push_back(std::move(group));
         first = end;
     }
-    for (const point &value : scene.points) {
+    for (const point &value : points) {
         if (value.visible) {
             expand_bounds(&build.bounds, value);
         }
     }
-    for (std::size_t first = 0; first < scene.lines.size();) {
+    for (std::size_t first = 0; first < lines.size();) {
         if (should_cancel()) {
             return false;
         }
         std::size_t end = first + 1;
-        while (end < scene.lines.size() && end - first < effective_procedural_group_size &&
-               scene.lines[end].layer == scene.lines[first].layer &&
-               scene.lines[end].visible == scene.lines[first].visible) {
+        while (end < lines.size() && end - first < effective_procedural_group_size &&
+               lines[end].layer == lines[first].layer &&
+               lines[end].visible == lines[first].visible) {
             ++end;
         }
         rt_procedural_chunk group{};
         group.first_primitive = first;
         group.primitive_count = end - first;
-        group.layer = scene.lines[first].layer;
-        group.visible = scene.lines[first].visible;
+        group.layer = lines[first].layer;
+        group.visible = lines[first].visible;
         for (std::size_t index = first; index < end; ++index) {
-            expand_bounds(&group.bounds, scene.lines[index]);
+            expand_bounds(&group.bounds, lines[index]);
         }
         build.line_chunks.push_back(std::move(group));
         first = end;
     }
-    for (const line &value : scene.lines) {
+    for (const line &value : lines) {
         if (value.visible) {
             expand_bounds(&build.bounds, value);
         }
@@ -468,13 +479,15 @@ bool build_rt_scene_overlay_input(
         return false;
     }
 
+    const std::vector<point> &points = scene.points.read();
+    const std::vector<line> &lines = scene.lines.read();
     rt_scene_build build = base_build;
     build.revision = revision;
     build.connection_serial = scene.connection_serial;
-    build.point_count = scene.points.size();
-    build.line_count = scene.lines.size();
-    build.points = scene.points;
-    build.lines = scene.lines;
+    build.point_count = points.size();
+    build.line_count = lines.size();
+    build.points = points;
+    build.lines = lines;
 
     build.point_chunks.clear();
     build.line_chunks.clear();
@@ -484,58 +497,58 @@ bool build_rt_scene_overlay_input(
     const std::size_t effective_group_size =
         (std::max)(std::size_t{1}, kDefaultRtSceneProceduralChunkPrimitives);
     const std::size_t base_point_count = base_build.point_count;
-    for (std::size_t first = 0; first < scene.points.size();) {
+    for (std::size_t first = 0; first < points.size();) {
         if (should_cancel()) {
             return false;
         }
         std::size_t end = first + 1;
-        while (end < scene.points.size() && end - first < effective_group_size &&
-               scene.points[end].layer == scene.points[first].layer &&
-               scene.points[end].visible == scene.points[first].visible &&
+        while (end < points.size() && end - first < effective_group_size &&
+               points[end].layer == points[first].layer &&
+               points[end].visible == points[first].visible &&
                (end < base_point_count) == (first < base_point_count)) {
             ++end;
         }
         rt_procedural_chunk group{};
         group.first_primitive = first;
         group.primitive_count = end - first;
-        group.layer = scene.points[first].layer;
-        group.visible = scene.points[first].visible;
+        group.layer = points[first].layer;
+        group.visible = points[first].visible;
         group.layer_visibility_exempt = first >= base_point_count;
         for (std::size_t index = first; index < end; ++index) {
-            expand_bounds(&group.bounds, scene.points[index]);
+            expand_bounds(&group.bounds, points[index]);
         }
         build.point_chunks.push_back(std::move(group));
         first = end;
     }
 
     const std::size_t base_line_count = base_build.line_count;
-    for (std::size_t first = 0; first < scene.lines.size();) {
+    for (std::size_t first = 0; first < lines.size();) {
         if (should_cancel()) {
             return false;
         }
         std::size_t end = first + 1;
-        while (end < scene.lines.size() && end - first < effective_group_size &&
-               scene.lines[end].layer == scene.lines[first].layer &&
-               scene.lines[end].visible == scene.lines[first].visible &&
+        while (end < lines.size() && end - first < effective_group_size &&
+               lines[end].layer == lines[first].layer &&
+               lines[end].visible == lines[first].visible &&
                (end < base_line_count) == (first < base_line_count)) {
             ++end;
         }
         rt_procedural_chunk group{};
         group.first_primitive = first;
         group.primitive_count = end - first;
-        group.layer = scene.lines[first].layer;
-        group.visible = scene.lines[first].visible;
+        group.layer = lines[first].layer;
+        group.visible = lines[first].visible;
         group.layer_visibility_exempt = first >= base_line_count;
         for (std::size_t index = first; index < end; ++index) {
-            expand_bounds(&group.bounds, scene.lines[index]);
+            expand_bounds(&group.bounds, lines[index]);
         }
         build.line_chunks.push_back(std::move(group));
         first = end;
     }
 
-    if (base_line_count < scene.lines.size()) {
-        for (std::size_t index = base_line_count; index < scene.lines.size(); ++index) {
-            expand_bounds(&build.bounds, scene.lines[index]);
+    if (base_line_count < lines.size()) {
+        for (std::size_t index = base_line_count; index < lines.size(); ++index) {
+            expand_bounds(&build.bounds, lines[index]);
         }
     }
     build.point_blas_chunk_sets = build_blas_chunk_sets(build.point_chunks, false);

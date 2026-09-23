@@ -132,7 +132,7 @@ bool make_rt_scene_resource_data(
     data.revision = build.revision;
     data.connection_serial = build.connection_serial;
     data.positions.resize(build.vertex_count);
-    data.indices = build.indices;
+    data.indices = build.indices.read();
     data.triangle_colors.resize(build.triangle_count);
     data.points.resize(build.point_count);
     data.lines.resize(build.line_count);

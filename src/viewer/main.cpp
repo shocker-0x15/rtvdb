@@ -399,6 +399,34 @@ std::uint64_t g_last_runtime_build_info_paint_count = 0;
 std::uint64_t g_last_present_ready_frame_serial = 0;
 std::uint64_t g_view_revision = 0;
 
+enum class viewer_ui_event_kind {
+    frame_ready,
+    capture_requested,
+    reference_grid_requested,
+    present_ready,
+};
+
+struct viewer_ui_event {
+    viewer_ui_event_kind kind = viewer_ui_event_kind::frame_ready;
+    std::shared_ptr<const rtvdb::viewer_backend::frame_scene> scene;
+    bool has_frame = false;
+    std::uint64_t connection_serial = 0;
+    bool full_accumulation = false;
+    rtvdb::reference_grid reference_grid = rtvdb::reference_grid::viewer_default;
+    std::uint64_t backend_revision = 0;
+};
+
+std::mutex g_viewer_ui_event_mutex;
+std::deque<viewer_ui_event> g_viewer_ui_events;
+
+void queue_viewer_ui_event(viewer_ui_event event) {
+    {
+        std::scoped_lock lock(g_viewer_ui_event_mutex);
+        g_viewer_ui_events.push_back(std::move(event));
+    }
+    rtvdb::viewer_shell::request_repaint();
+}
+
 struct status_tree_state {
     bool display_cadence_open = false;
     bool paint_cpu_work_open = false;
@@ -689,6 +717,7 @@ void on_capture_requested(
     bool full_accumulation,
     void* user_data);
 void on_reference_grid_requested(rtvdb::reference_grid value, void* user_data);
+void drain_viewer_ui_events();
 void prepare_pending_client_capture();
 void process_pending_client_capture(
     std::uint64_t rendered_revision,
@@ -734,13 +763,15 @@ bool render_diagnostics_enabled();
 std::uint64_t monotonic_time_ms();
 rtvdb::viewer_backend::frame_scene filter_scene_layers(
     const rtvdb::viewer_backend::frame_scene &source);
-bool copy_effective_present_scene(rtvdb::viewer_backend::frame_scene* out_scene, bool* out_has_frame);
-bool copy_effective_present_render_scene(rtvdb::viewer_backend::frame_scene* out_scene, bool* out_has_frame);
 bool acquire_effective_present_render_scene(
     std::shared_ptr<const rtvdb::viewer_backend::frame_scene>* out_scene,
     bool* out_has_frame,
     std::uint64_t* out_revision = nullptr,
     rtvdb::viewer_backend::render_scene_context* out_context = nullptr);
+bool acquire_effective_present_client_scene(
+    std::shared_ptr<const rtvdb::viewer_backend::frame_scene>* out_scene,
+    bool* out_has_frame);
+void apply_camera_override(rtvdb::viewer_backend::frame_scene &scene, bool apply_override);
 void start_layer_rebuild_worker();
 void stop_layer_rebuild_worker();
 void append_render_stall_trace_line(const char* text);
@@ -1207,13 +1238,23 @@ void on_capture_requested(
     std::uint64_t connection_serial,
     bool full_accumulation,
     void*) {
+    viewer_ui_event event{};
+    event.kind = viewer_ui_event_kind::capture_requested;
+    event.scene = scene;
+    event.has_frame = has_frame;
+    event.connection_serial = connection_serial;
+    event.full_accumulation = full_accumulation;
+    queue_viewer_ui_event(std::move(event));
+}
+
+void process_capture_requested(const viewer_ui_event &event) {
     {
         std::scoped_lock lock(g_client_capture_mutex);
         client_capture_request request{};
-        request.scene = scene;
-        request.has_frame = has_frame;
-        request.connection_serial = connection_serial;
-        request.full_accumulation = full_accumulation;
+        request.scene = event.scene;
+        request.has_frame = event.has_frame;
+        request.connection_serial = event.connection_serial;
+        request.full_accumulation = event.full_accumulation;
         g_client_capture_requests.push_back(std::move(request));
         g_client_capture_lock_active.store(true, std::memory_order_release);
     }
@@ -1221,6 +1262,13 @@ void on_capture_requested(
 }
 
 void on_reference_grid_requested(rtvdb::reference_grid value, void*) {
+    viewer_ui_event event{};
+    event.kind = viewer_ui_event_kind::reference_grid_requested;
+    event.reference_grid = value;
+    queue_viewer_ui_event(std::move(event));
+}
+
+void process_reference_grid_requested(rtvdb::reference_grid value) {
     std::scoped_lock lock(g_client_capture_mutex);
     if (g_client_capture_lock_active.load(std::memory_order_acquire)) {
         g_client_capture_deferred_reference_grid = value;
@@ -1391,14 +1439,17 @@ void prepare_pending_client_capture() {
 
     rtvdb::viewer_backend::frame_scene capture_scene = filter_scene_layers(*request.scene);
     if (!capture_scene.camera_set_by_client) {
-        rtvdb::viewer_backend::frame_scene current_scene{};
+        std::shared_ptr<const rtvdb::viewer_backend::frame_scene> current_scene;
         bool current_has_frame = false;
-        if (copy_effective_present_render_scene(&current_scene, &current_has_frame) && current_has_frame) {
-            capture_scene.camera = current_scene.camera;
-            capture_scene.projection_blend_from = current_scene.camera.projection;
-            capture_scene.projection_blend_to = current_scene.camera.projection;
+        if (acquire_effective_present_render_scene(&current_scene, &current_has_frame) && current_has_frame) {
+            rtvdb::viewer_backend::frame_scene camera_scene{};
+            camera_scene.camera = current_scene->camera;
+            apply_camera_override(camera_scene, g_camera_override.active);
+            capture_scene.camera = camera_scene.camera;
+            capture_scene.projection_blend_from = camera_scene.camera.projection;
+            capture_scene.projection_blend_to = camera_scene.camera.projection;
             capture_scene.projection_blend_t = 1.0f;
-            capture_scene.view_revision = current_scene.view_revision;
+            capture_scene.view_revision = camera_scene.view_revision;
         }
     } else {
         capture_scene.projection_blend_from = capture_scene.camera.projection;
@@ -1781,10 +1832,11 @@ std::wstring sanitize_filename_component(const std::string &text) {
 }
 
 std::wstring current_manual_png_client_name() {
-    rtvdb::viewer_backend::frame_scene scene{};
+    std::shared_ptr<const rtvdb::viewer_backend::frame_scene> scene;
     bool has_frame = false;
-    if (copy_effective_present_scene(&scene, &has_frame) && has_frame && !scene.app_name.empty()) {
-        return sanitize_filename_component(scene.app_name);
+    if (acquire_effective_present_client_scene(&scene, &has_frame) &&
+        has_frame && !scene->app_name.empty()) {
+        return sanitize_filename_component(scene->app_name);
     }
     return L"client";
 }
@@ -1971,9 +2023,8 @@ void complete_manual_png_save(bool accepted, const std::wstring &path, void*) {
         return;
     }
 
-    rtvdb::viewer_backend::frame_scene scene{};
     bool has_frame = false;
-    if (!copy_effective_present_render_scene(&scene, &has_frame) || !has_frame) {
+    if (!acquire_effective_present_render_scene(nullptr, &has_frame) || !has_frame) {
         append_manual_png_save_log(true, path, "no frame");
         return;
     }
@@ -3909,36 +3960,6 @@ void apply_camera_override(rtvdb::viewer_backend::frame_scene &scene, bool apply
     scene.view_revision = g_camera_override.active ? g_camera_override.revision : g_view_revision;
 }
 
-bool copy_effective_present_scene(rtvdb::viewer_backend::frame_scene* out_scene, bool* out_has_frame) {
-    progress_camera_animation();
-    rtvdb::viewer_backend::frame_scene scene{};
-    bool has_frame = false;
-    rtvdb::viewer_backend::copy_present_scene(&scene, &has_frame);
-    apply_camera_override(scene, has_frame && g_camera_override.active);
-    if (out_scene != nullptr) {
-        *out_scene = scene;
-    }
-    if (out_has_frame != nullptr) {
-        *out_has_frame = has_frame;
-    }
-    return has_frame;
-}
-
-bool copy_effective_present_render_scene(rtvdb::viewer_backend::frame_scene* out_scene, bool* out_has_frame) {
-    progress_camera_animation();
-    rtvdb::viewer_backend::frame_scene scene{};
-    bool has_frame = false;
-    rtvdb::viewer_backend::copy_present_render_scene(&scene, &has_frame);
-    apply_camera_override(scene, has_frame && g_camera_override.active);
-    if (out_scene != nullptr) {
-        *out_scene = scene;
-    }
-    if (out_has_frame != nullptr) {
-        *out_has_frame = has_frame;
-    }
-    return has_frame;
-}
-
 bool should_apply_camera_override_to_render_scene(std::uint64_t render_scene_revision) {
     if (!g_camera_override.active || !client_capture_lock_active()) {
         return g_camera_override.active;
@@ -3961,6 +3982,14 @@ bool acquire_effective_present_render_scene(
         out_has_frame,
         out_revision,
         out_context);
+}
+
+bool acquire_effective_present_client_scene(
+    std::shared_ptr<const rtvdb::viewer_backend::frame_scene>* out_scene,
+    bool* out_has_frame)
+{
+    progress_camera_animation();
+    return rtvdb::viewer_backend::acquire_present_client_scene(out_scene, out_has_frame);
 }
 
 void copy_render_scene_metadata(
@@ -4439,15 +4468,15 @@ void update_camera_projection_from_viewer_ui(rtvdb::camera_projection projection
         return;
     }
 
-    rtvdb::viewer_backend::frame_scene scene{};
+    std::shared_ptr<const rtvdb::viewer_backend::frame_scene> scene;
     bool has_frame = false;
-    if (!copy_effective_present_scene(&scene, &has_frame) || !has_frame) {
+    if (!acquire_effective_present_client_scene(&scene, &has_frame) || !has_frame) {
         animate_camera_to(camera, "projection", false);
         return;
     }
 
     primitive_focus_fit fit{};
-    if (!try_compute_scene_fit(scene, &fit)) {
+    if (!try_compute_scene_fit(*scene, &fit)) {
         animate_camera_to(camera, "projection", false);
         return;
     }
@@ -4611,14 +4640,14 @@ void frame_current_scene() {
     if (client_capture_lock_active()) {
         return;
     }
-    rtvdb::viewer_backend::frame_scene scene{};
+    std::shared_ptr<const rtvdb::viewer_backend::frame_scene> scene;
     bool has_frame = false;
-    if (!copy_effective_present_scene(&scene, &has_frame) || !has_frame) {
+    if (!acquire_effective_present_client_scene(&scene, &has_frame) || !has_frame) {
         return;
     }
 
     primitive_focus_fit fit{};
-    if (!try_compute_scene_fit(scene, &fit)) {
+    if (!try_compute_scene_fit(*scene, &fit)) {
         return;
     }
 
@@ -4666,7 +4695,7 @@ void update_hover_state() {
         return;
     }
     std::shared_ptr<const rtvdb::viewer_backend::frame_scene> scene_snapshot;
-    rtvdb::viewer_backend::frame_scene copied_scene{};
+    rtvdb::viewer_backend::frame_scene empty_scene{};
     rtvdb::viewer_backend::frame_scene render_scene{};
     const rtvdb::viewer_backend::frame_scene* scene = nullptr;
     const rtvdb::viewer_backend::frame_scene* render_input = nullptr;
@@ -4677,8 +4706,8 @@ void update_hover_state() {
         apply_effective_camera_to_render_scene(*scene, &render_scene, render_scene_revision);
         render_input = &render_scene;
     } else {
-        copy_effective_present_render_scene(&copied_scene, &has_frame);
-        scene = &copied_scene;
+        has_frame = false;
+        scene = &empty_scene;
         render_input = scene;
     }
     g_hover.has_frame = has_frame;
@@ -4823,13 +4852,14 @@ void draw_scene_to_paint_context(void*) {
         record_paint_started();
         const auto start = std::chrono::steady_clock::now();
         frame_pacing_state::paint_cpu_timing paint_timing{};
+        drain_viewer_ui_events();
         const bool camera_animation_active = progress_camera_animation();
         process_pending_present_update();
         if (g_client_capture_readback_pending) {
             complete_pending_client_capture_readback();
         }
         std::shared_ptr<const rtvdb::viewer_backend::frame_scene> scene_snapshot;
-        rtvdb::viewer_backend::frame_scene copied_scene{};
+        rtvdb::viewer_backend::frame_scene empty_scene{};
         rtvdb::viewer_backend::frame_scene render_scene{};
         rtvdb::viewer_backend::render_scene_context render_context{};
         const rtvdb::viewer_backend::frame_scene* scene = nullptr;
@@ -4847,8 +4877,8 @@ void draw_scene_to_paint_context(void*) {
             apply_effective_camera_to_render_scene(*scene, &render_scene, render_scene_revision);
             render_input = &render_scene;
         } else {
-            copy_effective_present_render_scene(&copied_scene, &has_frame);
-            scene = &copied_scene;
+            has_frame = false;
+            scene = &empty_scene;
             render_input = scene;
         }
         const bool current_scene_has_frame = has_frame;
@@ -5203,12 +5233,17 @@ bool show_scene_in_shell(
 }
 
 void on_shell_shutdown(void*) {
+    rtvdb::viewer_session::stop_session();
 #if defined(_WIN32)
     stop_viewer_activation_listener();
 #endif
     stop_render_watchdog();
     stop_layer_rebuild_worker();
     rtvdb::viewer_backend::shutdown_backend();
+    {
+        std::scoped_lock lock(g_viewer_ui_event_mutex);
+        g_viewer_ui_events.clear();
+    }
 }
 
 bool poll_completed_debug_render_capture(
@@ -6093,10 +6128,20 @@ void on_present_ready(const rtvdb::viewer_backend::frame_scene* scene, bool has_
     if (scene == nullptr) {
         return;
     }
-    std::uint64_t backend_revision = 0;
-    rtvdb::viewer_backend::acquire_present_render_scene(nullptr, nullptr, &backend_revision);
-    record_layer_update_ready(backend_revision);
-    const std::vector<std::string> layer_paths = has_frame ? collect_layer_paths(*scene) : std::vector<std::string>{};
+    viewer_ui_event event{};
+    event.kind = viewer_ui_event_kind::present_ready;
+    event.scene = std::make_shared<const rtvdb::viewer_backend::frame_scene>(*scene);
+    event.has_frame = has_frame;
+    rtvdb::viewer_backend::acquire_present_render_scene(nullptr, nullptr, &event.backend_revision);
+    queue_viewer_ui_event(std::move(event));
+}
+
+void process_present_ready(const viewer_ui_event &event) {
+    const rtvdb::viewer_backend::frame_scene &scene = *event.scene;
+    record_layer_update_ready(event.backend_revision);
+    const std::vector<std::string> layer_paths = event.has_frame
+        ? collect_layer_paths(scene)
+        : std::vector<std::string>{};
     {
         std::scoped_lock lock(g_layer_visibility_mutex);
         bool layer_state_changed = g_layer_paths != layer_paths;
@@ -6111,14 +6156,14 @@ void on_present_ready(const rtvdb::viewer_backend::frame_scene* scene, bool has_
             ++g_layer_state_revision;
         }
     }
-    if (has_frame && scene->frame_serial != 0) {
-        g_last_present_ready_frame_serial = scene->frame_serial;
+    if (event.has_frame && scene.frame_serial != 0) {
+        g_last_present_ready_frame_serial = scene.frame_serial;
     }
     {
         std::scoped_lock lock(g_present_update_mutex);
         g_pending_present_update = true;
     }
-    request_repaint_traced("present_ready", scene->frame_serial);
+    request_repaint_traced("present_ready", scene.frame_serial);
 }
 
 std::vector<std::string> collect_layer_paths(const rtvdb::viewer_backend::frame_scene &scene) {
@@ -7062,7 +7107,13 @@ void process_frame_ready(
 }
 
 void on_frame_ready(const rtvdb::viewer_backend::frame_scene* scene, void*) {
-    process_frame_ready(scene, false);
+    if (scene == nullptr) {
+        return;
+    }
+    viewer_ui_event event{};
+    event.kind = viewer_ui_event_kind::frame_ready;
+    event.scene = std::make_shared<const rtvdb::viewer_backend::frame_scene>(*scene);
+    queue_viewer_ui_event(std::move(event));
 }
 
 void on_frame_ready_shared(
@@ -7070,7 +7121,34 @@ void on_frame_ready_shared(
     void* user_data)
 {
     (void)user_data;
-    process_frame_ready(scene.get(), false);
+    viewer_ui_event event{};
+    event.kind = viewer_ui_event_kind::frame_ready;
+    event.scene = scene;
+    queue_viewer_ui_event(std::move(event));
+}
+
+void drain_viewer_ui_events() {
+    std::deque<viewer_ui_event> events;
+    {
+        std::scoped_lock lock(g_viewer_ui_event_mutex);
+        events.swap(g_viewer_ui_events);
+    }
+    for (const viewer_ui_event &event : events) {
+        switch (event.kind) {
+        case viewer_ui_event_kind::frame_ready:
+            process_frame_ready(event.scene.get(), false);
+            break;
+        case viewer_ui_event_kind::capture_requested:
+            process_capture_requested(event);
+            break;
+        case viewer_ui_event_kind::reference_grid_requested:
+            process_reference_grid_requested(event.reference_grid);
+            break;
+        case viewer_ui_event_kind::present_ready:
+            process_present_ready(event);
+            break;
+        }
+    }
 }
 
 void finish_client_capture() {
@@ -7553,12 +7631,6 @@ void on_ui(void*) {
                         g_layer_ui_rows_dirty = true;
                         rtvdb::viewer_shell::request_repaint();
                     }
-                    if (visibility_changed) {
-                        clear_camera_focus();
-                        g_hover = {};
-                        clear_selection_state();
-                        schedule_layer_rebuild();
-                    }
                 }
             }
             ImGui::EndChild();
@@ -7593,6 +7665,12 @@ void on_ui(void*) {
                     }
                 }
                 ImGui::SetCursorScreenPos(layers_list_end_cursor_pos);
+            }
+            if (visibility_changed) {
+                clear_camera_focus();
+                g_hover = {};
+                clear_selection_state();
+                schedule_layer_rebuild();
             }
             ImGui::EndTabItem();
         }

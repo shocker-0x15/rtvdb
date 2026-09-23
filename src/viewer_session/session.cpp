@@ -12,6 +12,7 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -21,6 +22,8 @@
 #include "viewer_session/session.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <condition_variable>
@@ -41,6 +44,8 @@ constexpr std::size_t kImplicitSnapshotPrimitiveDelta = 32768;
 constexpr std::size_t kLargeSceneImplicitSnapshotPrimitiveDelta = 262144;
 constexpr std::size_t kLargeScenePrimitiveThreshold = 65536;
 constexpr std::size_t kMaxRecentLogCount = 128;
+constexpr long kListenerPollMicroseconds = 100000;
+constexpr std::uint32_t kClientReceiveTimeoutMilliseconds = 100;
 
 #if defined(_WIN32)
 using platform_socket = SOCKET;
@@ -76,7 +81,11 @@ struct shared_state {
     std::chrono::steady_clock::time_point dirty_since_time{};
     session_callbacks callbacks{};
     bool started = false;
+    std::atomic<bool> stop_requested{false};
     platform_socket listener = kInvalidSocket;
+    platform_socket active_client = kInvalidSocket;
+    std::thread network_worker;
+    std::thread implicit_worker;
     bool winsock_started = false;
     char last_error_message[256]{};
     std::vector<log_entry> recent_logs;
@@ -164,6 +173,38 @@ void close_platform_socket(platform_socket socket_value) {
 #endif
 }
 
+void shutdown_platform_socket(platform_socket socket_value) {
+#if defined(_WIN32)
+    shutdown(socket_value, SD_BOTH);
+#else
+    shutdown(socket_value, SHUT_RDWR);
+#endif
+}
+
+bool set_client_receive_timeout(platform_socket socket_value) {
+#if defined(_WIN32)
+    return setsockopt(
+        socket_value,
+        SOL_SOCKET,
+        SO_RCVTIMEO,
+        reinterpret_cast<const char*>(&kClientReceiveTimeoutMilliseconds),
+        sizeof(kClientReceiveTimeoutMilliseconds)) == 0;
+#else
+    timeval timeout{};
+    timeout.tv_usec = kListenerPollMicroseconds;
+    return setsockopt(socket_value, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0;
+#endif
+}
+
+bool receive_timed_out() {
+#if defined(_WIN32)
+    const int error = WSAGetLastError();
+    return error == WSAETIMEDOUT || error == WSAEWOULDBLOCK;
+#else
+    return errno == EAGAIN || errno == EWOULDBLOCK;
+#endif
+}
+
 void set_last_error_message_locked(const char* message) {
     g_state.last_error_message[0] = '\0';
     if (message == nullptr || *message == '\0') {
@@ -221,7 +262,11 @@ bool recv_all(platform_socket sock, void* buffer, int size) {
     int received = 0;
     while (received < size) {
         const int chunk = recv(sock, bytes + received, size - received, 0);
-        if (chunk <= 0) {
+        if (chunk < 0 && receive_timed_out() &&
+            !g_state.stop_requested.load(std::memory_order_acquire)) {
+            continue;
+        }
+        if (chunk <= 0 || g_state.stop_requested.load(std::memory_order_acquire)) {
             return false;
         }
         received += chunk;
@@ -364,40 +409,51 @@ void publish_now(std::shared_ptr<const viewer_backend::frame_scene>* out_scene =
 
 template <typename Payload, typename Primitive, typename Convert>
 void append_primitives_locked(
-    const Payload* payloads, std::size_t count, std::vector<Primitive> &destination, Convert convert)
+    const Payload* payloads,
+    std::size_t count,
+    viewer_backend::cow_vector<Primitive> &destination,
+    Convert convert)
 {
     if (payloads == nullptr || count == 0) {
         return;
     }
     ensure_pending_revision_locked();
-    if (!reserve_for_append(&destination, count)) {
+    std::vector<Primitive> &values = destination.write();
+    if (!reserve_for_append(&values, count)) {
         return;
     }
+    const std::string layer_path = current_layer_path_locked();
     for (std::size_t i = 0; i < count; ++i) {
         expand_working_bounds_locked(payloads[i]);
-        destination.push_back(convert(payloads[i]));
+        values.push_back(convert(payloads[i], layer_path));
     }
     g_state.primitive_dirty = true;
     mark_dirty_locked();
 }
 
 void append_triangles_locked(const rtvdb::triangle_payload* triangles, std::size_t count) {
-    append_primitives_locked(triangles, count, g_state.working_scene.triangles, [](const auto &p) {
-        return viewer_backend::triangle{p.a, p.b, p.c, p.color, p.user_data, current_layer_path_locked()};
-    });
+    append_primitives_locked(
+        triangles, count, g_state.working_scene.triangles,
+        [](const auto &p, const std::string &layer) {
+            return viewer_backend::triangle{p.a, p.b, p.c, p.color, p.user_data, layer};
+        });
 }
 
 void append_points_locked(const rtvdb::point_payload* points, std::size_t count) {
-    append_primitives_locked(points, count, g_state.working_scene.points, [](const auto &p) {
-        return viewer_backend::point{p.position, p.radius, p.color, p.user_data, current_layer_path_locked()};
-    });
+    append_primitives_locked(
+        points, count, g_state.working_scene.points,
+        [](const auto &p, const std::string &layer) {
+            return viewer_backend::point{p.position, p.radius, p.color, p.user_data, layer};
+        });
 }
 
 void append_lines_locked(const rtvdb::line_payload* lines, std::size_t count) {
-    append_primitives_locked(lines, count, g_state.working_scene.lines, [](const auto &p) {
-        return viewer_backend::line{
-            p.a, p.radius, p.b, p.color, p.user_data, viewer_backend::line_flags::none, current_layer_path_locked()};
-    });
+    append_primitives_locked(
+        lines, count, g_state.working_scene.lines,
+        [](const auto &p, const std::string &layer) {
+            return viewer_backend::line{
+                p.a, p.radius, p.b, p.color, p.user_data, viewer_backend::line_flags::none, layer};
+        });
 }
 
 template <typename Payload>
@@ -422,14 +478,24 @@ bool receive_primitive_batch(
 void implicit_snapshot_thread() {
     std::unique_lock lock(g_state.mutex);
     for (;;) {
-        g_state.condition.wait(lock, [] { return g_state.dirty && !g_state.explicit_frame_open; });
+        g_state.condition.wait(lock, [] {
+            return g_state.stop_requested.load(std::memory_order_acquire) ||
+                (g_state.dirty && !g_state.explicit_frame_open);
+        });
+        if (g_state.stop_requested.load(std::memory_order_acquire)) {
+            break;
+        }
 
-        while (g_state.dirty && !g_state.explicit_frame_open &&
+        while (!g_state.stop_requested.load(std::memory_order_acquire) &&
+               g_state.dirty && !g_state.explicit_frame_open &&
                !implicit_snapshot_primitive_threshold_reached_locked()) {
             const auto due_time = g_state.dirty_since_time + implicit_snapshot_delay_locked();
             if (g_state.condition.wait_until(lock, due_time) == std::cv_status::timeout) {
                 break;
             }
+        }
+        if (g_state.stop_requested.load(std::memory_order_acquire)) {
+            break;
         }
         if (!g_state.dirty || g_state.explicit_frame_open) {
             continue;
@@ -458,12 +524,36 @@ void network_thread() {
         return;
     }
 
-    for (;;) {
+    while (!g_state.stop_requested.load(std::memory_order_acquire)) {
+        fd_set read_sockets{};
+        FD_ZERO(&read_sockets);
+        FD_SET(listener, &read_sockets);
+        timeval timeout{};
+        timeout.tv_usec = kListenerPollMicroseconds;
+#if defined(_WIN32)
+        const int ready = select(0, &read_sockets, nullptr, nullptr, &timeout);
+#else
+        const int ready = select(static_cast<int>(listener) + 1, &read_sockets, nullptr, nullptr, &timeout);
+#endif
+        if (ready <= 0) {
+            continue;
+        }
         platform_socket client = accept(listener, nullptr, nullptr);
         if (client == kInvalidSocket) {
             continue;
         }
+        if (!set_client_receive_timeout(client)) {
+            close_platform_socket(client);
+            continue;
+        }
+        {
+            std::scoped_lock lock(g_state.mutex);
+            g_state.active_client = client;
+        }
         for (;;) {
+            if (g_state.stop_requested.load(std::memory_order_acquire)) {
+                break;
+            }
             rtvdb::message_header header{};
             if (!recv_all(client, &header, sizeof(header))) {
                 break;
@@ -752,6 +842,7 @@ connection_end:
             bool publish_on_disconnect = false;
             {
                 std::scoped_lock lock(g_state.mutex);
+                g_state.active_client = kInvalidSocket;
                 if (g_state.explicit_frame_open) {
                     g_state.working_scene.triangles.clear();
                     g_state.working_scene.points.clear();
@@ -759,7 +850,7 @@ connection_end:
                     reset_working_bounds_locked();
                     g_state.explicit_frame_open = false;
                     g_state.dirty = false;
-                } else if (g_state.dirty) {
+                } else if (g_state.dirty && !g_state.stop_requested.load(std::memory_order_acquire)) {
                     publish_locked(&scene, &callbacks);
                     publish_on_disconnect = true;
                 }
@@ -857,12 +948,64 @@ bool start_session(const session_callbacks &callbacks, const session_config &con
 
     g_state.callbacks = callbacks;
     g_state.started = true;
+    g_state.stop_requested.store(false, std::memory_order_release);
     g_state.listener = listener;
     g_state.session_start_time = std::chrono::steady_clock::now();
     set_last_error_message_locked(nullptr);
-    std::thread(network_thread).detach();
-    std::thread(implicit_snapshot_thread).detach();
+    g_state.network_worker = std::thread(network_thread);
+    g_state.implicit_worker = std::thread(implicit_snapshot_thread);
     return true;
+}
+
+void stop_session() {
+    std::thread network_worker;
+    std::thread implicit_worker;
+    {
+        std::scoped_lock lock(g_state.mutex);
+        if (!g_state.started) {
+            return;
+        }
+        g_state.stop_requested.store(true, std::memory_order_release);
+        if (g_state.active_client != kInvalidSocket) {
+            shutdown_platform_socket(g_state.active_client);
+        }
+        g_state.condition.notify_all();
+        network_worker = std::move(g_state.network_worker);
+        implicit_worker = std::move(g_state.implicit_worker);
+    }
+    if (network_worker.joinable()) {
+        network_worker.join();
+    }
+    if (implicit_worker.joinable()) {
+        implicit_worker.join();
+    }
+    {
+        std::scoped_lock lock(g_state.mutex);
+        if (g_state.listener != kInvalidSocket) {
+            close_platform_socket(g_state.listener);
+            g_state.listener = kInvalidSocket;
+        }
+        cleanup_network_locked();
+        g_state.active_client = kInvalidSocket;
+        g_state.working_scene = {};
+        g_state.published_scene.reset();
+        g_state.working_bounds = {};
+        g_state.has_frame = false;
+        g_state.dirty = false;
+        g_state.primitive_dirty = false;
+        g_state.explicit_frame_open = false;
+        g_state.last_published_triangle_count = 0;
+        g_state.last_published_point_count = 0;
+        g_state.last_published_line_count = 0;
+        g_state.published_revision = 0;
+        g_state.current_revision = 0;
+        g_state.connection_serial = 0;
+        g_state.layer_stack.clear();
+        g_state.callbacks = {};
+        g_state.recent_logs.clear();
+        g_state.next_log_sequence = 1;
+        g_state.started = false;
+    }
 }
 
 void copy_latest_scene(viewer_backend::frame_scene* out_scene, bool* out_has_frame) {
